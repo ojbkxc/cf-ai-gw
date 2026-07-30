@@ -7,7 +7,7 @@
 // 用量限额配置（均可通过环境变量覆盖，未设置则使用默认值）
 const DEFAULT_DAILY_LIMIT = 10000;     // 默认每日限额 10,000 Neurons
 const DEFAULT_MONTHLY_LIMIT = 100000;  // 默认每月限额 100,000 Neurons（$5/月套餐）
-const DEFAULT_USAGE_THRESHOLD = 0.9;   // 默认触发拦截的用量阈值 90%；设为 0 表示关闭限额拦截（仅统计不拦截）
+const DEFAULT_USAGE_THRESHOLD = 0;     // 默认触发拦截的用量阈值；设为 0 表示关闭限额拦截（仅统计不拦截）
 
 // 默认模型映射表（左边是客户端请求的模型名，右边是 Cloudflare 上对应的真实模型）
 const DEFAULT_MODEL_MAP = {
@@ -68,19 +68,19 @@ export default {
 
 		const url = new URL(request.url);
 
-		// 2. OpenAI 兼容的代理接口（/v1/ 开头）
+		// 3. OpenAI 兼容的代理接口（/v1/ 开头）
 		if (url.pathname.startsWith('/v1/')) {
 			const response = await handleV1Proxy(request, env, ctx);
 			return addCORSHeaders(response);
 		}
 
-		// 3. 后台管理面板的 API 接口（/api/ 开头）
+		// 4. 后台管理面板的 API 接口（/api/ 开头）
 		if (url.pathname.startsWith('/api/')) {
 			const response = await handleDashboardApi(request, env, ctx);
 			return addCORSHeaders(response);
 		}
 
-		// 4. 后台管理面板页面
+		// 5. 后台管理面板页面
 		if (url.pathname === '/admin' || url.pathname === '/admin/') {
 			const isLoggedIn = await verifyAdminCookie(request, env);
 			if (isLoggedIn) {
@@ -94,7 +94,7 @@ export default {
 			}
 		}
 
-		// 5. 首页 / 登录页
+		// 6. 首页 / 登录页
 		if (url.pathname === '/') {
 			return handleLandingPage(request, env, ctx);
 		}
@@ -106,7 +106,7 @@ export default {
 			});
 		}
 
-		// 6. 其他路径一律返回 404
+		// 7. 其他路径一律返回 404
 		return new Response('404 Not Found', { status: 404 });
 	}
 };
@@ -152,7 +152,7 @@ async function getAppConfig(env) {
 	}
 
 	const raw = await env.KV.get('config');
-	let parsed = { accounts: [], apiKeys: [], customModelMap: {} };
+	let parsed = { accounts: [], apiKeys: [], customModelMap: {}, usageLimits: {} };
 
 	if (raw) {
 		try {
@@ -160,7 +160,8 @@ async function getAppConfig(env) {
 			parsed = {
 				accounts: data.accounts || [],
 				apiKeys: data.apiKeys || [],
-				customModelMap: data.customModelMap || {}
+				customModelMap: data.customModelMap || {},
+				usageLimits: data.usageLimits || {}
 			};
 		} catch (e) { }
 	} else {
@@ -211,6 +212,17 @@ async function getCustomModelMap(env) {
 async function saveCustomModelMap(env, map) {
 	const config = await getAppConfig(env);
 	config.customModelMap = map;
+	await saveAppConfig(env, config);
+}
+
+async function getUsageLimitsConfig(env) {
+	const config = await getAppConfig(env);
+	return config.usageLimits || {};
+}
+
+async function saveUsageLimitsConfig(env, limits) {
+	const config = await getAppConfig(env);
+	config.usageLimits = limits;
 	await saveAppConfig(env, config);
 }
 
@@ -298,13 +310,18 @@ function getEnvFloat(env, key, defaultVal) {
 	return isNaN(val) ? defaultVal : val;
 }
 
-// 统一读取日/月限额和阈值配置（避免重复调用 3 次 getEnv）
+// 统一读取日/月限额和阈值配置
+// 优先级：KV 中保存的配置 > 环境变量 > 默认值
 // threshold <= 0 表示关闭限额拦截：用量照常统计，但不会拦截请求。
-function getUsageLimits(env) {
+async function getUsageLimits(env) {
+	// 先从 KV 读取用户保存的配置
+	const kvLimits = await getUsageLimitsConfig(env);
+
 	return {
-		dailyLimit: getEnvInt(env, 'DAILY_LIMIT', DEFAULT_DAILY_LIMIT),
-		monthlyLimit: getEnvInt(env, 'MONTHLY_LIMIT', DEFAULT_MONTHLY_LIMIT),
-		threshold: getEnvFloat(env, 'USAGE_THRESHOLD', DEFAULT_USAGE_THRESHOLD)
+		// env var 未设置时用 KV 值，KV 也未设置时用默认值
+		dailyLimit: getEnvInt(env, 'DAILY_LIMIT', kvLimits.dailyLimit ?? DEFAULT_DAILY_LIMIT),
+		monthlyLimit: getEnvInt(env, 'MONTHLY_LIMIT', kvLimits.monthlyLimit ?? DEFAULT_MONTHLY_LIMIT),
+		threshold: getEnvFloat(env, 'USAGE_THRESHOLD', kvLimits.threshold ?? DEFAULT_USAGE_THRESHOLD)
 	};
 }
 
@@ -332,7 +349,7 @@ async function checkUsageLimit(env) {
 	}
 
 	// 2. 读取环境变量，未设置则使用默认值
-	const { dailyLimit, monthlyLimit, threshold } = getUsageLimits(env);
+	const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
 
 	// 3. 获取当日用量（优先读缓存汇总，过期则从明细汇总）
 	let dailyUsage = 0;
@@ -406,7 +423,7 @@ async function setCachedSummary(env, summaryData) {
 
 // 从 cacheMap + accounts 构建用量汇总响应（消除 GET/POST 重复代码）
 async function buildSummaryResponse(env, accounts, cacheMap, needUpdate) {
-	const { dailyLimit, monthlyLimit, threshold } = getUsageLimits(env);
+	const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
 	let totalNeuronsToday = 0;
 	const modelsToday = {};
 	accounts.forEach(account => {
@@ -1530,12 +1547,7 @@ async function handleEmbeddings(request, env) {
 	}
 
 	// 解析模型名映射
-	let cfModel = model;
-	if (!cfModel || !cfModel.startsWith('@cf/')) {
-		const customMap = await getCustomModelMap(env);
-		const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
-		cfModel = cfModel ? combinedMap[model] : null;
-	}
+	const cfModel = await resolveModelName(model, env);
 	if (!cfModel) {
 		return new Response(JSON.stringify({
 			error: {
@@ -1592,7 +1604,14 @@ async function handleEmbeddings(request, env) {
 				}
 			} else {
 				const errorText = await cfResponse.text();
-				lastError = `CF API status ${cfResponse.status}: ${errorText}`;
+				const status = cfResponse.status;
+				// 4xx（除 429）属于客户端参数/鉴权类错误，换账号也一样失败，直接返回
+				if (status >= 400 && status < 500 && status !== 429) {
+					return new Response(JSON.stringify({
+						error: { message: `CF API returned ${status}: ${errorText}`, type: "invalid_request_error" }
+					}), { status, headers: { 'Content-Type': 'application/json' } });
+				}
+				lastError = `CF API status ${status}: ${errorText}`;
 			}
 		} catch (e) {
 			lastError = `Connection error: ${e.message}`;
@@ -1735,7 +1754,7 @@ async function handleDashboardApi(request, env, ctx) {
 			if (cached) {
 				// 即使命中缓存，也补充最新的限额配置字段（环境变量可能已变更）
 				// 月度用量从 KV 读取最新值（refreshAccountsUsage 会更新该键）
-				const { dailyLimit, monthlyLimit, threshold } = getUsageLimits(env);
+				const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
 				const monthlyUsage = await getMonthlyUsage(env);
 				return new Response(JSON.stringify({
 					...cached,
@@ -1749,7 +1768,7 @@ async function handleDashboardApi(request, env, ctx) {
 			}
 
 			const accounts = await getAccounts(env);
-			const limits = getUsageLimits(env);
+			const limits = await getUsageLimits(env);
 
 			if (accounts.length === 0) {
 				return new Response(JSON.stringify({
@@ -1786,7 +1805,7 @@ async function handleDashboardApi(request, env, ctx) {
 			}
 
 			const accounts = await getAccounts(env);
-			const limits = getUsageLimits(env);
+			const limits = await getUsageLimits(env);
 
 			if (accounts.length === 0) {
 				return new Response(JSON.stringify({
@@ -1987,7 +2006,7 @@ async function handleDashboardApi(request, env, ctx) {
 	// 8. 登录后看到的详细用量统计
 	if (url.pathname === '/api/accounts/usage' && method === 'GET') {
 		const accounts = await getAccounts(env);
-		const { dailyLimit, monthlyLimit, threshold } = getUsageLimits(env);
+		const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
 
 		if (accounts.length === 0) {
 			return new Response(JSON.stringify({
@@ -2075,6 +2094,54 @@ async function handleDashboardApi(request, env, ctx) {
 			}
 			await saveCustomModelMap(env, customModelMap);
 			return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+		}
+	}
+
+	// 11. 用量限额配置（阈值、日/月限额）
+	if (url.pathname === '/api/limits') {
+		if (method === 'GET') {
+			const limits = await getUsageLimits(env);
+			return new Response(JSON.stringify(limits), { headers: { 'Content-Type': 'application/json' } });
+		}
+
+		if (method === 'POST') {
+			const body = await request.json();
+			const { dailyLimit, monthlyLimit, threshold } = body || {};
+			const updates = {};
+			if (dailyLimit !== undefined) {
+				const val = parseInt(dailyLimit, 10);
+				if (isNaN(val) || val < 0) {
+					return new Response(JSON.stringify({ error: 'dailyLimit must be a non-negative integer' }), { status: 400 });
+				}
+				updates.dailyLimit = val;
+			}
+			if (monthlyLimit !== undefined) {
+				const val = parseInt(monthlyLimit, 10);
+				if (isNaN(val) || val < 0) {
+					return new Response(JSON.stringify({ error: 'monthlyLimit must be a non-negative integer' }), { status: 400 });
+				}
+				updates.monthlyLimit = val;
+			}
+			if (threshold !== undefined) {
+				const val = parseFloat(threshold);
+				if (isNaN(val) || val < 0 || val > 1) {
+					return new Response(JSON.stringify({ error: 'threshold must be a number between 0 and 1' }), { status: 400 });
+				}
+				updates.threshold = val;
+			}
+			if (Object.keys(updates).length === 0) {
+				return new Response(JSON.stringify({ error: 'No valid fields provided' }), { status: 400 });
+			}
+
+			await saveUsageLimitsConfig(env, updates);
+			// 清除内存缓存，让下次读取时从 KV 重新加载
+			memoryCache.config = null;
+			memoryCache.configExpiry = 0;
+			limitCheckCache.result = null;
+			limitCheckCache.expiry = 0;
+
+			const newLimits = await getUsageLimits(env);
+			return new Response(JSON.stringify({ success: true, limits: newLimits }), { headers: { 'Content-Type': 'application/json' } });
 		}
 	}
 
@@ -4159,6 +4226,10 @@ function handleAdminPage(request, env, ctx) {
 					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path></svg>
 					API 密钥
 				</div>
+				<div class="nav-item" id="menu-limits" onclick="switchTab('limits')">
+					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+					限额配置
+				</div>
 				<div class="nav-item" id="menu-settings" onclick="switchTab('settings')">
 					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
 					模型映射
@@ -4428,6 +4499,46 @@ function handleAdminPage(request, env, ctx) {
 								<!-- Mapping rows -->
 							</tbody>
 						</table>
+					</div>
+				</div>
+
+				<div id="tab-limits" class="tab-content">
+					<div class="section-card">
+						<div class="section-title">用量限额配置</div>
+						<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">
+							配置每日/每月用量限额和拦截阈值。阈值设为 0 表示关闭限额拦截（仅统计不拦截）。<br>
+							环境变量 <code>DAILY_LIMIT</code>、<code>MONTHLY_LIMIT</code>、<code>USAGE_THRESHOLD</code> 优先级高于此处配置。
+						</p>
+
+						<div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 20px;">
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>每日限额 (Neurons)</label>
+								<input type="number" id="limits-daily" min="0" step="1" placeholder="10000">
+							</div>
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>每月限额 (Neurons)</label>
+								<input type="number" id="limits-monthly" min="0" step="1" placeholder="100000">
+							</div>
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>拦截阈值 (0-1)</label>
+								<input type="number" id="limits-threshold" min="0" max="1" step="0.05" placeholder="0.9">
+								<span style="font-size: 11px; color: var(--text-muted);">0 = 关闭限额拦截</span>
+							</div>
+						</div>
+
+						<button class="btn btn-primary" onclick="saveLimits()" style="align-self: flex-start;">保存配置</button>
+						<span id="limits-save-msg" style="font-size: 13px; margin-left: 12px; display: none;"></span>
+					</div>
+
+					<div class="section-card" style="margin-top: 20px;">
+						<div class="section-title">环境变量说明</div>
+						<p style="font-size: 13px; color: var(--text-muted); line-height: 1.8; margin-top: 8px;">
+							以下配置优先级：<strong>环境变量 > 面板配置 > 默认值</strong><br><br>
+							<code>DAILY_LIMIT</code> — 每日 Neurons 限额（默认 10000）<br>
+							<code>MONTHLY_LIMIT</code> — 每月 Neurons 限额（默认 100000）<br>
+							<code>USAGE_THRESHOLD</code> — 拦截阈值（0-1，默认 0，即关闭拦截）<br><br>
+							在 Cloudflare Workers 仪表盘的 Settings → Variables 中添加上述环境变量即可覆盖面板配置。
+						</p>
 					</div>
 				</div>
 
@@ -4874,6 +4985,7 @@ function handleAdminPage(request, env, ctx) {
 				overview: '数据看板',
 				accounts: '账号管理',
 				keys: 'API 密钥',
+				limits: '限额配置',
 				settings: '模型映射'
 			};
 			document.getElementById('view-title').innerText = titles[tabName];
@@ -4885,6 +4997,8 @@ function handleAdminPage(request, env, ctx) {
 				loadAccounts();
 			} else if (tabName === 'keys') {
 				loadKeys();
+			} else if (tabName === 'limits') {
+				loadLimits();
 			} else if (tabName === 'settings') {
 				loadSettings();
 			}
@@ -5497,6 +5611,58 @@ function handleAdminPage(request, env, ctx) {
 			} else {
 				showToast('删除映射失败！', 'error');
 			}
+		}
+
+		async function loadLimits() {
+			try {
+				const res = await apiFetch('/api/limits');
+				const data = await res.json();
+				document.getElementById('limits-daily').value = data.dailyLimit;
+				document.getElementById('limits-monthly').value = data.monthlyLimit;
+				document.getElementById('limits-threshold').value = data.threshold;
+			} catch (e) {
+				console.error(e);
+				showToast('加载限额配置失败', 'error');
+			}
+		}
+
+		async function saveLimits() {
+			const daily = parseInt(document.getElementById('limits-daily').value, 10);
+			const monthly = parseInt(document.getElementById('limits-monthly').value, 10);
+			const threshold = parseFloat(document.getElementById('limits-threshold').value);
+
+			if (isNaN(daily) || daily < 0) {
+				showToast('每日限额必须是非负整数', 'error');
+				return;
+			}
+			if (isNaN(monthly) || monthly < 0) {
+				showToast('每月限额必须是非负整数', 'error');
+				return;
+			}
+			if (isNaN(threshold) || threshold < 0 || threshold > 1) {
+				showToast('阈值必须在 0-1 之间', 'error');
+				return;
+			}
+
+			const res = await apiFetch('/api/limits', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ dailyLimit: daily, monthlyLimit: monthly, threshold })
+			});
+
+			const msgEl = document.getElementById('limits-save-msg');
+			if (res.ok) {
+				msgEl.style.display = 'inline';
+				msgEl.style.color = 'var(--success-color)';
+				msgEl.textContent = '保存成功';
+				showToast('限额配置已保存');
+			} else {
+				msgEl.style.display = 'inline';
+				msgEl.style.color = 'var(--danger-color)';
+				msgEl.textContent = '保存失败';
+				showToast('保存失败', 'error');
+			}
+			setTimeout(() => { msgEl.style.display = 'none'; }, 3000);
 		}
 	</script>
 </body>
