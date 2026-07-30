@@ -691,12 +691,12 @@ async function handleV1Proxy(request, env, ctx) {
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 3. 对话补全 / 文本补全 接口
+	// 4. 对话补全 / 文本补全 接口
 	if ((url.pathname === '/v1/chat/completions' || url.pathname === '/v1/completions') && request.method === 'POST') {
 		return handleCompletions(request, env, url.pathname);
 	}
 
-	// 4. Anthropic Messages API 接口（/v1/messages）
+	// 5. Anthropic Messages API 接口（/v1/messages）
 	if (url.pathname === '/v1/messages' && request.method === 'POST') {
 		return handleMessages(request, env);
 	}
@@ -1827,7 +1827,6 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 
 		const [readResult, editResult, analyticsResult] = await Promise.all([
-			// 1. Workers AI > Read
 			(async () => {
 				try {
 					const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${targetAccountId}/ai/models/search?limit=1`, {
@@ -1846,7 +1845,6 @@ async function handleDashboardApi(request, env, ctx) {
 					return { success: false, error: e.message };
 				}
 			})(),
-			// 2. Workers AI > Edit
 			(async () => {
 				try {
 					const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${targetAccountId}/ai/run/@cf/google/embeddinggemma-300m`, {
@@ -1866,7 +1864,6 @@ async function handleDashboardApi(request, env, ctx) {
 					return { success: false, error: e.message };
 				}
 			})(),
-			// 3. Account Analytics > Read
 			(async () => {
 				try {
 					const query = `
@@ -2136,6 +2133,42 @@ const SHARED_JS = `
 			}
 		}`;
 
+// 各页面共享的 CSS（背景装饰 orb）
+const SHARED_BG_CSS = `
+		.bg-orbs-container {
+			position: fixed;
+			top: 0;
+			left: 0;
+			width: 100%;
+			height: 100%;
+			z-index: -1;
+			overflow: hidden;
+			pointer-events: none;
+		}
+
+		.bg-orb {
+			position: absolute;
+			border-radius: 50%;
+			filter: blur(100px);
+			animation: float 25s infinite alternate ease-in-out;
+		}`;
+
+// 错误页共享的 error-card CSS
+const SHARED_ERROR_CARD_CSS = `
+		.error-card {
+			background-color: var(--card-bg);
+			border: 1px solid var(--border-color);
+			border-radius: 20px;
+			padding: 40px;
+			max-width: 500px;
+			width: 100%;
+			text-align: center;
+			box-shadow: var(--card-shadow);
+			backdrop-filter: blur(var(--glass-blur));
+			-webkit-backdrop-filter: blur(var(--glass-blur));
+			z-index: 10;
+		}`;
+
 // 1. 首页 / 登录页
 async function handleLandingPage(request, env, ctx) {
 	const isLoggedIn = await checkAdminAuth(request, env);
@@ -2222,24 +2255,7 @@ async function handleLandingPage(request, env, ctx) {
 			display: none !important;
 		}
 
-		/* Dynamic Background Orbs */
-		.bg-orbs-container {
-			position: fixed;
-			top: 0;
-			left: 0;
-			width: 100%;
-			height: 100%;
-			z-index: -1;
-			overflow: hidden;
-			pointer-events: none;
-		}
-
-		.bg-orb {
-			position: absolute;
-			border-radius: 50%;
-			filter: blur(100px);
-			animation: float 25s infinite alternate ease-in-out;
-		}
+		${SHARED_BG_CSS}
 
 		.bg-orb-1 {
 			top: -10%;
@@ -2321,10 +2337,6 @@ async function handleLandingPage(request, env, ctx) {
 			grid-template-columns: 1fr 2fr;
 			gap: 20px;
 			width: 100%;
-		}
-
-		.dashboard-grid.single-col {
-			grid-template-columns: 1fr;
 		}
 
 		.public-chart-wrapper {
@@ -2526,27 +2538,6 @@ async function handleLandingPage(request, env, ctx) {
 		@keyframes progress-shimmer {
 			0% { background-position: -200% 0; }
 			100% { background-position: 200% 0; }
-		}
-
-		.progress-threshold {
-			position: absolute;
-			top: 0;
-			bottom: 0;
-			width: 2px;
-			background: var(--warning-color);
-		}
-
-		.section-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 18px;
-			padding: 28px;
-			box-shadow: var(--card-shadow);
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			display: flex;
-			flex-direction: column;
-			gap: 20px;
 		}
 
 		.section-title {
@@ -3334,23 +3325,7 @@ function handleAdminPage(request, env, ctx) {
 		}
 
 		/* Dynamic Background Orbs */
-		.bg-orbs-container {
-			position: fixed;
-			top: 0;
-			left: 0;
-			width: 100%;
-			height: 100%;
-			z-index: -1;
-			overflow: hidden;
-			pointer-events: none;
-		}
-
-		.bg-orb {
-			position: absolute;
-			border-radius: 50%;
-			filter: blur(100px);
-			animation: float 25s infinite alternate ease-in-out;
-		}
+		${SHARED_BG_CSS}
 
 		.bg-orb-1 {
 			top: -10%;
@@ -5559,23 +5534,7 @@ function handleKVError(request) {
 		}
 
 		/* Dynamic Background Orbs */
-		.bg-orbs-container {
-			position: fixed;
-			top: 0;
-			left: 0;
-			width: 100%;
-			height: 100%;
-			z-index: -1;
-			overflow: hidden;
-			pointer-events: none;
-		}
-
-		.bg-orb {
-			position: absolute;
-			border-radius: 50%;
-			filter: blur(100px);
-			animation: float 25s infinite alternate ease-in-out;
-		}
+		${SHARED_BG_CSS}
 
 		.bg-orb-1 {
 			top: -10%;
@@ -5598,19 +5557,7 @@ function handleKVError(request) {
 			100% { transform: translate(5%, 5%) scale(1.05); }
 		}
 
-		.error-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 20px;
-			padding: 40px;
-			max-width: 500px;
-			width: 100%;
-			text-align: center;
-			box-shadow: var(--card-shadow);
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			z-index: 10;
-		}
+		${SHARED_ERROR_CARD_CSS}
 
 		h1 {
 			font-family: 'Outfit', sans-serif;
@@ -5744,23 +5691,7 @@ function handlePasswordError(request) {
 		}
 
 		/* Dynamic Background Orbs */
-		.bg-orbs-container {
-			position: fixed;
-			top: 0;
-			left: 0;
-			width: 100%;
-			height: 100%;
-			z-index: -1;
-			overflow: hidden;
-			pointer-events: none;
-		}
-
-		.bg-orb {
-			position: absolute;
-			border-radius: 50%;
-			filter: blur(100px);
-			animation: float 25s infinite alternate ease-in-out;
-		}
+		${SHARED_BG_CSS}
 
 		.bg-orb-1 {
 			top: -10%;
@@ -5783,19 +5714,7 @@ function handlePasswordError(request) {
 			100% { transform: translate(5%, 5%) scale(1.05); }
 		}
 
-		.error-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 20px;
-			padding: 40px;
-			max-width: 500px;
-			width: 100%;
-			text-align: center;
-			box-shadow: var(--card-shadow);
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			z-index: 10;
-		}
+		${SHARED_ERROR_CARD_CSS}
 
 		h1 {
 			font-family: 'Outfit', sans-serif;
