@@ -153,7 +153,9 @@ async function getAppConfig(env) {
 				customModelMap: data.customModelMap || {},
 				usageLimits: data.usageLimits || {}
 			};
-		} catch (e) { }
+		} catch (e) {
+			console.error('Failed to parse KV config JSON:', e);
+		}
 	} else {
 		// 仅在 KV 首次初始化时写入默认模型映射，避免覆盖已有配置。
 		parsed.customModelMap = { ...DEFAULT_MODEL_MAP };
@@ -368,7 +370,9 @@ async function getCachedSummary(env) {
 			if (Date.now() - data.timestamp < 300000) { // 缓存有效期 5 分钟
 				return data;
 			}
-		} catch (e) { }
+		} catch (e) {
+			console.error('Failed to parse cached usage summary:', e);
+		}
 	}
 	return null;
 }
@@ -1719,7 +1723,7 @@ async function handleDashboardApi(request, env, ctx) {
 			const cachedDetailsRaw = await env.KV.get('cache_usage_details');
 			let cacheMap = {};
 			if (cachedDetailsRaw) {
-				try { cacheMap = JSON.parse(cachedDetailsRaw) || {}; } catch (e) { }
+				try { cacheMap = JSON.parse(cachedDetailsRaw) || {}; } catch (e) { console.error('Failed to parse cache_usage_details:', e); }
 			}
 
 			const summary = await buildUsageSummary(env, accounts, cacheMap);
@@ -5105,6 +5109,11 @@ function handleAdminPage(request, env, ctx) {
 				.replace(/>/g, '&gt;')
 				.replace(/"/g, '&quot;')
 				.replace(/'/g, '&#39;');
+		}
+
+		// 对 HTML 属性中 JS 字符串字面量的值做转义（用于 onclick 等内联属性）
+		function attrEscape(str) {
+			return JSON.stringify(String(str)).replace(/"/g, '&quot;');
 		}
 
 		function setAlertStyle(el, type) {
