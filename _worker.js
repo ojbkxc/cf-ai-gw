@@ -82,11 +82,10 @@ export default {
 
 		// 5. 后台管理面板页面
 		if (url.pathname === '/admin' || url.pathname === '/admin/') {
-			const isLoggedIn = await verifyAdminCookie(request, env);
+			const isLoggedIn = await checkAdminAuth(request, env);
 			if (isLoggedIn) {
 				return handleAdminPage(request, env, ctx);
 			} else {
-				// 未登录则跳转到首页（登录页）
 				return new Response(null, {
 					status: 302,
 					headers: { 'Location': '/' }
@@ -130,27 +129,9 @@ async function sha256(message) {
 
 // ----------------------------------------------------
 // KV 读写相关工具函数
-// （把所有配置合并存到一个 'config' 键里，一次读取就能拿到全部配置，省 KV 读次数）
+// （把所有配置合并存到一个 'config' 键里，一次读取就能拿到全部配置）
 // ----------------------------------------------------
-const memoryCache = {
-	config: null,
-	configExpiry: 0
-};
-const CACHE_TTL_MS = 60000; // 内存缓存有效期：1 分钟
-
-// 限流检查结果的内存缓存（避免每次请求都读 KV）
-const limitCheckCache = {
-	result: null,
-	expiry: 0
-};
-const LIMIT_CHECK_CACHE_MS = 30000; // 限流检查缓存 30 秒
-
 async function getAppConfig(env) {
-	const now = Date.now();
-	if (memoryCache.config && now < memoryCache.configExpiry) {
-		return memoryCache.config;
-	}
-
 	const raw = await env.KV.get('config');
 	let parsed = { accounts: [], apiKeys: [], customModelMap: {}, usageLimits: {} };
 
@@ -170,15 +151,11 @@ async function getAppConfig(env) {
 		await env.KV.put('config', JSON.stringify(parsed));
 	}
 
-	memoryCache.config = parsed;
-	memoryCache.configExpiry = now + CACHE_TTL_MS;
 	return parsed;
 }
 
 async function saveAppConfig(env, config) {
 	await env.KV.put('config', JSON.stringify(config));
-	memoryCache.config = config;
-	memoryCache.configExpiry = Date.now() + CACHE_TTL_MS;
 }
 
 async function getAccounts(env) {
@@ -248,21 +225,6 @@ async function checkAdminAuth(request, env) {
 	const expectedPassword = env.ADMIN_PASSWORD ? env.ADMIN_PASSWORD.trim() : '';
 
 	if (!expectedPassword) return false; // 还没配置管理员密码
-
-	const expectedHash = await sha256(expectedPassword);
-	return token === expectedHash;
-}
-
-// 校验管理员的登录 Cookie（用于页面访问的权限判断）
-async function verifyAdminCookie(request, env) {
-	const cookies = request.headers.get('Cookie') || '';
-	const cookieMatch = cookies.match(/admin_token=([^;]+)/);
-	if (!cookieMatch) return false;
-
-	const token = cookieMatch[1];
-
-	const expectedPassword = env.ADMIN_PASSWORD ? env.ADMIN_PASSWORD.trim() : '';
-	if (!expectedPassword) return false;
 
 	const expectedHash = await sha256(expectedPassword);
 	return token === expectedHash;
@@ -341,17 +303,10 @@ async function getMonthlyUsage(env) {
 // 用量限额检查：读取日/月用量，超过阈值则返回 blocked
 // ----------------------------------------------------
 async function checkUsageLimit(env) {
-	const now = Date.now();
-
-	// 1. 优先返回内存缓存（30 秒内免 KV 读取）
-	if (limitCheckCache.result && now < limitCheckCache.expiry) {
-		return limitCheckCache.result;
-	}
-
-	// 2. 读取环境变量，未设置则使用默认值
+	// 1. 读取环境变量，未设置则使用默认值
 	const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
 
-	// 3. 获取当日用量（优先读缓存汇总，过期则从明细汇总）
+	// 2. 获取当日用量（优先读缓存汇总，过期则从明细汇总）
 	let dailyUsage = 0;
 	const cached = await getCachedSummary(env);
 	if (cached) {
@@ -369,10 +324,10 @@ async function checkUsageLimit(env) {
 		}
 	}
 
-	// 4. 获取当月用量（从独立 KV 键读取，由 refreshAccountsUsage 定期更新）
+	// 3. 获取当月用量（从独立 KV 键读取，由 refreshAccountsUsage 定期更新）
 	const monthlyUsage = await getMonthlyUsage(env);
 
-	// 5. 判断是否触发拦截（threshold <= 0 表示关闭限额：仅统计不拦截）
+	// 4. 判断是否触发拦截（threshold <= 0 表示关闭限额：仅统计不拦截）
 	let result;
 	if (threshold <= 0) {
 		result = { allowed: true, dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold };
@@ -389,10 +344,6 @@ async function checkUsageLimit(env) {
 			result = { allowed: true, dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold };
 		}
 	}
-
-	// 6. 写入内存缓存
-	limitCheckCache.result = result;
-	limitCheckCache.expiry = now + LIMIT_CHECK_CACHE_MS;
 
 	return result;
 }
@@ -418,11 +369,11 @@ async function setCachedSummary(env, summaryData) {
 		...summaryData,
 		timestamp: Date.now()
 	};
-	await env.KV.put('cache_usage_summary', JSON.stringify(data), { expirationTtl: 600 }); // TTL 10 分钟
+	await env.KV.put('cache_usage_summary', JSON.stringify(data), { expirationTtl: 300 });
 }
 
 // 从 cacheMap + accounts 构建用量汇总响应（消除 GET/POST 重复代码）
-async function buildSummaryResponse(env, accounts, cacheMap, needUpdate) {
+async function buildSummaryResponse(env, accounts, cacheMap) {
 	const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
 	let totalNeuronsToday = 0;
 	const modelsToday = {};
@@ -446,7 +397,6 @@ async function buildSummaryResponse(env, accounts, cacheMap, needUpdate) {
 		totalLimit: dailyLimit,
 		usagePercentage,
 		modelsToday: formattedModelsToday,
-		needUpdate,
 		dailyUsage: totalNeuronsToday,
 		dailyLimit,
 		monthlyUsage,
@@ -771,10 +721,9 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 		return { success: false, error: "No active Cloudflare accounts configured. Add them in the WebUI." };
 	}
 
-	const shuffledAccounts = [...activeAccounts].sort(() => Math.random() - 0.5);
 	let lastError = null;
 
-	for (const account of shuffledAccounts) {
+	for (const account of activeAccounts) {
 		try {
 			const cfResponse = await fetch(
 				`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/v1/chat/completions`,
@@ -1566,10 +1515,9 @@ async function handleEmbeddings(request, env) {
 		return new Response(JSON.stringify({ error: { message: "No active accounts configured", type: "server_error" } }), { status: 503 });
 	}
 
-	const shuffledAccounts = [...activeAccounts].sort(() => Math.random() - 0.5);
 	let lastError = null;
 
-	for (const account of shuffledAccounts) {
+	for (const account of activeAccounts) {
 		try {
 			const cfResponse = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/run/${cfModel}`, {
 				method: 'POST',
@@ -1708,19 +1656,7 @@ async function handleDashboardApi(request, env, ctx) {
 	const url = new URL(request.url);
 	const method = request.method;
 
-	// 1. 查询初始化状态（密码通过环境变量配置，所以这里永远返回已初始化）
-	if (url.pathname === '/api/auth/status' && method === 'GET') {
-		return new Response(JSON.stringify({
-			isSetup: true
-		}), { headers: { 'Content-Type': 'application/json' } });
-	}
-
-	// 2. 设置首个管理员密码（已停用，改由环境变量 ADMIN_PASSWORD 配置）
-	if (url.pathname === '/api/auth/setup' && method === 'POST') {
-		return new Response(JSON.stringify({ error: 'Setup is handled via environment variable ADMIN_PASSWORD' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-	}
-
-	// 3. 登录（直接比对密码，不读写 KV，既快又省钱）
+	// 1. 登录（直接比对密码，不读写 KV，既快又省钱）
 	if (url.pathname === '/api/auth/login' && method === 'POST') {
 		const { password } = await request.json();
 		const expectedPassword = env.ADMIN_PASSWORD ? env.ADMIN_PASSWORD.trim() : '';
@@ -1737,7 +1673,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
-	// 4. 退出登录
+	// 2. 退出登录
 	if (url.pathname === '/api/auth/logout' && method === 'POST') {
 		return new Response(JSON.stringify({ success: true }), {
 			headers: {
@@ -1747,7 +1683,7 @@ async function handleDashboardApi(request, env, ctx) {
 		});
 	}
 
-	// 5. 公开的用量汇总（首页未登录时也能看到）
+	// 3. 公开的用量汇总（首页未登录时也能看到）
 	if (url.pathname === '/api/usage/summary') {
 		if (method === 'GET') {
 			const cached = await getCachedSummary(env);
@@ -1773,27 +1709,20 @@ async function handleDashboardApi(request, env, ctx) {
 			if (accounts.length === 0) {
 				return new Response(JSON.stringify({
 					totalNeuronsToday: 0, totalAccounts: 0, totalLimit: limits.dailyLimit,
-					usagePercentage: 0, modelsToday: [], needUpdate: false,
+					usagePercentage: 0, modelsToday: [],
 					dailyUsage: 0, dailyLimit: limits.dailyLimit, monthlyUsage: 0,
 					monthlyLimit: limits.monthlyLimit, threshold: limits.threshold
 				}), { headers: { 'Content-Type': 'application/json' } });
 			}
 
-			// 读取缓存的卡片明细来检查更新时间
+			// 读取缓存的卡片明细
 			const cachedDetailsRaw = await env.KV.get('cache_usage_details');
 			let cacheMap = {};
 			if (cachedDetailsRaw) {
 				try { cacheMap = JSON.parse(cachedDetailsRaw) || {}; } catch (e) { }
 			}
 
-			// 判断是否有任意一个账号的更新时间超过了 20 分钟
-			const now = Date.now();
-			const hasOutdated = accounts.some(account => {
-				const lastUpdated = cacheMap[account.id]?.timestamp || 0;
-				return (now - lastUpdated) > 20 * 60 * 1000;
-			});
-
-			const summary = await buildSummaryResponse(env, accounts, cacheMap, hasOutdated);
+			const summary = await buildSummaryResponse(env, accounts, cacheMap);
 			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json' } });
 		}
 
@@ -1810,14 +1739,14 @@ async function handleDashboardApi(request, env, ctx) {
 			if (accounts.length === 0) {
 				return new Response(JSON.stringify({
 					totalNeuronsToday: 0, totalAccounts: 0, totalLimit: limits.dailyLimit,
-					usagePercentage: 0, modelsToday: [], needUpdate: false,
+					usagePercentage: 0, modelsToday: [],
 					dailyUsage: 0, dailyLimit: limits.dailyLimit, monthlyUsage: 0,
 					monthlyLimit: limits.monthlyLimit, threshold: limits.threshold
 				}), { headers: { 'Content-Type': 'application/json' } });
 			}
 
 			const cacheMap = await refreshAccountsUsage(env, accounts, 20);
-			const summary = await buildSummaryResponse(env, accounts, cacheMap, false);
+			const summary = await buildSummaryResponse(env, accounts, cacheMap);
 			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json' } });
 		}
 	}
@@ -1875,7 +1804,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
-	// 7. 测试账号是否能正常连接
+	// 4. 测试账号是否能正常连接
 	if (url.pathname === '/api/accounts/test' && method === 'POST') {
 		const { id, accountId, apiToken } = await request.json();
 		let targetAccountId = accountId;
@@ -2003,7 +1932,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 8. 登录后看到的详细用量统计
+	// 5. 登录后看到的详细用量统计
 	if (url.pathname === '/api/accounts/usage' && method === 'GET') {
 		const accounts = await getAccounts(env);
 		const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
@@ -2046,7 +1975,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 9. 代理接口用的自定义 API 密钥管理
+	// 6. 代理接口用的自定义 API 密钥管理
 	if (url.pathname === '/api/keys') {
 		if (method === 'GET') {
 			const keys = await getApiKeys(env);
@@ -2080,7 +2009,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
-	// 10. 模型设置和映射
+	// 7. 模型设置和映射
 	if (url.pathname === '/api/settings') {
 		if (method === 'GET') {
 			const customMap = await getCustomModelMap(env);
@@ -2097,7 +2026,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
-	// 11. 用量限额配置（阈值、日/月限额）
+	// 8. 用量限额配置（阈值、日/月限额）
 	if (url.pathname === '/api/limits') {
 		if (method === 'GET') {
 			const limits = await getUsageLimits(env);
@@ -2134,11 +2063,6 @@ async function handleDashboardApi(request, env, ctx) {
 			}
 
 			await saveUsageLimitsConfig(env, updates);
-			// 清除内存缓存，让下次读取时从 KV 重新加载
-			memoryCache.config = null;
-			memoryCache.configExpiry = 0;
-			limitCheckCache.result = null;
-			limitCheckCache.expiry = 0;
 
 			const newLimits = await getUsageLimits(env);
 			return new Response(JSON.stringify({ success: true, limits: newLimits }), { headers: { 'Content-Type': 'application/json' } });
@@ -2154,30 +2078,7 @@ async function handleDashboardApi(request, env, ctx) {
 
 // 1. 首页 / 登录页
 async function handleLandingPage(request, env, ctx) {
-	const isLoggedIn = await verifyAdminCookie(request, env);
-
-	let actionCardHtml = '';
-	if (isLoggedIn) {
-		actionCardHtml = `
-			<div class="section-card" style="text-align: center;">
-				<div class="section-title" style="justify-content: center; margin-bottom: 10px;">欢迎回来</div>
-				<p style="font-size: 14px; color: var(--text-muted); margin-bottom: 20px;">您当前已登录管理员身份。</p>
-				<a href="/admin" class="btn btn-primary" style="width: 100%; text-decoration: none; display: flex; align-items: center; justify-content: center;">进入后台管理面板</a>
-				<button class="btn btn-secondary" onclick="submitLogout()" style="width: 100%; margin-top: 12px;">安全退出</button>
-			</div>
-		`;
-	} else {
-		actionCardHtml = `
-			<div class="section-card" id="login-form-card">
-				<div class="section-title">后台管理员登录</div>
-				<div class="form-group" style="margin-top: 15px;">
-					<label for="login-password">管理员密码</label>
-					<input type="password" id="login-password" placeholder="请输入管理员密码" onkeydown="if(event.key==='Enter')submitLogin()">
-				</div>
-				<button class="btn btn-primary" onclick="submitLogin()" style="width: 100%; margin-top: 10px;">登录</button>
-			</div>
-		`;
-	}
+	const isLoggedIn = await checkAdminAuth(request, env);
 
 	const html = `<!DOCTYPE html>
 <head>
@@ -3032,17 +2933,7 @@ async function handleLandingPage(request, env, ctx) {
 			try {
 				const res = await fetch('/api/usage/summary');
 				const data = await res.json();
-				
 				renderPublicSummary(data);
-
-				// 如果后端认为需要更新，则继续发送 POST 请求触发静默更新并获取最新数据
-				if (data.needUpdate) {
-					const updateRes = await fetch('/api/usage/summary', { method: 'POST' });
-					if (updateRes.ok) {
-						const freshData = await updateRes.json();
-						renderPublicSummary(freshData);
-					}
-				}
 			} catch (e) {
 				console.error(e);
 			}
