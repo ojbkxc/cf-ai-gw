@@ -1214,7 +1214,7 @@ async function handleMessages(request, env) {
 
 	if (stream) {
 		// 流式：转换流
-		const transformedStream = anthropicStreamTransform(result.stream, model, anthropicBody.messages);
+		const transformedStream = anthropicStreamTransform(result.stream, model);
 		return new Response(transformedStream, {
 			headers: {
 				'Content-Type': 'text/event-stream',
@@ -1237,7 +1237,7 @@ async function handleMessages(request, env) {
 // Anthropic SSE 流式转换
 // 将 OpenAI SSE 格式实时转换为 Anthropic SSE 格式
 // ----------------------------------------------------
-function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
+function anthropicStreamTransform(upstreamBody, modelName) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
@@ -1683,7 +1683,7 @@ async function handleDashboardApi(request, env, ctx) {
 		return new Response(JSON.stringify({ success: true }), {
 			headers: {
 				'Content-Type': 'application/json',
-				'Set-Cookie': `admin_token=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`
+				'Set-Cookie': `admin_token=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`
 			}
 		});
 	}
@@ -5029,13 +5029,13 @@ function handleAdminPage(request, env, ctx) {
 					const maskedToken = acc.apiToken.length > 8 ? acc.apiToken.substring(0, 4) + '...' + acc.apiToken.substring(acc.apiToken.length - 4) : '********';
 					const tr = document.createElement('tr');
 					tr.innerHTML = \`
-						<td><strong style="font-weight:600;">\${acc.name}</strong></td>
-						<td><code>\${acc.accountId}</code></td>
-						<td><code>\${maskedToken}</code></td>
+						<td><strong style="font-weight:600;">\${escapeHtml(acc.name)}</strong></td>
+						<td><code>\${escapeHtml(acc.accountId)}</code></td>
+						<td><code>\${escapeHtml(maskedToken)}</code></td>
 						<td>
 							<div style="display:flex; gap:8px;">
-								<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" onclick="editAccount('\${acc.id}', '\${acc.name}', '\${acc.accountId}', '\${acc.apiToken}')">编辑</button>
-								<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteAccount('\${acc.id}')">删除</button>
+								<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" onclick="editAccount(\${attrEscape(acc.id)}, \${attrEscape(acc.name)}, \${attrEscape(acc.accountId)}, \${attrEscape(acc.apiToken)})">编辑</button>
+								<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteAccount(\${attrEscape(acc.id)})">删除</button>
 							</div>
 						</td>
 					\`;
