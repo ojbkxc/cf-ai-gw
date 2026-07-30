@@ -26,10 +26,18 @@ const DEFAULT_MODEL_MAP = {
 	'mistral-7b': '@cf/mistral/mistral-7b-instruct-v0.1',
 	'deepseek-coder-6.7b': '@cf/deepseek-ai/deepseek-coder-6.7b-instruct',
 	'llama-3.2-3b': '@cf/meta/llama-3.2-3b-instruct',
+	'llama-3.2-1b': '@cf/meta/llama-3.2-1b-instruct',
+	'codellama-34b': '@cf/codellama/codellama-34b-instruct',
+	'codellama-13b': '@cf/codellama/codellama-13b-instruct',
 	'codellama-7b': '@cf/codellama/codellama-7b-instruct',
+	'mixtral-8x7b': '@cf/mistral/mixtral-8x7b-instruct',
+	'gemma-2-27b': '@cf/google/gemma-2-27b-it',
+	'gemma-2-9b': '@cf/google/gemma-2-9b-it',
+	'gemma-2-2b': '@cf/google/gemma-2-2b-it',
+	'phi-3-mini': '@cf/microsoft/phi-3-mini-4k-instruct',
+	'phi-2': '@cf/microsoft/phi-2',
 	'qwen1.5-7b': '@cf/qwen/qwen1.5-7b-instruct',
 	'internlm2-7b': '@cf/internlm/internlm2-7b-instruct',
-	'phi-2': '@cf/microsoft/phi-2',
 
 	// 向量嵌入（Embeddings）模型
 	'embeddinggemma-300m': '@cf/google/embeddinggemma-300m',
@@ -40,6 +48,7 @@ const DEFAULT_MODEL_MAP = {
 	// 多模态模型
 	'llava-1.5-7b': '@cf/llava-hf/llava-1.5-7b-hf',
 	'flux-1-schnell': '@cf/black-forest-labs/flux-1-schnell',
+	'sdxl': '@cf/stabilityai/stable-diffusion-xl-base-1.0',
 	'whisper': '@cf/openai/whisper'
 };
 
@@ -273,7 +282,7 @@ function getEnvFloat(env, key, defaultVal) {
 }
 
 // 统一读取日/月限额和阈值配置
-// 优先级：KV 中保存的配置 > 环境变量 > 默认值
+// 优先级：环境变量 > KV 中保存的配置 > 默认值
 // threshold <= 0 表示关闭限额拦截：用量照常统计，但不会拦截请求。
 async function getUsageLimits(env) {
 	// 先从 KV 读取用户保存的配置
@@ -372,8 +381,18 @@ async function setCachedSummary(env, summaryData) {
 	await env.KV.put('cache_usage_summary', JSON.stringify(data), { expirationTtl: 300 });
 }
 
-// 从 cacheMap + accounts 构建用量汇总响应（消除 GET/POST 重复代码）
-async function buildSummaryResponse(env, accounts, cacheMap) {
+// 构建空用量响应（无账号时用）
+function emptyUsageResponse(limits) {
+	return {
+		totalNeuronsToday: 0, totalAccounts: 0, totalLimit: limits.dailyLimit,
+		usagePercentage: 0, modelsToday: [],
+		dailyUsage: 0, dailyLimit: limits.dailyLimit, monthlyUsage: 0,
+		monthlyLimit: limits.monthlyLimit, threshold: limits.threshold
+	};
+}
+
+// 从 cacheMap + accounts 构建用量汇总
+async function buildUsageSummary(env, accounts, cacheMap) {
 	const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
 	let totalNeuronsToday = 0;
 	const modelsToday = {};
@@ -391,7 +410,7 @@ async function buildSummaryResponse(env, accounts, cacheMap) {
 	const formattedModelsToday = Object.keys(modelsToday).map(model => ({ model, neurons: modelsToday[model] }));
 	const monthlyUsage = await getMonthlyUsage(env);
 	const usagePercentage = dailyLimit > 0 ? parseFloat(((totalNeuronsToday / dailyLimit) * 100).toFixed(2)) : 0;
-	const summary = {
+	return {
 		totalNeuronsToday,
 		totalAccounts: accounts.length,
 		totalLimit: dailyLimit,
@@ -403,8 +422,6 @@ async function buildSummaryResponse(env, accounts, cacheMap) {
 		monthlyLimit,
 		threshold
 	};
-	await setCachedSummary(env, summary);
-	return summary;
 }
 
 async function refreshAccountsUsage(env, accounts, limit = 20) {
@@ -573,7 +590,7 @@ function processAnalytics(groups) {
 	for (const group of groups) {
 		const date = group.dimensions.date;
 		const model = group.dimensions.modelId;
-		const neurons = group.sum.totalNeurons || 0;
+		const neurons = group.sum?.totalNeurons || 0;
 		const count = group.count || 0;
 
 		if (date === todayStr) {
@@ -721,6 +738,10 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 
 			if (cfResponse.ok) {
 				if (stream) {
+					if (!cfResponse.body) {
+						lastError = `CF API returned empty response body`;
+						continue;
+					}
 					return { success: true, stream: cfResponse.body };
 				} else {
 					const cfJson = await cfResponse.json();
@@ -755,6 +776,25 @@ async function resolveModelName(model, env) {
 	return combinedMap[model] || null;
 }
 
+// 模型名解析 + 错误响应：找不到模型时返回对应的错误 Response
+async function resolveModelOrError(model, env, errorFormat = 'openai') {
+	const cfModel = await resolveModelName(model, env);
+	if (cfModel) return { model: cfModel };
+
+	const msg = `Model '${model}' not found. Available models: see /v1/models. Use @cf/<org>/<model> to pass through a raw Cloudflare model id.`;
+
+	if (errorFormat === 'anthropic') {
+		return { error: new Response(JSON.stringify({
+			type: 'error',
+			error: { type: 'invalid_request_error', message: msg }
+		}), { status: 404, headers: { 'Content-Type': 'application/json' } }) };
+	}
+
+	return { error: new Response(JSON.stringify({
+		error: { message: msg, type: "invalid_request_error", param: "model", code: "model_not_found" }
+	}), { status: 404, headers: { 'Content-Type': 'application/json' } }) };
+}
+
 // 对话补全 / 文本补全 的代理处理函数
 async function handleCompletions(request, env, pathname) {
 	let body;
@@ -774,17 +814,9 @@ async function handleCompletions(request, env, pathname) {
 	}
 
 	// 解析模型名映射
-	const cfModel = await resolveModelName(model, env);
-	if (!cfModel) {
-		return new Response(JSON.stringify({
-			error: {
-				message: `Model '${model}' not found. Available models: see /v1/models. Use @cf/<org>/<model> to pass through a raw Cloudflare model id.`,
-				type: "invalid_request_error",
-				param: "model",
-				code: "model_not_found"
-			}
-		}), { status: 404, headers: { 'Content-Type': 'application/json' } });
-	}
+	const resolved = await resolveModelOrError(model, env);
+	if (resolved.error) return resolved.error;
+	const cfModel = resolved.model;
 
 	// 构造发给 Cloudflare 的请求体
 	const cfPayload = {
@@ -1020,14 +1052,17 @@ function convertAnthropicToOpenAI(anthropicBody) {
 		}));
 	}
 
-	// tool_choice 转换
+	// tool_choice 转换：支持字符串 ("auto"|"any"|"none") 和对象 ({type:"auto"|"any"|"tool"|"none"}) 两种形式
 	if (anthropicBody.tool_choice) {
 		const tc = anthropicBody.tool_choice;
-		if (tc.type === 'auto') {
+		const type = typeof tc === 'string' ? tc : tc.type;
+		if (type === 'auto') {
 			openaiBody.tool_choice = 'auto';
-		} else if (tc.type === 'any') {
+		} else if (type === 'any') {
 			openaiBody.tool_choice = 'required';
-		} else if (tc.type === 'tool' && tc.name) {
+		} else if (type === 'none') {
+			openaiBody.tool_choice = 'none';
+		} else if (type === 'tool' && tc.name) {
 			openaiBody.tool_choice = { type: 'function', function: { name: tc.name } };
 		}
 	}
@@ -1069,16 +1104,15 @@ function convertOpenAIToAnthropic(openaiResponse, originalModel) {
 		for (const tc of message.tool_calls) {
 			let inputObj = {};
 			try {
-				inputObj = typeof tc.function.arguments === 'string'
-					? JSON.parse(tc.function.arguments)
-					: tc.function.arguments;
+				const args = tc.function?.arguments;
+				inputObj = typeof args === 'string' ? JSON.parse(args) : (args || {});
 			} catch (_) {
 				inputObj = {};
 			}
 			anthropicResponse.content.push({
 				type: 'tool_use',
 				id: tc.id,
-				name: tc.function.name,
+				name: tc.function?.name || '',
 				input: inputObj
 			});
 		}
@@ -1102,7 +1136,7 @@ function convertOpenAIToAnthropic(openaiResponse, originalModel) {
 // ----------------------------------------------------
 // OpenAI 错误响应 → Anthropic 错误格式转换
 // ----------------------------------------------------
-function convertOpenAIErrorToAnthropic(openaiError, statusCode) {
+function convertOpenAIErrorToAnthropic(openaiError) {
 	return {
 		type: 'error',
 		error: {
@@ -1145,16 +1179,9 @@ async function handleMessages(request, env) {
 
 	// 解析模型名映射
 	const model = anthropicBody.model;
-	const cfModel = await resolveModelName(model, env);
-	if (!cfModel) {
-		return new Response(JSON.stringify({
-			type: 'error',
-			error: {
-				type: 'invalid_request_error',
-				message: `Model '${model}' not found. Available models: see /v1/models. Use @cf/<org>/<model> to pass through a raw Cloudflare model id.`
-			}
-		}), { status: 404, headers: { 'Content-Type': 'application/json' } });
-	}
+	const resolved = await resolveModelOrError(model, env, 'anthropic');
+	if (resolved.error) return resolved.error;
+	const cfModel = resolved.model;
 
 	// Anthropic → OpenAI 格式转换
 	const openaiBody = convertAnthropicToOpenAI(anthropicBody);
@@ -1177,8 +1204,7 @@ async function handleMessages(request, env) {
 		} catch (_) { }
 
 		const anthropicError = convertOpenAIErrorToAnthropic(
-			errorDetail || { message: result.error },
-			result.status || 502
+			errorDetail || { message: result.error }
 		);
 		return new Response(JSON.stringify(anthropicError), {
 			status: result.status || 502,
@@ -1478,17 +1504,9 @@ async function handleEmbeddings(request, env) {
 	}
 
 	// 解析模型名映射
-	const cfModel = await resolveModelName(model, env);
-	if (!cfModel) {
-		return new Response(JSON.stringify({
-			error: {
-				message: `Model '${model}' not found. Available models: see /v1/models. Use @cf/<org>/<model> to pass through a raw Cloudflare model id.`,
-				type: "invalid_request_error",
-				param: "model",
-				code: "model_not_found"
-			}
-		}), { status: 404, headers: { 'Content-Type': 'application/json' } });
-	}
+	const resolved = await resolveModelOrError(model, env);
+	if (resolved.error) return resolved.error;
+	const cfModel = resolved.model;
 
 	const textArray = Array.isArray(input) ? input : [input];
 	const accounts = await getAccounts(env);
@@ -1513,7 +1531,12 @@ async function handleEmbeddings(request, env) {
 			if (cfResponse.ok) {
 				const cfJson = await cfResponse.json();
 				if (cfJson.success) {
-					const embeddings = cfJson.result.data.map((emb, index) => ({
+					const data = cfJson.result?.data;
+					if (!Array.isArray(data)) {
+						lastError = `CF Run returned unexpected result format`;
+						continue;
+					}
+					const embeddings = data.map((emb, index) => ({
 						object: "embedding",
 						index: index,
 						embedding: emb
@@ -1647,7 +1670,7 @@ async function handleDashboardApi(request, env, ctx) {
 			return new Response(JSON.stringify({ success: true }), {
 				headers: {
 					'Content-Type': 'application/json',
-					'Set-Cookie': `admin_token=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`
+					'Set-Cookie': `admin_token=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400`
 				}
 			});
 		} else {
@@ -1689,12 +1712,7 @@ async function handleDashboardApi(request, env, ctx) {
 			const limits = await getUsageLimits(env);
 
 			if (accounts.length === 0) {
-				return new Response(JSON.stringify({
-					totalNeuronsToday: 0, totalAccounts: 0, totalLimit: limits.dailyLimit,
-					usagePercentage: 0, modelsToday: [],
-					dailyUsage: 0, dailyLimit: limits.dailyLimit, monthlyUsage: 0,
-					monthlyLimit: limits.monthlyLimit, threshold: limits.threshold
-				}), { headers: { 'Content-Type': 'application/json' } });
+				return new Response(JSON.stringify(emptyUsageResponse(limits)), { headers: { 'Content-Type': 'application/json' } });
 			}
 
 			// 读取缓存的卡片明细
@@ -1704,7 +1722,8 @@ async function handleDashboardApi(request, env, ctx) {
 				try { cacheMap = JSON.parse(cachedDetailsRaw) || {}; } catch (e) { }
 			}
 
-			const summary = await buildSummaryResponse(env, accounts, cacheMap);
+			const summary = await buildUsageSummary(env, accounts, cacheMap);
+			await setCachedSummary(env, summary);
 			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json' } });
 		}
 
@@ -1719,16 +1738,12 @@ async function handleDashboardApi(request, env, ctx) {
 			const limits = await getUsageLimits(env);
 
 			if (accounts.length === 0) {
-				return new Response(JSON.stringify({
-					totalNeuronsToday: 0, totalAccounts: 0, totalLimit: limits.dailyLimit,
-					usagePercentage: 0, modelsToday: [],
-					dailyUsage: 0, dailyLimit: limits.dailyLimit, monthlyUsage: 0,
-					monthlyLimit: limits.monthlyLimit, threshold: limits.threshold
-				}), { headers: { 'Content-Type': 'application/json' } });
+				return new Response(JSON.stringify(emptyUsageResponse(limits)), { headers: { 'Content-Type': 'application/json' } });
 			}
 
 			const cacheMap = await refreshAccountsUsage(env, accounts, 20);
-			const summary = await buildSummaryResponse(env, accounts, cacheMap);
+			const summary = await buildUsageSummary(env, accounts, cacheMap);
+			await setCachedSummary(env, summary);
 			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json' } });
 		}
 	}
@@ -2057,6 +2072,65 @@ async function handleDashboardApi(request, env, ctx) {
 // ----------------------------------------------------
 // 前端页面处理函数（按页面拆分）
 // ----------------------------------------------------
+
+// 两个页面共享的 JS 工具函数（toast / theme）
+const SHARED_JS = `
+		function showToast(message, type = 'success') {
+			let container = document.querySelector('.toast-container');
+			if (!container) {
+				container = document.createElement('div');
+				container.className = 'toast-container';
+				document.body.appendChild(container);
+			}
+
+			const toast = document.createElement('div');
+			toast.className = \`toast toast-\${type}\`;
+			
+			let iconSvg = '';
+			if (type === 'success') {
+				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>\`;
+			} else if (type === 'error') {
+				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>\`;
+			} else {
+				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>\`;
+			}
+
+			toast.innerHTML = \`\${iconSvg}<span>\${message}</span>\`;
+			container.appendChild(toast);
+
+			toast.offsetHeight; // trigger reflow
+			toast.classList.add('show');
+
+			setTimeout(() => {
+				toast.classList.remove('show');
+				setTimeout(() => toast.remove(), 400);
+			}, 3000);
+		}
+
+		function initTheme() {
+			const savedTheme = localStorage.getItem('theme');
+			if (savedTheme) {
+				document.documentElement.setAttribute('data-theme', savedTheme);
+			} else {
+				const systemPrefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+				const defaultTheme = systemPrefersDark ? 'dark' : 'light';
+				document.documentElement.setAttribute('data-theme', defaultTheme);
+			}
+			updateThemeIcons();
+		}
+
+		function updateThemeIcons() {
+			const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+			const sunIcons = document.querySelectorAll('.theme-icon-sun');
+			const moonIcons = document.querySelectorAll('.theme-icon-moon');
+			if (currentTheme === 'light') {
+				sunIcons.forEach(el => el.style.display = 'none');
+				moonIcons.forEach(el => el.style.display = 'block');
+			} else {
+				sunIcons.forEach(el => el.style.display = 'block');
+				moonIcons.forEach(el => el.style.display = 'none');
+			}
+		}`;
 
 // 1. 首页 / 登录页
 async function handleLandingPage(request, env, ctx) {
@@ -2719,7 +2793,7 @@ async function handleLandingPage(request, env, ctx) {
 				<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
 			</svg>
 		</button>
-		<button class="floating-btn" onclick="openLoginModal()" title="${isLoggedIn ? '管理后台' : '管理员登录'}" style="background: var(--primary-gradient); color: white; border: none;">
+		<button class="floating-btn" onclick="${isLoggedIn ? "window.location.href='/admin'" : 'openLoginModal()'}" title="${isLoggedIn ? '管理后台' : '管理员登录'}" style="background: var(--primary-gradient); color: white; border: none;">
 			${isLoggedIn ? `
 				<!-- User Check Icon -->
 				<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 20px; height: 20px;">
@@ -2820,50 +2894,7 @@ async function handleLandingPage(request, env, ctx) {
 	</div>
 
 	<script>
-		// Toast Helper
-		function showToast(message, type = 'success') {
-			let container = document.querySelector('.toast-container');
-			if (!container) {
-				container = document.createElement('div');
-				container.className = 'toast-container';
-				document.body.appendChild(container);
-			}
-
-			const toast = document.createElement('div');
-			toast.className = \`toast toast-\${type}\`;
-			
-			let iconSvg = '';
-			if (type === 'success') {
-				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>\`;
-			} else if (type === 'error') {
-				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>\`;
-			} else {
-				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>\`;
-			}
-
-			toast.innerHTML = \`\${iconSvg}<span>\${message}</span>\`;
-			container.appendChild(toast);
-
-			toast.offsetHeight; // trigger reflow
-			toast.classList.add('show');
-
-			setTimeout(() => {
-				toast.classList.remove('show');
-				setTimeout(() => toast.remove(), 400);
-			}, 3000);
-		}
-
-		function initTheme() {
-			const savedTheme = localStorage.getItem('theme');
-			if (savedTheme) {
-				document.documentElement.setAttribute('data-theme', savedTheme);
-			} else {
-				const systemPrefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-				const defaultTheme = systemPrefersDark ? 'dark' : 'light';
-				document.documentElement.setAttribute('data-theme', defaultTheme);
-			}
-			updateThemeIcons();
-		}
+		${SHARED_JS}
 
 		let publicModelsChartInstance = null;
 		let lastPublicSummaryData = null;
@@ -2876,19 +2907,6 @@ async function handleLandingPage(request, env, ctx) {
 			updateThemeIcons();
 			if (lastPublicSummaryData) {
 				renderPublicSummary(lastPublicSummaryData);
-			}
-		}
-
-		function updateThemeIcons() {
-			const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-			const sunIcons = document.querySelectorAll('.theme-icon-sun');
-			const moonIcons = document.querySelectorAll('.theme-icon-moon');
-			if (currentTheme === 'light') {
-				sunIcons.forEach(el => el.style.display = 'none');
-				moonIcons.forEach(el => el.style.display = 'block');
-			} else {
-				sunIcons.forEach(el => el.style.display = 'block');
-				moonIcons.forEach(el => el.style.display = 'none');
 			}
 		}
 
@@ -4499,44 +4517,13 @@ function handleAdminPage(request, env, ctx) {
 	</div>
 
 	<script>
+		${SHARED_JS}
+
 		let currentTab = 'overview';
 		let historyChart = null;
 		let modelsChart = null;
 		const defaultMappings = ${JSON.stringify(DEFAULT_MODEL_MAP)};
 		let customMappings = {};
-
-		// Toast Helper
-		function showToast(message, type = 'success') {
-			let container = document.querySelector('.toast-container');
-			if (!container) {
-				container = document.createElement('div');
-				container.className = 'toast-container';
-				document.body.appendChild(container);
-			}
-
-			const toast = document.createElement('div');
-			toast.className = \`toast toast-\${type}\`;
-			
-			let iconSvg = '';
-			if (type === 'success') {
-				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>\`;
-			} else if (type === 'error') {
-				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>\`;
-			} else {
-				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>\`;
-			}
-
-			toast.innerHTML = \`\${iconSvg}<span>\${message}</span>\`;
-			container.appendChild(toast);
-
-			toast.offsetHeight; // trigger reflow
-			toast.classList.add('show');
-
-			setTimeout(() => {
-				toast.classList.remove('show');
-				setTimeout(() => toast.remove(), 400);
-			}, 3000);
-		}
 
 		function renderUsageDetails(data) {
 			// localStorage 向后兼容：旧格式是数组，新格式是 { accounts, limits }
@@ -4777,18 +4764,6 @@ function handleAdminPage(request, env, ctx) {
 			label.innerText = '最后更新: ' + yyyy + '-' + MM + '-' + dd + ' ' + hh + ':' + mm + ':' + ss;
 		}
 
-		function initTheme() {
-			const savedTheme = localStorage.getItem('theme');
-			if (savedTheme) {
-				document.documentElement.setAttribute('data-theme', savedTheme);
-			} else {
-				const systemPrefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-				const defaultTheme = systemPrefersDark ? 'dark' : 'light';
-				document.documentElement.setAttribute('data-theme', defaultTheme);
-			}
-			updateThemeIcons();
-		}
-
 		function toggleTheme() {
 			const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
 			const newTheme = currentTheme === 'light' ? 'dark' : 'light';
@@ -4797,19 +4772,6 @@ function handleAdminPage(request, env, ctx) {
 			updateThemeIcons();
 			if (currentTab === 'overview') {
 				loadUsageDetails();
-			}
-		}
-
-		function updateThemeIcons() {
-			const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-			const sunIcons = document.querySelectorAll('.theme-icon-sun');
-			const moonIcons = document.querySelectorAll('.theme-icon-moon');
-			if (currentTheme === 'light') {
-				sunIcons.forEach(el => el.style.display = 'none');
-				moonIcons.forEach(el => el.style.display = 'block');
-			} else {
-				sunIcons.forEach(el => el.style.display = 'block');
-				moonIcons.forEach(el => el.style.display = 'none');
 			}
 		}
 
@@ -5447,7 +5409,7 @@ function handleAdminPage(request, env, ctx) {
 			const mergedMappings = { ...customMappings, ...defaultMappings };
 			const hasChanges = Object.keys(defaultMappings).some(source => customMappings[source] !== defaultMappings[source]);
 
-			if (!hasChanges && Object.keys(defaultMappings).every(source => customMappings[source] === defaultMappings[source])) {
+			if (!hasChanges) {
 				showToast('预设映射已存在，无需重复添加');
 				return;
 			}
