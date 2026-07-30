@@ -4538,8 +4538,8 @@ function handleAdminPage(request, env, ctx) {
 			accounts.forEach(account => {
 				totalUsageToday += account.usageToday;
 
-				// Percentage formatted to 2 decimal places
-				const percentage = Math.min(100, Number(((account.usageToday / limits.dailyLimit) * 100).toFixed(2)));
+				// Percentage formatted to 2 decimal places（不封顶，允许超过 100%）
+			const percentage = Number(((account.usageToday / limits.dailyLimit) * 100).toFixed(2));
 				const warningClass = account.status === 'error' ? 'badge-danger' : (account.status === 'pending' ? 'badge-info' : (percentage >= 90 ? 'badge-warning' : 'badge-success'));
 				const statusText = account.status === 'error' ? '连接异常' : (account.status === 'pending' ? '待刷新' : (percentage >= 100 ? '用尽 (' + limits.dailyLimit.toLocaleString() + ')' : '正常运行'));
 				
@@ -4562,9 +4562,9 @@ function handleAdminPage(request, env, ctx) {
 						<span class="badge \${warningClass}" style="flex-shrink: 0;">\${statusText}</span>
 					</div>
 					<div class="progress-container">
-						<div class="progress-bar" style="width: \${percentage}%;"></div>
-					</div>
-					<div style="display:flex; justify-content:space-between; font-size:12px; color: var(--text-muted); margin-top: 6px;">
+					<div class="progress-bar" style="width: \${Math.min(100, percentage)}%;"></div>
+				</div>
+				<div style="display:flex; justify-content:space-between; font-size:12px; color: var(--text-muted); margin-top: 6px;">
 						<span>今日已用: \${roundedUsage.toLocaleString()} / \${limits.dailyLimit.toLocaleString()} Neurons</span>
 						<span>\${percentage.toFixed(2)}%</span>
 					</div>
@@ -4590,8 +4590,8 @@ function handleAdminPage(request, env, ctx) {
 			document.getElementById('stat-total-neurons').innerText = roundedTotalUsageToday.toLocaleString();
 			document.getElementById('stat-accounts-count').innerText = accounts.length;
 			
-			const overallPercentage = totalLimit > 0 ? Math.min(100, Number(((totalUsageToday / totalLimit) * 100).toFixed(2))) : 0;
-			document.getElementById('stat-neurons-progress').style.width = overallPercentage + '%';
+			const overallPercentage = totalLimit > 0 ? Number(((totalUsageToday / totalLimit) * 100).toFixed(2)) : 0;
+			document.getElementById('stat-neurons-progress').style.width = Math.min(100, overallPercentage) + '%';
 			document.getElementById('stat-neurons-desc').innerText = \`\${roundedTotalUsageToday.toLocaleString()} / \${totalLimit.toLocaleString()} Neurons (\${overallPercentage.toFixed(2)}%)\`;
 			
 			const costSaved = (totalUsageToday / 1000) * 0.011;
@@ -4615,9 +4615,9 @@ function handleAdminPage(request, env, ctx) {
 			const limitDisabled = threshold <= 0;
 
 			// 今日限额
-			const dailyPct = Math.min(100, Number(((dailyUsage / dailyLimit) * 100).toFixed(2)));
-			document.getElementById('stat-daily-usage').innerText = Math.ceil(dailyUsage).toLocaleString();
-			document.getElementById('stat-daily-progress').style.width = dailyPct + '%';
+		const dailyPct = Number(((dailyUsage / dailyLimit) * 100).toFixed(2));
+		document.getElementById('stat-daily-usage').innerText = Math.ceil(dailyUsage).toLocaleString();
+		document.getElementById('stat-daily-progress').style.width = Math.min(100, dailyPct) + '%';
 			document.getElementById('stat-daily-desc').innerText = limitDisabled
 				? Math.ceil(dailyUsage).toLocaleString() + ' Neurons（已用，限额已关闭）'
 				: Math.ceil(dailyUsage).toLocaleString() + ' / ' + dailyLimit.toLocaleString() + ' Neurons (' + dailyPct.toFixed(1) + '%)';
@@ -4633,12 +4633,12 @@ function handleAdminPage(request, env, ctx) {
 			}
 
 			// 本月限额
-			const monthlyPct = Math.min(100, Number(((monthlyUsage / monthlyLimit) * 100).toFixed(2)));
-			document.getElementById('stat-monthly-usage').innerText = Math.ceil(monthlyUsage).toLocaleString();
-			document.getElementById('stat-monthly-progress').style.width = monthlyPct + '%';
-			document.getElementById('stat-monthly-desc').innerText = limitDisabled
-				? Math.ceil(monthlyUsage).toLocaleString() + ' Neurons（已用，限额已关闭）'
-				: Math.ceil(monthlyUsage).toLocaleString() + ' / ' + monthlyLimit.toLocaleString() + ' Neurons (' + monthlyPct.toFixed(1) + '%)';
+		const monthlyPct = Number(((monthlyUsage / monthlyLimit) * 100).toFixed(2));
+		document.getElementById('stat-monthly-usage').innerText = Math.ceil(monthlyUsage).toLocaleString();
+		document.getElementById('stat-monthly-progress').style.width = Math.min(100, monthlyPct) + '%';
+		document.getElementById('stat-monthly-desc').innerText = limitDisabled
+			? Math.ceil(monthlyUsage).toLocaleString() + ' Neurons（已用，限额已关闭）'
+			: Math.ceil(monthlyUsage).toLocaleString() + ' / ' + monthlyLimit.toLocaleString() + ' Neurons (' + monthlyPct.toFixed(1) + '%)';
 			// 阈值线位置（threshold <= 0 表示已关闭限额拦截，隐藏阈值线）
 			const monthlyThresholdEl = document.getElementById('stat-monthly-threshold');
 			if (monthlyThresholdEl) {
