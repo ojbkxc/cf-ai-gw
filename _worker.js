@@ -445,27 +445,9 @@ async function refreshAccountsUsage(env, accounts, limit = 20) {
 			const historyGroups = await queryGraphQL(account.accountId, account.apiToken, startSevenDays);
 			const historyParsed = processAnalytics(historyGroups);
 
-			// 从 7 天数据中过滤出今日数据（7 天窗口已包含今天）
-			const todayStr = todayUTC.toISOString().split('T')[0];
-			const todayFromHistory = historyParsed.history.find(h => h.date === todayStr);
-			const todayUsage = todayFromHistory ? todayFromHistory.neurons : 0;
-
-			// 从 7 天数据中提取今日模型明细（需要重新解析原始数据）
-			let todayModels = [];
-			if (historyGroups.length > 0) {
-				const todayModelsMap = {};
-				for (const group of historyGroups) {
-					if (group.dimensions.date === todayStr) {
-						const model = group.dimensions.modelId;
-						const neurons = group.sum.totalNeurons || 0;
-						const count = group.count || 0;
-						if (!todayModelsMap[model]) todayModelsMap[model] = { model, neurons: 0, requests: 0 };
-						todayModelsMap[model].neurons += neurons;
-						todayModelsMap[model].requests += count;
-					}
-				}
-				todayModels = Object.values(todayModelsMap).sort((a, b) => b.neurons - a.neurons);
-			}
+			// 复用 processAnalytics 已计算好的今日用量和模型明细
+			const todayUsage = historyParsed.todayTotalNeurons;
+			const todayModels = historyParsed.todayModels;
 
 			// 月度查询：月初在 7 天窗口内时从 historyGroups 提取，否则独立查询
 			let monthlyTotal;
@@ -1261,8 +1243,8 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 					readResult = await reader.read();
 				} catch (e) {
 					// upstream read error: emit Anthropic error event instead of silent break
-					var em = (e && e.message) ? e.message : "connection error";
-					var ep = JSON.stringify({ type: "error", error: { type: "api_error", message: "Upstream stream error: " + em } });
+					const em = (e && e.message) ? e.message : "connection error";
+					const ep = JSON.stringify({ type: "error", error: { type: "api_error", message: "Upstream stream error: " + em } });
 					controller.enqueue(encoder.encode("event: error\ndata: " + ep + "\n\n"));
 					controller.close();
 					break;
@@ -5313,7 +5295,7 @@ function handleAdminPage(request, env, ctx) {
 					const tr = document.createElement('tr');
 					const dateStr = new Date(k.createdAt).toLocaleString();
 					tr.innerHTML = \`
-						<td><strong style="font-weight:600;">\${sen(k.name)}</strong></td>
+						<td><strong style="font-weight:600;">\${escapeHtml(k.name)}</strong></td>
 						<td>
 							<div style="display:flex; align-items:center; gap:8px;">
 								<code id="key-val-\${k.id}">\${k.key.length > 6 ? k.key.substring(0, 5) + '...' + k.key.substring(k.key.length - 1) : k.key.substring(0, Math.min(3, k.key.length)) + '...'}</code>
@@ -5330,10 +5312,6 @@ function handleAdminPage(request, env, ctx) {
 			} catch (e) {
 				console.error(e);
 			}
-		}
-
-		function sen(str) {
-			return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 		}
 
 		function copyKeyText(val) {
