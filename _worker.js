@@ -7,7 +7,7 @@
 // 用量限额配置（均可通过环境变量覆盖，未设置则使用默认值）
 const DEFAULT_DAILY_LIMIT = 10000;     // 默认每日限额 10,000 Neurons
 const DEFAULT_MONTHLY_LIMIT = 100000;  // 默认每月限额 100,000 Neurons（$5/月套餐）
-const DEFAULT_USAGE_THRESHOLD = 0.9;   // 默认触发拦截的用量阈值 90%
+const DEFAULT_USAGE_THRESHOLD = 0.9;   // 默认触发拦截的用量阈值 90%；设为 0 表示关闭限额拦截（仅统计不拦截）
 
 // 默认模型映射表（左边是客户端请求的模型名，右边是 Cloudflare 上对应的真实模型）
 const DEFAULT_MODEL_MAP = {
@@ -299,6 +299,7 @@ function getEnvFloat(env, key, defaultVal) {
 }
 
 // 统一读取日/月限额和阈值配置（避免重复调用 3 次 getEnv）
+// threshold <= 0 表示关闭限额拦截：用量照常统计，但不会拦截请求。
 function getUsageLimits(env) {
 	return {
 		dailyLimit: getEnvInt(env, 'DAILY_LIMIT', DEFAULT_DAILY_LIMIT),
@@ -354,18 +355,22 @@ async function checkUsageLimit(env) {
 	// 4. 获取当月用量（从独立 KV 键读取，由 refreshAccountsUsage 定期更新）
 	const monthlyUsage = await getMonthlyUsage(env);
 
-	// 5. 判断是否触发拦截
-	const dailyExceeded = dailyUsage >= dailyLimit * threshold;
-	const monthlyExceeded = monthlyUsage >= monthlyLimit * threshold;
-
+	// 5. 判断是否触发拦截（threshold <= 0 表示关闭限额：仅统计不拦截）
 	let result;
-	if (dailyExceeded || monthlyExceeded) {
-		const reason = dailyExceeded
-			? `Daily usage (${dailyUsage}/${dailyLimit}) exceeds ${Math.round(threshold * 100)}% threshold`
-			: `Monthly usage (${monthlyUsage}/${monthlyLimit}) exceeds ${Math.round(threshold * 100)}% threshold`;
-		result = { allowed: false, reason, dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold };
-	} else {
+	if (threshold <= 0) {
 		result = { allowed: true, dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold };
+	} else {
+		const dailyExceeded = dailyUsage >= dailyLimit * threshold;
+		const monthlyExceeded = monthlyUsage >= monthlyLimit * threshold;
+
+		if (dailyExceeded || monthlyExceeded) {
+			const reason = dailyExceeded
+				? `Daily usage (${dailyUsage}/${dailyLimit}) exceeds ${Math.round(threshold * 100)}% threshold`
+				: `Monthly usage (${monthlyUsage}/${monthlyLimit}) exceeds ${Math.round(threshold * 100)}% threshold`;
+			result = { allowed: false, reason, dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold };
+		} else {
+			result = { allowed: true, dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold };
+		}
 	}
 
 	// 6. 写入内存缓存
@@ -775,7 +780,14 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 				}
 			} else {
 				const errorText = await cfResponse.text();
-				lastError = `CF API returned ${cfResponse.status}: ${errorText}`;
+				const status = cfResponse.status;
+				// 4xx（除 429）属于客户端参数/鉴权类错误，换账号也一样失败，且会白白消耗配额；
+				// 直接返回原始错误，保留状态码供调用方转发。
+				if (status >= 400 && status < 500 && status !== 429) {
+					return { success: false, status, error: `CF API returned ${status}: ${errorText}` };
+				}
+				// 5xx / 429 / 其他错误：记录后继续尝试下一个账号
+				lastError = `CF API returned ${status}: ${errorText}`;
 			}
 		} catch (e) {
 			lastError = `Connection error: ${e.message}`;
@@ -786,11 +798,13 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 }
 
 // 共享的模型名解析函数：根据用户传入的模型名，映射到 Cloudflare 实际模型
+// 找不到映射时返回 null，由调用方决定如何报错（避免静默兜底用错模型）。
 async function resolveModelName(model, env) {
+	if (!model) return null;
 	if (model.startsWith('@cf/')) return model;
 	const customMap = await getCustomModelMap(env);
 	const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
-	return combinedMap[model] || '@cf/zai-org/glm-4.7-flash';
+	return combinedMap[model] || null;
 }
 
 // 对话补全 / 文本补全 的代理处理函数
@@ -813,6 +827,16 @@ async function handleCompletions(request, env, pathname) {
 
 	// 解析模型名映射
 	const cfModel = await resolveModelName(model, env);
+	if (!cfModel) {
+		return new Response(JSON.stringify({
+			error: {
+				message: `Model '${model}' not found. Available models: see /v1/models. Use @cf/<org>/<model> to pass through a raw Cloudflare model id.`,
+				type: "invalid_request_error",
+				param: "model",
+				code: "model_not_found"
+			}
+		}), { status: 404, headers: { 'Content-Type': 'application/json' } });
+	}
 
 	// 构造发给 Cloudflare 的请求体
 	const cfPayload = {
@@ -837,7 +861,7 @@ async function handleCompletions(request, env, pathname) {
 	if (!result.success) {
 		return new Response(JSON.stringify({
 			error: { message: result.error, type: "server_error" }
-		}), { status: 502, headers: { 'Content-Type': 'application/json' } });
+		}), { status: result.status || 502, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	if (stream) {
@@ -1174,6 +1198,15 @@ async function handleMessages(request, env) {
 	// 解析模型名映射
 	const model = anthropicBody.model;
 	const cfModel = await resolveModelName(model, env);
+	if (!cfModel) {
+		return new Response(JSON.stringify({
+			type: 'error',
+			error: {
+				type: 'invalid_request_error',
+				message: `Model '${model}' not found. Available models: see /v1/models. Use @cf/<org>/<model> to pass through a raw Cloudflare model id.`
+			}
+		}), { status: 404, headers: { 'Content-Type': 'application/json' } });
+	}
 
 	// Anthropic → OpenAI 格式转换
 	const openaiBody = convertAnthropicToOpenAI(anthropicBody);
@@ -1197,10 +1230,10 @@ async function handleMessages(request, env) {
 
 		const anthropicError = convertOpenAIErrorToAnthropic(
 			errorDetail || { message: result.error },
-			502
+			result.status || 502
 		);
 		return new Response(JSON.stringify(anthropicError), {
-			status: 502,
+			status: result.status || 502,
 			headers: { 'Content-Type': 'application/json' }
 		});
 	}
@@ -1257,7 +1290,18 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 			};
 
 			while (true) {
-				const { value, done } = await reader.read();
+				let readResult;
+				try {
+					readResult = await reader.read();
+				} catch (e) {
+					// upstream read error: emit Anthropic error event instead of silent break
+					var em = (e && e.message) ? e.message : "connection error";
+					var ep = JSON.stringify({ type: "error", error: { type: "api_error", message: "Upstream stream error: " + em } });
+					controller.enqueue(encoder.encode("event: error\ndata: " + ep + "\n\n"));
+					controller.close();
+					break;
+				}
+				const { value, done } = readResult;
 				if (done) {
 					if (buffer.trim()) {
 						buffer = processLines(buffer, controller);
@@ -1268,7 +1312,6 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 
 				buffer += decoder.decode(value, { stream: true });
 				buffer = processLines(buffer, controller);
-
 				if (buffer.indexOf('\n') === -1) {
 					if (enqueuedAny) {
 						break;
@@ -1488,13 +1531,20 @@ async function handleEmbeddings(request, env) {
 
 	// 解析模型名映射
 	let cfModel = model;
-	if (!cfModel.startsWith('@cf/')) {
+	if (!cfModel || !cfModel.startsWith('@cf/')) {
 		const customMap = await getCustomModelMap(env);
 		const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
-		cfModel = combinedMap[model];
-		if (!cfModel) {
-			cfModel = '@cf/baai/bge-m3'; // 找不到映射就用这个默认模型兜底
-		}
+		cfModel = cfModel ? combinedMap[model] : null;
+	}
+	if (!cfModel) {
+		return new Response(JSON.stringify({
+			error: {
+				message: `Model '${model}' not found. Available models: see /v1/models. Use @cf/<org>/<model> to pass through a raw Cloudflare model id.`,
+				type: "invalid_request_error",
+				param: "model",
+				code: "model_not_found"
+			}
+		}), { status: 404, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	const textArray = Array.isArray(input) ? input : [input];
@@ -1554,24 +1604,6 @@ async function handleEmbeddings(request, env) {
 	}), { status: 502, headers: { 'Content-Type': 'application/json' } });
 }
 
-// 粗略估算 token 数量（按每 4 个字符约 1 个 token 估算）
-function estimateUsage(messages, answer) {
-	let promptChars = 0;
-	for (const msg of messages) {
-		promptChars += (msg.content || '').length;
-	}
-	const completionChars = (answer || '').length;
-
-	const promptTokens = Math.ceil(promptChars / 4);
-	const completionTokens = Math.ceil(completionChars / 4);
-
-	return {
-		prompt_tokens: promptTokens,
-		completion_tokens: completionTokens,
-		total_tokens: promptTokens + completionTokens
-	};
-}
-
 // 透传 CF /ai/v1/chat/completions 返回的 SSE 流
 // CF 返回的本来就是标准 OpenAI 的 SSE 格式，我们只把模型名改一下，
 // 这样 tool_calls、finish_reason、reasoning_content、usage 等字段都能原样保留。
@@ -1584,7 +1616,18 @@ function passthroughStream(upstreamBody, modelName) {
 	return new ReadableStream({
 		async pull(controller) {
 			while (true) {
-				const { value, done } = await reader.read();
+				let readResult;
+				try {
+					readResult = await reader.read();
+				} catch (e) {
+					// 读取上游流异常时，把错误透传给客户端而非静默断流
+					const errChunk = { error: { message: `Upstream stream error: ${e.message || 'connection error'}`, type: "server_error" } };
+					controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
+					controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+					controller.close();
+					break;
+				}
+				const { value, done } = readResult;
 				if (done) {
 					// 把缓冲区里剩下的内容输出掉
 					if (buffer.trim()) {
@@ -4618,24 +4661,44 @@ function handleAdminPage(request, env, ctx) {
 
 		function updateLimitCards(limits) {
 			const { dailyUsage = 0, dailyLimit = 10000, monthlyUsage = 0, monthlyLimit = 100000, threshold = 0.9 } = limits || {};
+			// threshold <= 0 表示已关闭限额拦截：仅统计用量，不再对请求做限制
+			const limitDisabled = threshold <= 0;
 
 			// 今日限额
 			const dailyPct = Math.min(100, Number(((dailyUsage / dailyLimit) * 100).toFixed(2)));
 			document.getElementById('stat-daily-usage').innerText = Math.ceil(dailyUsage).toLocaleString();
 			document.getElementById('stat-daily-progress').style.width = dailyPct + '%';
-			document.getElementById('stat-daily-desc').innerText = Math.ceil(dailyUsage).toLocaleString() + ' / ' + dailyLimit.toLocaleString() + ' Neurons (' + dailyPct.toFixed(1) + '%)';
-			// 阈值线位置
+			document.getElementById('stat-daily-desc').innerText = limitDisabled
+				? Math.ceil(dailyUsage).toLocaleString() + ' Neurons（已用，限额已关闭）'
+				: Math.ceil(dailyUsage).toLocaleString() + ' / ' + dailyLimit.toLocaleString() + ' Neurons (' + dailyPct.toFixed(1) + '%)';
+			// 阈值线位置（threshold <= 0 表示已关闭限额拦截，隐藏阈值线）
 			const dailyThresholdEl = document.getElementById('stat-daily-threshold');
-			if (dailyThresholdEl) dailyThresholdEl.style.left = Math.round(threshold * 100) + '%';
+			if (dailyThresholdEl) {
+				if (threshold > 0) {
+					dailyThresholdEl.style.left = Math.round(threshold * 100) + '%';
+					dailyThresholdEl.style.display = '';
+				} else {
+					dailyThresholdEl.style.display = 'none';
+				}
+			}
 
 			// 本月限额
 			const monthlyPct = Math.min(100, Number(((monthlyUsage / monthlyLimit) * 100).toFixed(2)));
 			document.getElementById('stat-monthly-usage').innerText = Math.ceil(monthlyUsage).toLocaleString();
 			document.getElementById('stat-monthly-progress').style.width = monthlyPct + '%';
-			document.getElementById('stat-monthly-desc').innerText = Math.ceil(monthlyUsage).toLocaleString() + ' / ' + monthlyLimit.toLocaleString() + ' Neurons (' + monthlyPct.toFixed(1) + '%)';
-			// 阈值线位置
+			document.getElementById('stat-monthly-desc').innerText = limitDisabled
+				? Math.ceil(monthlyUsage).toLocaleString() + ' Neurons（已用，限额已关闭）'
+				: Math.ceil(monthlyUsage).toLocaleString() + ' / ' + monthlyLimit.toLocaleString() + ' Neurons (' + monthlyPct.toFixed(1) + '%)';
+			// 阈值线位置（threshold <= 0 表示已关闭限额拦截，隐藏阈值线）
 			const monthlyThresholdEl = document.getElementById('stat-monthly-threshold');
-			if (monthlyThresholdEl) monthlyThresholdEl.style.left = Math.round(threshold * 100) + '%';
+			if (monthlyThresholdEl) {
+				if (threshold > 0) {
+					monthlyThresholdEl.style.left = Math.round(threshold * 100) + '%';
+					monthlyThresholdEl.style.display = '';
+				} else {
+					monthlyThresholdEl.style.display = 'none';
+				}
+			}
 		}
 
 		let isRefreshingUsage = false;
