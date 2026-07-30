@@ -222,7 +222,7 @@ async function getUsageLimitsConfig(env) {
 
 async function saveUsageLimitsConfig(env, limits) {
 	const config = await getAppConfig(env);
-	config.usageLimits = limits;
+	config.usageLimits = { ...config.usageLimits, ...limits };
 	await saveAppConfig(env, config);
 }
 
