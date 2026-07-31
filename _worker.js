@@ -380,6 +380,7 @@ async function getCachedSummary(env) {
 async function setCachedSummary(env, summaryData) {
 	const data = {
 		...summaryData,
+		summaryDate: new Date().toISOString().split('T')[0],
 		timestamp: Date.now()
 	};
 	await env.KV.put('cache_usage_summary', JSON.stringify(data), { expirationTtl: 300 });
@@ -391,7 +392,8 @@ function emptyUsageResponse(limits) {
 		totalNeuronsToday: 0, totalRequestsToday: 0, totalRequestsMonth: 0, totalAccounts: 0, totalLimit: limits.dailyLimit,
 		usagePercentage: 0, modelsToday: [],
 		dailyUsage: 0, dailyLimit: limits.dailyLimit, monthlyUsage: 0,
-		monthlyLimit: limits.monthlyLimit, threshold: limits.threshold
+		monthlyLimit: limits.monthlyLimit, threshold: limits.threshold,
+		dailyRequests: 0, monthlyRequests: 0
 	};
 }
 
@@ -1734,7 +1736,8 @@ async function handleDashboardApi(request, env, ctx) {
 	if (url.pathname === '/api/usage/summary') {
 		if (method === 'GET') {
 			const cached = await getCachedSummary(env);
-			if (cached) {
+			const todayStr = new Date().toISOString().split('T')[0];
+			if (cached && cached.summaryDate === todayStr) {
 				// 即使命中缓存，也补充最新的限额配置字段（环境变量可能已变更）
 				// 月度用量从 KV 读取最新值（refreshAccountsUsage 会更新该键）
 				const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
@@ -1978,7 +1981,7 @@ async function handleDashboardApi(request, env, ctx) {
 		if (accounts.length === 0) {
 			return new Response(JSON.stringify({
 				accounts: [],
-				limits: { dailyUsage: 0, dailyLimit, monthlyUsage: 0, monthlyLimit, threshold }
+				limits: { dailyUsage: 0, dailyRequests: 0, dailyLimit, monthlyUsage: 0, monthlyRequests: 0, monthlyLimit, threshold }
 			}), { headers: { 'Content-Type': 'application/json' } });
 		}
 
@@ -4216,50 +4219,50 @@ function handleAdminPage(request, env, ctx) {
 								<div class="stat-desc" id="stat-neurons-desc" style="margin-top: 0;">0 / 0 Neurons (0.00%)</div>
 								<span id="stat-total-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">0次</span>
 							</div>
-					</div>
+						</div>
 					<div class="stat-card">
 						<div style="display: flex; justify-content: space-between; align-items: flex-start;">
 							<div class="stat-title">今日用量限额</div>
-								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
-									<path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-								</svg>
-							</div>
-							<div class="stat-value" id="stat-daily-usage">0</div>
-							<div class="progress-container" style="position: relative;">
-								<div class="progress-bar" id="stat-daily-progress" style="width: 0%;"></div>
-								<div class="progress-threshold" id="stat-daily-threshold" style="position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warning-color); left: 90%;"></div>
-							</div>
-							<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
-								<div class="stat-desc" id="stat-daily-desc" style="margin-top: 0;">0 / 10,000 Neurons (0%)</div>
-								<span id="stat-daily-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">0次</span>
-							</div>
-					</div>
+							<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
+								<path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+							</svg>
+						</div>
+						<div class="stat-value" id="stat-daily-usage">0</div>
+						<div class="progress-container" style="position: relative;">
+							<div class="progress-bar" id="stat-daily-progress" style="width: 0%;"></div>
+							<div class="progress-threshold" id="stat-daily-threshold" style="position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warning-color); left: 90%;"></div>
+						</div>
+						<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
+							<div class="stat-desc" id="stat-daily-desc" style="margin-top: 0;">0 / 10,000 Neurons (0%)</div>
+							<span id="stat-daily-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">0次</span>
+						</div>
+						</div>
 					<div class="stat-card">
 						<div style="display: flex; justify-content: space-between; align-items: flex-start;">
 							<div class="stat-title">本月用量限额</div>
-								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
-									<path stroke-linecap="round" stroke-linejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-								</svg>
-							</div>
-							<div class="stat-value" id="stat-monthly-usage">0</div>
-							<div class="progress-container" style="position: relative;">
-								<div class="progress-bar" id="stat-monthly-progress" style="width: 0%;"></div>
-								<div class="progress-threshold" id="stat-monthly-threshold" style="position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warning-color); left: 90%;"></div>
-							</div>
-							<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
-								<div class="stat-desc" id="stat-monthly-desc" style="margin-top: 0;">0 / 100,000 Neurons (0%)</div>
-								<span id="stat-monthly-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">0次</span>
-							</div>
+							<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
+								<path stroke-linecap="round" stroke-linejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+							</svg>
+						</div>
+						<div class="stat-value" id="stat-monthly-usage">0</div>
+						<div class="progress-container" style="position: relative;">
+							<div class="progress-bar" id="stat-monthly-progress" style="width: 0%;"></div>
+							<div class="progress-threshold" id="stat-monthly-threshold" style="position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warning-color); left: 90%;"></div>
+						</div>
+						<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
+							<div class="stat-desc" id="stat-monthly-desc" style="margin-top: 0;">0 / 100,000 Neurons (0%)</div>
+							<span id="stat-monthly-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">0次</span>
+						</div>
 					</div>
 					<div class="stat-card">
 						<div style="display: flex; justify-content: space-between; align-items: flex-start;">
 							<div class="stat-title">已绑定账号</div>
-								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
-									<path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-								</svg>
-							</div>
-							<div class="stat-value" id="stat-accounts-count">0</div>
-							<div class="stat-desc">活跃中的 Cloudflare 账号数</div>
+							<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
+								<path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+							</svg>
+						</div>
+						<div class="stat-value" id="stat-accounts-count">0</div>
+						<div class="stat-desc">活跃中的 Cloudflare 账号数</div>
 						</div>
 						<div class="stat-card">
 							<div style="display: flex; justify-content: space-between; align-items: flex-start;">
