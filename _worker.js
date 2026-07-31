@@ -507,10 +507,11 @@ async function refreshAccountsUsage(env, accounts, limit = 20) {
 			} else {
 				// 月初不在 7 天窗口内，独立查询（失败不连坐其他数据）
 				const monthGroups = await queryGraphQL(account.accountId, account.apiToken, startMonth)
-					.catch(e => {
-						console.error(`Monthly query failed for ${account.name}:`, e);
-						return null;
-					});
+				.catch(e => {
+					// 仅记录账号名与错误消息，避免异常对象可能携带请求头/ token 被 tail workers 捕获
+					console.error(`Monthly query failed for ${account.name}: ${e?.message || e}`);
+					return null;
+				});
 				if (monthGroups) {
 					monthlyTotal = monthGroups.reduce((sum, g) => sum + (g.sum?.totalNeurons || 0), 0);
 					monthlyRequests = monthGroups.reduce((sum, g) => sum + (g.count || 0), 0);
@@ -533,7 +534,8 @@ async function refreshAccountsUsage(env, accounts, limit = 20) {
 				timestamp: Date.now()
 			};
 		} catch (e) {
-			console.error(`Error querying GraphQL for ${account.name}:`, e);
+			// 仅记录账号名与错误消息，避免异常对象可能携带请求头/ token 被 tail workers 捕获
+			console.error(`Error querying GraphQL for ${account.name}: ${e?.message || e}`);
 			cacheMap[account.id] = {
 				status: 'error',
 				error: e.message,
