@@ -882,10 +882,11 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 	const accounts = await getAccounts(env);
 	const activeAccounts = accounts.filter(a => a.status === 'active');
 	if (activeAccounts.length === 0) {
-		return { success: false, error: "No active Cloudflare accounts configured. Add them in the WebUI." };
+		return { success: false, status: 503, error: "No active Cloudflare accounts configured. Add them in the WebUI." };
 	}
 
 	let lastError = null;
+	let lastStatus = 502; // 记录最后一次上游 HTTP 状态码，用于透传给客户端（区分 429 限流 / 5xx 故障等）
 
 	for (const account of activeAccounts) {
 		try {
@@ -910,21 +911,23 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 					// 流式响应：一旦拿到 HTTP 200 + body 就立即返回，不预读首字节。
 					// 这意味着如果上游在流式传输中途断开，客户端会收到截断的流而不会触发 failover。
 					// 这是刻意的设计权衡：预读会破坏 SSE 的实时性。
-					return { success: true, stream: cfResponse.body };
+					return { success: true, status: cfResponse.status, stream: cfResponse.body };
 				}
 				const cfJson = await cfResponse.json();
-				return { success: true, data: cfJson };
+				return { success: true, status: cfResponse.status, data: cfJson };
 			}
 
-			// 非 2xx：记录错误后继续尝试下一个账号（failover）
+			// 非 2xx：记录错误与状态码后继续尝试下一个账号（failover）
 			const errorText = await cfResponse.text();
+			lastStatus = cfResponse.status;
 			lastError = `CF API returned ${cfResponse.status}: ${errorText}`;
 		} catch (e) {
+			lastStatus = 502; // 网络异常归为 502
 			lastError = `Connection error: ${e.message}`;
 		}
 	}
 
-	return { success: false, error: `All Cloudflare accounts failed. Last error: ${lastError}` };
+	return { success: false, status: lastStatus, error: `All Cloudflare accounts failed. Last error: ${lastError}` };
 }
 
 // 共享的模型名解析函数：根据用户传入的模型名，映射到 Cloudflare 实际模型
