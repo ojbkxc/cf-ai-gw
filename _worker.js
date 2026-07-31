@@ -459,7 +459,10 @@ async function buildUsageSummary(env, accounts, cacheMap) {
 		} else if (cachedItem.history) {
 			// 缓存日期与今日不一致（跨天），从 history 中重新提取今日数据
 			const todayEntry = cachedItem.history.find(h => h.date === todayStr);
-			if (todayEntry) totalNeuronsToday += todayEntry.neurons;
+			if (todayEntry) {
+				totalNeuronsToday += todayEntry.neurons;
+				if (todayEntry.requests) totalRequestsToday += todayEntry.requests;
+			}
 			// modelsToday 无法从 history 重建，跨天后暂不计入模型分布
 		}
 		// 月度请求次数
@@ -480,7 +483,9 @@ async function buildUsageSummary(env, accounts, cacheMap) {
 		dailyLimit,
 		monthlyUsage,
 		monthlyLimit,
-		threshold
+		threshold,
+		dailyRequests: totalRequestsToday,
+		monthlyRequests: totalRequestsMonth
 	};
 }
 
@@ -679,12 +684,14 @@ function processAnalytics(groups) {
 	let todayTotalRequests = 0;
 	const todayModelsMap = {};
 	const historyMap = {};
+	const historyRequestsMap = {};
 
 	// 先把最近 7 天的历史数据全部初始化为 0
 	for (let i = 6; i >= 0; i--) {
 		const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000);
 		const dStr = d.toISOString().split('T')[0];
 		historyMap[dStr] = 0;
+		historyRequestsMap[dStr] = 0;
 	}
 
 	for (const group of groups) {
@@ -705,13 +712,14 @@ function processAnalytics(groups) {
 
 		if (historyMap[date] !== undefined) {
 			historyMap[date] += neurons;
+			historyRequestsMap[date] += count;
 		}
 	}
 
 	const todayModels = Object.values(todayModelsMap).sort((a, b) => b.neurons - a.neurons);
 	const history = Object.keys(historyMap)
 		.sort()
-		.map(date => ({ date, neurons: historyMap[date] }));
+		.map(date => ({ date, neurons: historyMap[date], requests: historyRequestsMap[date] }));
 
 	return {
 		todayTotalNeurons,
@@ -2186,7 +2194,9 @@ async function handleDashboardApi(request, env, ctx) {
 					dailyLimit,
 					monthlyUsage,
 					monthlyLimit,
-					threshold
+					threshold,
+					dailyRequests: cached.dailyRequests ?? cached.totalRequestsToday ?? 0,
+					monthlyRequests: cached.monthlyRequests ?? cached.totalRequestsMonth ?? 0
 				}), { headers: { 'Content-Type': 'application/json' } });
 			}
 
@@ -2455,6 +2465,7 @@ async function handleDashboardApi(request, env, ctx) {
 				} else if (cached.history) {
 					const todayEntry = cached.history.find(h => h.date === todayStr);
 					usageToday = todayEntry ? todayEntry.neurons : 0;
+					usageTodayRequests = todayEntry && todayEntry.requests ? todayEntry.requests : 0;
 				}
 			}
 			return {

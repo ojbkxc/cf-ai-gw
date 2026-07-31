@@ -6,12 +6,13 @@
 
 ## 功能特性
 
-- OpenAI 兼容接口(`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/models`)
-- Anthropic Messages API 兼容接口(`/v1/messages`),支持流式与非流式
+- OpenAI 兼容接口(`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/models`、`/v1/images/generations`、`/v1/audio/transcriptions`)
+- Anthropic Messages API 兼容接口(`/v1/messages`、`/v1/messages/count_tokens`),支持流式与非流式
 - 多 Cloudflare 账号绑定,负载均衡 + 故障自动切换重试
 - 内置可视化管理面板(`/admin`),查看今日/本月用量、历史趋势、模型分布
 - 可配置每日/每月 Neurons 限额及拦截阈值
 - 代理 API Key 管理(可随机生成或自定义)
+- 模型名称映射:客户端模型名自动映射到 Cloudflare `@cf/` 模型,找不到映射时回退到默认模型并返回 `X-Model-Fallback-Warning` 响应头
 - 跨域(CORS)支持
 - 安全加固:异常日志不泄露 token、前端 XSS 防护、CSRF 防护
 
@@ -58,27 +59,123 @@
 3. 在"账号管理"中添加 Cloudflare 账号(填入 `Account ID` 与 `API Token`,Token 需具备 Workers AI 的读/写权限)。
 4. 即可通过 `https://<你的项目>.pages.dev/v1/chat/completions` 调用 OpenAI 兼容接口,`Authorization` 头填代理 API Key(在面板中创建)。
 
+## 接口一览
+
+### OpenAI 兼容端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/v1/chat/completions` | POST | Chat 对话补全,支持流式 |
+| `/v1/completions` | POST | Text 文本补全,返回 `text_completion` 格式 |
+| `/v1/embeddings` | POST | 文本向量化 |
+| `/v1/models` | GET | 可用模型列表 |
+| `/v1/images/generations` | POST | 图片生成(基于 Flux 模型) |
+| `/v1/audio/transcriptions` | POST | 音频转文字(基于 Whisper 模型) |
+
+### Anthropic 兼容端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/v1/messages` | POST | Messages API,支持流式与非流式 |
+| `/v1/messages/count_tokens` | POST | Token 计数估算 |
+
+### 管理面板端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/admin` | GET | 管理面板页面 |
+| `/api/usage/summary` | GET/POST | 用量汇总(需认证) |
+| `/api/accounts/usage` | GET | 各账号用量明细(需认证) |
+| `/api/accounts` | GET/POST | 账号管理(需认证 + CSRF) |
+| `/api/accounts/:id` | DELETE | 删除账号(需认证 + CSRF) |
+| `/api/keys` | GET/POST | API Key 管理(需认证 + CSRF) |
+| `/api/keys/:id` | DELETE | 删除 API Key(需认证 + CSRF) |
+| `/api/settings` | GET/PUT | 模型映射配置(需认证 + CSRF) |
+| `/api/limits` | GET/PUT | 限额配置(需认证 + CSRF) |
+
 ## 接口调用示例
+
+### OpenAI Chat Completions
 
 ```bash
 curl https://<你的项目>.pages.dev/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <你在面板中创建的代理APIKey>" \
-  -d '{
+  -d '
     "model": "llama-3.1-8b",
     "messages": [{"role": "user", "content": "你好"}]
   }'
 ```
 
-### Anthropic 格式调用示例
+### OpenAI Text Completions
+
+```bash
+curl https://<你的项目>.pages.dev/v1/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <代理APIKey>" \
+  -d '
+    "model": "llama-3.1-8b",
+    "prompt": "从前有座山"
+  }'
+```
+
+### OpenAI Embeddings
+
+```bash
+curl https://<你的项目>.pages.dev/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <代理APIKey>" \
+  -d '
+    "model": "text-embedding-3-small",
+    "input": ["你好", "世界"]
+  }'
+```
+
+### OpenAI Images Generations
+
+```bash
+curl https://<你的项目>.pages.dev/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <代理APIKey>" \
+  -d '
+    "model": "flux-1-schnell",
+    "prompt": "a cat in a hat",
+    "size": "1024x1024"
+  }'
+```
+
+> Cloudflare 图片生成端点单次调用只返回 1 张图片,不支持 `n>1`。即使客户端传入 `n>1`,也只返回 1 张,不重复同一张图。
+
+### OpenAI Audio Transcriptions
+
+```bash
+curl https://<你的项目>.pages.dev/v1/audio/transcriptions \
+  -H "Authorization: Bearer <代理APIKey>" \
+  -F "file=@audio.mp3" \
+  -F "model=whisper-1"
+```
+
+### Anthropic Messages
 
 ```bash
 curl https://<你的项目>.pages.dev/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: <你在面板中创建的代理APIKey>" \
-  -d '{
+  -d '
     "model": "llama-3.1-8b",
     "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "你好"}]
+  }'
+```
+
+### Anthropic Count Tokens
+
+```bash
+curl https://<你的项目>.pages.dev/v1/messages/count_tokens \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: <代理APIKey>" \
+  -d '
+    "model": "llama-3.1-8b",
     "messages": [{"role": "user", "content": "你好"}]
   }'
 ```
@@ -94,7 +191,7 @@ curl https://<你的项目>.pages.dev/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <代理APIKey>" \
   -N \
-  -d '{
+  -d '
     "model": "llama-3.1-8b",
     "stream": true,
     "messages": [{"role": "user", "content": "你好"}]
@@ -110,7 +207,7 @@ curl https://<你的项目>.pages.dev/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: <代理APIKey>" \
   -N \
-  -d '{
+  -d '
     "model": "llama-3.1-8b",
     "max_tokens": 1024,
     "stream": true,
@@ -121,6 +218,13 @@ curl https://<你的项目>.pages.dev/v1/messages \
 返回格式为 Anthropic SSE 流,包含 `message_start`、`content_block_start`、`content_block_delta`(含 `text_delta` 和 `input_json_delta`)、`content_block_stop`、`message_delta`、`message_stop` 等事件。支持 `tool_use` 流式输出。
 
 > **注意:** 流式响应由 Cloudflare Workers AI 上游直接透传(OpenAI 格式仅替换模型名)或实时转换(Anthropic 格式)。如果上游在流式传输中途断开,客户端会收到截断的流,不会触发账号切换重试——这是 SSE 流式的设计特性。
+
+## 模型映射
+
+客户端可使用简短模型名(如 `llama-3.1-8b`)或完整 Cloudflare 模型名(如 `@cf/meta/llama-3.1-8b-instruct`)。简短名通过内置映射表转换为 Cloudflare 实际模型路径。
+
+- 如果请求的模型名不在映射表中,将自动回退到默认模型(`@cf/meta/llama-3.1-8b-instruct`),并在响应头中添加 `X-Model-Fallback-Warning` 提示。
+- 可在管理面板"模型映射"中自定义映射关系,覆盖内置默认映射。
 
 ## 关于数据看板"今日总消耗量"百分比
 
