@@ -4214,7 +4214,7 @@ function handleAdminPage(request, env, ctx) {
 							</div>
 							<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
 								<div class="stat-desc" id="stat-neurons-desc" style="margin-top: 0;">0 / 0 Neurons (0.00%)</div>
-								<span id="stat-total-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">调用 0 次</span>
+								<span id="stat-total-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">0次</span>
 							</div>
 					</div>
 					<div class="stat-card">
@@ -4231,7 +4231,7 @@ function handleAdminPage(request, env, ctx) {
 							</div>
 							<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
 								<div class="stat-desc" id="stat-daily-desc" style="margin-top: 0;">0 / 10,000 Neurons (0%)</div>
-								<span id="stat-daily-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">调用 0 次</span>
+								<span id="stat-daily-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">0次</span>
 							</div>
 					</div>
 					<div class="stat-card">
@@ -4248,7 +4248,7 @@ function handleAdminPage(request, env, ctx) {
 							</div>
 							<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
 								<div class="stat-desc" id="stat-monthly-desc" style="margin-top: 0;">0 / 100,000 Neurons (0%)</div>
-								<span id="stat-monthly-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">调用 0 次</span>
+								<span id="stat-monthly-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">0次</span>
 							</div>
 					</div>
 					<div class="stat-card">
@@ -4659,7 +4659,7 @@ function handleAdminPage(request, env, ctx) {
 			const roundedTotalUsageToday = Math.ceil(totalUsageToday);
 			document.getElementById('stat-total-neurons').innerText = roundedTotalUsageToday.toLocaleString();
 			document.getElementById('stat-accounts-count').innerText = accounts.length;
-			document.getElementById('stat-total-requests').innerText = '调用 ' + totalRequestsToday.toLocaleString() + ' 次';
+			document.getElementById('stat-total-requests').innerText = totalRequestsToday.toLocaleString() + '次';
 			
 			const overallPercentage = totalLimit > 0 ? Number(((totalUsageToday / totalLimit) * 100).toFixed(2)) : 0;
 			document.getElementById('stat-neurons-progress').style.width = Math.min(100, overallPercentage) + '%';
@@ -4692,7 +4692,7 @@ function handleAdminPage(request, env, ctx) {
 			document.getElementById('stat-daily-desc').innerText = limitDisabled
 				? Math.ceil(dailyUsage).toLocaleString() + ' Neurons（已用，限额已关闭）'
 				: Math.ceil(dailyUsage).toLocaleString() + ' / ' + dailyLimit.toLocaleString() + ' Neurons (' + dailyPct.toFixed(1) + '%)';
-			document.getElementById('stat-daily-requests').innerText = '调用 ' + dailyRequests.toLocaleString() + ' 次';
+			document.getElementById('stat-daily-requests').innerText = dailyRequests.toLocaleString() + '次';
 			// 阈值线位置（threshold <= 0 表示已关闭限额拦截，隐藏阈值线）
 			const dailyThresholdEl = document.getElementById('stat-daily-threshold');
 			if (dailyThresholdEl) {
@@ -4711,7 +4711,7 @@ function handleAdminPage(request, env, ctx) {
 		document.getElementById('stat-monthly-desc').innerText = limitDisabled
 			? Math.ceil(monthlyUsage).toLocaleString() + ' Neurons（已用，限额已关闭）'
 			: Math.ceil(monthlyUsage).toLocaleString() + ' / ' + monthlyLimit.toLocaleString() + ' Neurons (' + monthlyPct.toFixed(1) + '%)';
-			document.getElementById('stat-monthly-requests').innerText = '调用 ' + monthlyRequests.toLocaleString() + ' 次';
+			document.getElementById('stat-monthly-requests').innerText = monthlyRequests.toLocaleString() + '次';
 			// 阈值线位置（threshold <= 0 表示已关闭限额拦截，隐藏阈值线）
 			const monthlyThresholdEl = document.getElementById('stat-monthly-threshold');
 			if (monthlyThresholdEl) {
