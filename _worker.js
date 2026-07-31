@@ -896,12 +896,6 @@ async function handleCompletions(request, env, pathname) {
 		stream: !!stream,
 	};
 
-	// 客户端未指定 max_tokens 时设一个较大默认值，
-	// 避免 CF Workers AI 默认值过小导致输出被截断
-	if (body.max_tokens === undefined) {
-		cfPayload.max_tokens = 4096;
-	}
-
 	const passthroughFields = [
 		'temperature', 'max_tokens', 'top_p', 'n',
 		'stop', 'presence_penalty', 'frequency_penalty',
