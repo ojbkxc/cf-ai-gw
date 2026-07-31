@@ -4237,54 +4237,39 @@ function handleAdminPage(request, env, ctx) {
 				<div id="tab-overview" class="tab-content active">
 					<div class="card-grid">
 						<div class="stat-card">
-							<div style="display: flex; justify-content: space-between; align-items: flex-start;">
+							<div style="display: flex; justify-content: space-between; align-items: center;">
 								<div class="stat-title">今日总消耗量</div>
-								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
-									<path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
-								</svg>
+								<span id="stat-total-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">0次</span>
 							</div>
 							<div class="stat-value" id="stat-total-neurons">0</div>
 							<div class="progress-container">
 								<div class="progress-bar" id="stat-neurons-progress" style="width: 0%;"></div>
 							</div>
-							<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
-								<div class="stat-desc" id="stat-neurons-desc" style="margin-top: 0;">0 / 0 Neurons (0.00%)</div>
-								<span id="stat-total-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">0次</span>
-							</div>
+							<div class="stat-desc" id="stat-neurons-desc" style="margin-top: 4px;">0 / 0 Neurons (0.00%)</div>
 						</div>
 					<div class="stat-card">
-						<div style="display: flex; justify-content: space-between; align-items: flex-start;">
+						<div style="display: flex; justify-content: space-between; align-items: center;">
 							<div class="stat-title">今日用量限额</div>
-							<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
-								<path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-							</svg>
+							<span id="stat-daily-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">0次</span>
 						</div>
 						<div class="stat-value" id="stat-daily-usage">0</div>
 						<div class="progress-container" style="position: relative;">
 							<div class="progress-bar" id="stat-daily-progress" style="width: 0%;"></div>
 							<div class="progress-threshold" id="stat-daily-threshold" style="position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warning-color); left: 90%;"></div>
 						</div>
-						<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
-							<div class="stat-desc" id="stat-daily-desc" style="margin-top: 0;">0 / 10,000 Neurons (0%)</div>
-							<span id="stat-daily-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">0次</span>
-						</div>
+						<div class="stat-desc" id="stat-daily-desc" style="margin-top: 4px;">0 / 10,000 Neurons (0%)</div>
 						</div>
 					<div class="stat-card">
-						<div style="display: flex; justify-content: space-between; align-items: flex-start;">
+						<div style="display: flex; justify-content: space-between; align-items: center;">
 							<div class="stat-title">本月用量限额</div>
-							<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
-								<path stroke-linecap="round" stroke-linejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-							</svg>
+							<span id="stat-monthly-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">0次</span>
 						</div>
 						<div class="stat-value" id="stat-monthly-usage">0</div>
 						<div class="progress-container" style="position: relative;">
 							<div class="progress-bar" id="stat-monthly-progress" style="width: 0%;"></div>
 							<div class="progress-threshold" id="stat-monthly-threshold" style="position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warning-color); left: 90%;"></div>
 						</div>
-						<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
-							<div class="stat-desc" id="stat-monthly-desc" style="margin-top: 0;">0 / 100,000 Neurons (0%)</div>
-							<span id="stat-monthly-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">0次</span>
-						</div>
+						<div class="stat-desc" id="stat-monthly-desc" style="margin-top: 4px;">0 / 100,000 Neurons (0%)</div>
 					</div>
 					<div class="stat-card">
 						<div style="display: flex; justify-content: space-between; align-items: flex-start;">
@@ -4725,7 +4710,7 @@ function handleAdminPage(request, env, ctx) {
 		document.getElementById('stat-daily-usage').innerText = Math.ceil(dailyUsage).toLocaleString();
 		document.getElementById('stat-daily-progress').style.width = Math.min(100, dailyPct) + '%';
 			document.getElementById('stat-daily-desc').innerText = limitDisabled
-				? Math.ceil(dailyUsage).toLocaleString() + ' Neurons（已用，限额已关闭）'
+				? Math.ceil(dailyUsage).toLocaleString() + ' Neurons · 限额关闭'
 				: Math.ceil(dailyUsage).toLocaleString() + ' / ' + dailyLimit.toLocaleString() + ' Neurons (' + dailyPct.toFixed(1) + '%)';
 			document.getElementById('stat-daily-requests').innerText = dailyRequests.toLocaleString() + '次';
 			// 阈值线位置（threshold <= 0 表示已关闭限额拦截，隐藏阈值线）
@@ -4744,7 +4729,7 @@ function handleAdminPage(request, env, ctx) {
 		document.getElementById('stat-monthly-usage').innerText = Math.ceil(monthlyUsage).toLocaleString();
 		document.getElementById('stat-monthly-progress').style.width = Math.min(100, monthlyPct) + '%';
 		document.getElementById('stat-monthly-desc').innerText = limitDisabled
-			? Math.ceil(monthlyUsage).toLocaleString() + ' Neurons（已用，限额已关闭）'
+			? Math.ceil(monthlyUsage).toLocaleString() + ' Neurons · 限额关闭'
 			: Math.ceil(monthlyUsage).toLocaleString() + ' / ' + monthlyLimit.toLocaleString() + ' Neurons (' + monthlyPct.toFixed(1) + '%)';
 			document.getElementById('stat-monthly-requests').innerText = monthlyRequests.toLocaleString() + '次';
 			// 阈值线位置（threshold <= 0 表示已关闭限额拦截，隐藏阈值线）
