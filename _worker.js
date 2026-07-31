@@ -388,7 +388,7 @@ async function setCachedSummary(env, summaryData) {
 // 构建空用量响应（无账号时用）
 function emptyUsageResponse(limits) {
 	return {
-		totalNeuronsToday: 0, totalAccounts: 0, totalLimit: limits.dailyLimit,
+		totalNeuronsToday: 0, totalRequestsToday: 0, totalRequestsMonth: 0, totalAccounts: 0, totalLimit: limits.dailyLimit,
 		usagePercentage: 0, modelsToday: [],
 		dailyUsage: 0, dailyLimit: limits.dailyLimit, monthlyUsage: 0,
 		monthlyLimit: limits.monthlyLimit, threshold: limits.threshold
@@ -398,24 +398,40 @@ function emptyUsageResponse(limits) {
 // 从 cacheMap + accounts 构建用量汇总
 async function buildUsageSummary(env, accounts, cacheMap) {
 	const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
+	const todayStr = new Date().toISOString().split('T')[0];
 	let totalNeuronsToday = 0;
+	let totalRequestsToday = 0;
+	let totalRequestsMonth = 0;
 	const modelsToday = {};
 	accounts.forEach(account => {
 		const cachedItem = cacheMap[account.id];
-		if (cachedItem) {
+		if (!cachedItem) return;
+
+		if (cachedItem.todayDate === todayStr) {
+			// 缓存日期与今日一致，直接使用缓存值
 			if (cachedItem.usageToday) totalNeuronsToday += cachedItem.usageToday;
+			if (cachedItem.usageTodayRequests) totalRequestsToday += cachedItem.usageTodayRequests;
 			if (cachedItem.modelsToday) {
 				cachedItem.modelsToday.forEach(m => {
 					modelsToday[m.model] = (modelsToday[m.model] || 0) + m.neurons;
 				});
 			}
+		} else if (cachedItem.history) {
+			// 缓存日期与今日不一致（跨天），从 history 中重新提取今日数据
+			const todayEntry = cachedItem.history.find(h => h.date === todayStr);
+			if (todayEntry) totalNeuronsToday += todayEntry.neurons;
+			// modelsToday 无法从 history 重建，跨天后暂不计入模型分布
 		}
+		// 月度请求次数
+		if (cachedItem.usageThisMonthRequests) totalRequestsMonth += cachedItem.usageThisMonthRequests;
 	});
 	const formattedModelsToday = Object.keys(modelsToday).map(model => ({ model, neurons: modelsToday[model] }));
 	const monthlyUsage = await getMonthlyUsage(env);
 	const usagePercentage = dailyLimit > 0 ? parseFloat(((totalNeuronsToday / dailyLimit) * 100).toFixed(2)) : 0;
 	return {
 		totalNeuronsToday,
+		totalRequestsToday,
+		totalRequestsMonth,
 		totalAccounts: accounts.length,
 		totalLimit: dailyLimit,
 		usagePercentage,
@@ -468,10 +484,13 @@ async function refreshAccountsUsage(env, accounts, limit = 20) {
 
 			// 复用 processAnalytics 已计算好的今日用量和模型明细
 			const todayUsage = historyParsed.todayTotalNeurons;
+			const todayRequests = historyParsed.todayTotalRequests;
 			const todayModels = historyParsed.todayModels;
+			const todayDateStr = new Date().toISOString().split('T')[0];
 
 			// 月度查询：月初在 7 天窗口内时从 historyGroups 提取，否则独立查询
 			let monthlyTotal;
+			let monthlyRequests = 0;
 			const monthStartStr = monthStart.toISOString().split('T')[0];
 			if (historyParsed.history.some(h => h.date === monthStartStr)) {
 				// 月初在 7 天窗口内，只汇总本月的数据（过滤掉上月的记录）
@@ -479,23 +498,36 @@ async function refreshAccountsUsage(env, accounts, limit = 20) {
 					if (g.dimensions.date >= monthStartStr) return sum + (g.sum?.totalNeurons || 0);
 					return sum;
 				}, 0);
+				monthlyRequests = historyGroups.reduce((sum, g) => {
+					if (g.dimensions.date >= monthStartStr) return sum + (g.count || 0);
+					return sum;
+				}, 0);
 			} else {
 				// 月初不在 7 天窗口内，独立查询（失败不连坐其他数据）
-				monthlyTotal = await queryGraphQL(account.accountId, account.apiToken, startMonth)
-					.then(groups => groups.reduce((sum, g) => sum + (g.sum?.totalNeurons || 0), 0))
+				const monthGroups = await queryGraphQL(account.accountId, account.apiToken, startMonth)
 					.catch(e => {
 						console.error(`Monthly query failed for ${account.name}:`, e);
-						return cacheMap[account.id]?.usageThisMonth || 0;
+						return null;
 					});
+				if (monthGroups) {
+					monthlyTotal = monthGroups.reduce((sum, g) => sum + (g.sum?.totalNeurons || 0), 0);
+					monthlyRequests = monthGroups.reduce((sum, g) => sum + (g.count || 0), 0);
+				} else {
+					monthlyTotal = cacheMap[account.id]?.usageThisMonth || 0;
+					monthlyRequests = cacheMap[account.id]?.usageThisMonthRequests || 0;
+				}
 			}
 
 			cacheMap[account.id] = {
 				status: 'active',
 				error: null,
+				todayDate: todayDateStr,
 				usageToday: todayUsage,
+				usageTodayRequests: todayRequests,
 				modelsToday: todayModels,
 				history: historyParsed.history,
 				usageThisMonth: monthlyTotal,
+				usageThisMonthRequests: monthlyRequests,
 				timestamp: Date.now()
 			};
 		} catch (e) {
@@ -503,10 +535,13 @@ async function refreshAccountsUsage(env, accounts, limit = 20) {
 			cacheMap[account.id] = {
 				status: 'error',
 				error: e.message,
+				todayDate: cacheMap[account.id]?.todayDate || '',
 				usageToday: cacheMap[account.id]?.usageToday || 0,
+				usageTodayRequests: cacheMap[account.id]?.usageTodayRequests || 0,
 				modelsToday: cacheMap[account.id]?.modelsToday || [],
 				history: cacheMap[account.id]?.history || [],
 				usageThisMonth: cacheMap[account.id]?.usageThisMonth || 0,
+				usageThisMonthRequests: cacheMap[account.id]?.usageThisMonthRequests || 0,
 				timestamp: Date.now() // 即使出错也更新时间戳，以便其他账号轮转刷新
 			};
 		}
@@ -581,6 +616,7 @@ function processAnalytics(groups) {
 	const todayStr = new Date().toISOString().split('T')[0];
 
 	let todayTotalNeurons = 0;
+	let todayTotalRequests = 0;
 	const todayModelsMap = {};
 	const historyMap = {};
 
@@ -599,6 +635,7 @@ function processAnalytics(groups) {
 
 		if (date === todayStr) {
 			todayTotalNeurons += neurons;
+			todayTotalRequests += count;
 			if (!todayModelsMap[model]) {
 				todayModelsMap[model] = { model, neurons: 0, requests: 0 };
 			}
@@ -618,6 +655,7 @@ function processAnalytics(groups) {
 
 	return {
 		todayTotalNeurons,
+		todayTotalRequests,
 		todayModels,
 		history
 	};
@@ -1703,6 +1741,8 @@ async function handleDashboardApi(request, env, ctx) {
 				const monthlyUsage = await getMonthlyUsage(env);
 				return new Response(JSON.stringify({
 					...cached,
+					totalRequestsToday: cached.totalRequestsToday || 0,
+					totalRequestsMonth: cached.totalRequestsMonth || 0,
 					totalLimit: dailyLimit,
 					dailyUsage: cached.totalNeuronsToday || 0,
 					dailyLimit,
@@ -1946,30 +1986,49 @@ async function handleDashboardApi(request, env, ctx) {
 		const cacheMap = await refreshAccountsUsage(env, accounts, 20);
 
 		// 构建完整结果列表，若没有缓存数据则标为 pending
+		const todayStr = new Date().toISOString().split('T')[0];
 		const results = accounts.map(account => {
 			const cached = cacheMap[account.id];
+			// 如果缓存日期与今日不一致，从 history 重新计算今日用量
+			let usageToday = 0;
+			let usageTodayRequests = 0;
+			if (cached) {
+				if (cached.todayDate === todayStr) {
+					usageToday = cached.usageToday || 0;
+					usageTodayRequests = cached.usageTodayRequests || 0;
+				} else if (cached.history) {
+					const todayEntry = cached.history.find(h => h.date === todayStr);
+					usageToday = todayEntry ? todayEntry.neurons : 0;
+				}
+			}
 			return {
 				id: account.id,
 				name: account.name,
 				accountId: account.accountId,
 				status: cached ? cached.status : 'pending',
 				error: cached ? cached.error : undefined,
-				usageToday: cached ? cached.usageToday : 0,
-				modelsToday: cached ? cached.modelsToday : [],
+				usageToday,
+				usageTodayRequests,
+				modelsToday: cached && cached.todayDate === todayStr ? (cached.modelsToday || []) : [],
 				history: cached ? cached.history : [],
 				lastUpdated: cached ? cached.timestamp : 0
 			};
 		});
 
-		// 汇总今日用量
+		// 汇总今日用量和请求次数
 		let dailyUsage = 0;
-		results.forEach(a => { dailyUsage += a.usageToday || 0; });
-		// 月度用量从独立 KV 键读取
+		let dailyRequests = 0;
+		let monthlyRequests = 0;
+		results.forEach(a => { dailyUsage += a.usageToday || 0; dailyRequests += a.usageTodayRequests || 0; });
+		// 月度数据
+		for (const [, data] of Object.entries(cacheMap)) {
+			if (data.usageThisMonthRequests) monthlyRequests += data.usageThisMonthRequests;
+		}
 		const monthlyUsage = await getMonthlyUsage(env);
 
 		return new Response(JSON.stringify({
 			accounts: results,
-			limits: { dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold }
+			limits: { dailyUsage, dailyRequests, dailyLimit, monthlyUsage, monthlyRequests, monthlyLimit, threshold }
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
@@ -4153,11 +4212,14 @@ function handleAdminPage(request, env, ctx) {
 							<div class="progress-container">
 								<div class="progress-bar" id="stat-neurons-progress" style="width: 0%;"></div>
 							</div>
-							<div class="stat-desc" id="stat-neurons-desc">0 / 0 Neurons (0.00%)</div>
-						</div>
-						<div class="stat-card">
-							<div style="display: flex; justify-content: space-between; align-items: flex-start;">
-								<div class="stat-title">今日用量限额</div>
+							<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
+								<div class="stat-desc" id="stat-neurons-desc" style="margin-top: 0;">0 / 0 Neurons (0.00%)</div>
+								<span id="stat-total-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">调用 0 次</span>
+							</div>
+					</div>
+					<div class="stat-card">
+						<div style="display: flex; justify-content: space-between; align-items: flex-start;">
+							<div class="stat-title">今日用量限额</div>
 								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
 									<path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
 								</svg>
@@ -4167,11 +4229,14 @@ function handleAdminPage(request, env, ctx) {
 								<div class="progress-bar" id="stat-daily-progress" style="width: 0%;"></div>
 								<div class="progress-threshold" id="stat-daily-threshold" style="position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warning-color); left: 90%;"></div>
 							</div>
-							<div class="stat-desc" id="stat-daily-desc">0 / 10,000 Neurons (0%)</div>
-						</div>
-						<div class="stat-card">
-							<div style="display: flex; justify-content: space-between; align-items: flex-start;">
-								<div class="stat-title">本月用量限额</div>
+							<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
+								<div class="stat-desc" id="stat-daily-desc" style="margin-top: 0;">0 / 10,000 Neurons (0%)</div>
+								<span id="stat-daily-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">调用 0 次</span>
+							</div>
+					</div>
+					<div class="stat-card">
+						<div style="display: flex; justify-content: space-between; align-items: flex-start;">
+							<div class="stat-title">本月用量限额</div>
 								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
 									<path stroke-linecap="round" stroke-linejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
 								</svg>
@@ -4181,11 +4246,14 @@ function handleAdminPage(request, env, ctx) {
 								<div class="progress-bar" id="stat-monthly-progress" style="width: 0%;"></div>
 								<div class="progress-threshold" id="stat-monthly-threshold" style="position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warning-color); left: 90%;"></div>
 							</div>
-							<div class="stat-desc" id="stat-monthly-desc">0 / 100,000 Neurons (0%)</div>
-						</div>
-						<div class="stat-card">
-							<div style="display: flex; justify-content: space-between; align-items: flex-start;">
-								<div class="stat-title">已绑定账号</div>
+							<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
+								<div class="stat-desc" id="stat-monthly-desc" style="margin-top: 0;">0 / 100,000 Neurons (0%)</div>
+								<span id="stat-monthly-requests" style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">调用 0 次</span>
+							</div>
+					</div>
+					<div class="stat-card">
+						<div style="display: flex; justify-content: space-between; align-items: flex-start;">
+							<div class="stat-title">已绑定账号</div>
 								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
 									<path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
 								</svg>
@@ -4507,11 +4575,12 @@ function handleAdminPage(request, env, ctx) {
 		function renderUsageDetails(data) {
 			// localStorage 向后兼容：旧格式是数组，新格式是 { accounts, limits }
 			if (Array.isArray(data)) {
-				data = { accounts: data, limits: { dailyUsage: 0, dailyLimit: 10000, monthlyUsage: 0, monthlyLimit: 100000, threshold: 0.9 } };
+				data = { accounts: data, limits: { dailyUsage: 0, dailyRequests: 0, dailyLimit: 10000, monthlyUsage: 0, monthlyRequests: 0, monthlyLimit: 100000, threshold: 0.9 } };
 			}
 			const { accounts, limits } = data;
 
 			let totalUsageToday = 0;
+			let totalRequestsToday = 0;
 			const totalLimit = limits.dailyLimit;
 			let historyData = {};
 			let modelsToday = {};
@@ -4537,6 +4606,7 @@ function handleAdminPage(request, env, ctx) {
 
 			accounts.forEach(account => {
 				totalUsageToday += account.usageToday;
+				totalRequestsToday += account.usageTodayRequests || 0;
 
 				// Percentage formatted to 2 decimal places（不封顶，允许超过 100%）
 			const percentage = Number(((account.usageToday / limits.dailyLimit) * 100).toFixed(2));
@@ -4589,6 +4659,7 @@ function handleAdminPage(request, env, ctx) {
 			const roundedTotalUsageToday = Math.ceil(totalUsageToday);
 			document.getElementById('stat-total-neurons').innerText = roundedTotalUsageToday.toLocaleString();
 			document.getElementById('stat-accounts-count').innerText = accounts.length;
+			document.getElementById('stat-total-requests').innerText = '调用 ' + totalRequestsToday.toLocaleString() + ' 次';
 			
 			const overallPercentage = totalLimit > 0 ? Number(((totalUsageToday / totalLimit) * 100).toFixed(2)) : 0;
 			document.getElementById('stat-neurons-progress').style.width = Math.min(100, overallPercentage) + '%';
@@ -4610,7 +4681,7 @@ function handleAdminPage(request, env, ctx) {
 		}
 
 		function updateLimitCards(limits) {
-			const { dailyUsage = 0, dailyLimit = 10000, monthlyUsage = 0, monthlyLimit = 100000, threshold = 0.9 } = limits || {};
+			const { dailyUsage = 0, dailyRequests = 0, dailyLimit = 10000, monthlyUsage = 0, monthlyRequests = 0, monthlyLimit = 100000, threshold = 0.9 } = limits || {};
 			// threshold <= 0 表示已关闭限额拦截：仅统计用量，不再对请求做限制
 			const limitDisabled = threshold <= 0;
 
@@ -4621,6 +4692,7 @@ function handleAdminPage(request, env, ctx) {
 			document.getElementById('stat-daily-desc').innerText = limitDisabled
 				? Math.ceil(dailyUsage).toLocaleString() + ' Neurons（已用，限额已关闭）'
 				: Math.ceil(dailyUsage).toLocaleString() + ' / ' + dailyLimit.toLocaleString() + ' Neurons (' + dailyPct.toFixed(1) + '%)';
+			document.getElementById('stat-daily-requests').innerText = '调用 ' + dailyRequests.toLocaleString() + ' 次';
 			// 阈值线位置（threshold <= 0 表示已关闭限额拦截，隐藏阈值线）
 			const dailyThresholdEl = document.getElementById('stat-daily-threshold');
 			if (dailyThresholdEl) {
@@ -4639,6 +4711,7 @@ function handleAdminPage(request, env, ctx) {
 		document.getElementById('stat-monthly-desc').innerText = limitDisabled
 			? Math.ceil(monthlyUsage).toLocaleString() + ' Neurons（已用，限额已关闭）'
 			: Math.ceil(monthlyUsage).toLocaleString() + ' / ' + monthlyLimit.toLocaleString() + ' Neurons (' + monthlyPct.toFixed(1) + '%)';
+			document.getElementById('stat-monthly-requests').innerText = '调用 ' + monthlyRequests.toLocaleString() + ' 次';
 			// 阈值线位置（threshold <= 0 表示已关闭限额拦截，隐藏阈值线）
 			const monthlyThresholdEl = document.getElementById('stat-monthly-threshold');
 			if (monthlyThresholdEl) {
