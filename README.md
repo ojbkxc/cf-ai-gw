@@ -1,17 +1,19 @@
 # WorkersAI2API
 
-一个反向代理:把 Cloudflare Workers AI 转换成 OpenAI 兼容的接口格式,支持多账号负载均衡、故障自动切换重试,并自带一个可视化管理面板(数据看板)。
+一个反向代理:把 Cloudflare Workers AI 转换成 OpenAI / Anthropic 兼容的接口格式,支持多账号负载均衡、故障自动切换重试,并自带一个可视化管理面板(数据看板)。
 
 仓库仅包含一个 `_worker.js` 文件,可直接部署到 **Cloudflare Pages**(Pages 高级模式,根目录放置 `_worker.js`)。
 
 ## 功能特性
 
-- OpenAI 兼容接口(`/v1/chat/completions`、`/v1/embeddings`、`/v1/images/generations` 等)
+- OpenAI 兼容接口(`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/models`)
+- Anthropic Messages API 兼容接口(`/v1/messages`),支持流式与非流式
 - 多 Cloudflare 账号绑定,负载均衡 + 故障自动切换重试
 - 内置可视化管理面板(`/admin`),查看今日/本月用量、历史趋势、模型分布
 - 可配置每日/每月 Neurons 限额及拦截阈值
 - 代理 API Key 管理(可随机生成或自定义)
 - 跨域(CORS)支持
+- 安全加固:异常日志不泄露 token、前端 XSS 防护、CSRF 防护
 
 ## 部署到 Cloudflare Pages
 
@@ -66,6 +68,58 @@ curl https://<你的项目>.pages.dev/v1/chat/completions \
     "messages": [{"role": "user", "content": "你好"}]
   }'
 ```
+
+### Anthropic 格式调用示例
+
+```bash
+curl https://<你的项目>.pages.dev/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: <你在面板中创建的代理APIKey>" \
+  -d '{
+    "model": "llama-3.1-8b",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "你好"}]
+  }'
+```
+
+## 流式调用(Stream)
+
+### OpenAI 格式流式
+
+在请求体中加入 `"stream": true` 即可开启 SSE 流式响应:
+
+```bash
+curl https://<你的项目>.pages.dev/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <代理APIKey>" \
+  -N \
+  -d '{
+    "model": "llama-3.1-8b",
+    "stream": true,
+    "messages": [{"role": "user", "content": "你好"}]
+  }'
+```
+
+返回格式为标准 OpenAI SSE 流,每个 chunk 的 `data:` 行包含一段 JSON,末尾以 `data: [DONE]` 结束。`tool_calls`、`finish_reason`、`usage`、`reasoning_content` 等字段均原样透传。
+
+### Anthropic 格式流式
+
+```bash
+curl https://<你的项目>.pages.dev/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: <代理APIKey>" \
+  -N \
+  -d '{
+    "model": "llama-3.1-8b",
+    "max_tokens": 1024,
+    "stream": true,
+    "messages": [{"role": "user", "content": "你好"}]
+  }'
+```
+
+返回格式为 Anthropic SSE 流,包含 `message_start`、`content_block_start`、`content_block_delta`(含 `text_delta` 和 `input_json_delta`)、`content_block_stop`、`message_delta`、`message_stop` 等事件。支持 `tool_use` 流式输出。
+
+> **注意:** 流式响应由 Cloudflare Workers AI 上游直接透传(OpenAI 格式仅替换模型名)或实时转换(Anthropic 格式)。如果上游在流式传输中途断开,客户端会收到截断的流,不会触发账号切换重试——这是 SSE 流式的设计特性。
 
 ## 关于数据看板"今日总消耗量"百分比
 

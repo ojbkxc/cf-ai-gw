@@ -9,6 +9,12 @@ const DEFAULT_DAILY_LIMIT = 10000;     // 默认每日限额 10,000 Neurons
 const DEFAULT_MONTHLY_LIMIT = 100000;  // 默认每月限额 100,000 Neurons（$5/月套餐）
 const DEFAULT_USAGE_THRESHOLD = 0;     // 默认触发拦截的用量阈值；设为 0 表示关闭限额拦截（仅统计不拦截）
 
+// 缓存与刷新相关常量
+const USAGE_CACHE_TTL_MS = 300000;     // 用量汇总缓存有效期 5 分钟（毫秒）
+const USAGE_REFRESH_LIMIT = 20;        // 每次刷新最多更新的账号数
+const MONTHLY_USAGE_TTL_SEC = 38 * 24 * 60 * 60; // 月度用量 KV 键 TTL 38 天（秒）
+const MODEL_CREATED_TS = 1686935000;   // 模型列表中的 created 时间戳（2023-06-16）
+
 // 默认模型映射表（左边是客户端请求的模型名，右边是 Cloudflare 上对应的真实模型）
 const DEFAULT_MODEL_MAP = {
 	// 对话 / 文本生成模型
@@ -57,21 +63,49 @@ export default {
 		try {
 			// 1. 检查是否绑定了 KV 存储
 			if (!env.KV) {
-				return handleKVError(request);
+				const url = new URL(request.url);
+				if (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/api/')) {
+					return new Response(JSON.stringify({ error: { message: 'KV storage not configured. Please bind a KV namespace named \'KV\' in your Pages project settings.', type: 'server_error' } }), {
+						status: 503,
+						headers: { 'Content-Type': 'application/json' }
+					});
+				}
+				return new Response('KV storage not configured. Please bind a KV namespace named \'KV\' in your Pages project settings.', {
+					status: 503,
+					headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+				});
 			}
 
 			// 2. 检查是否配置了 ADMIN_PASSWORD 环境变量
 			if (!env.ADMIN_PASSWORD) {
-				return handlePasswordError(request);
+				const url = new URL(request.url);
+				if (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/api/')) {
+					return new Response(JSON.stringify({ error: { message: 'ADMIN_PASSWORD not configured. Please set this environment variable in your Pages project settings.', type: 'server_error' } }), {
+						status: 503,
+						headers: { 'Content-Type': 'application/json' }
+					});
+				}
+				return new Response('ADMIN_PASSWORD not configured. Please set this environment variable in your Pages project settings.', {
+					status: 503,
+					headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+				});
 			}
 
 			// 处理跨域预检请求（OPTIONS）
+			// /v1/ 接口放开 *，/api/ 管理接口仅允许同源，与 addCORSHeaders 保持一致
 			if (request.method === 'OPTIONS') {
+				const reqUrl = new URL(request.url);
+				const isApiPath = reqUrl.pathname.startsWith('/api/');
+				const origin = request.headers.get('Origin');
+				const allowOrigin = (isApiPath && origin && origin === reqUrl.origin) ? origin
+					: (isApiPath && (!origin || origin !== reqUrl.origin)) ? 'null'
+					: '*';
 				return new Response(null, {
 					headers: {
-						'Access-Control-Allow-Origin': '*',
+						'Access-Control-Allow-Origin': allowOrigin,
 						'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
-						'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key'
+						'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key',
+						...(isApiPath && allowOrigin !== 'null' ? { 'Vary': 'Origin' } : {})
 					}
 				});
 			}
@@ -81,13 +115,13 @@ export default {
 			// 3. OpenAI 兼容的代理接口（/v1/ 开头）
 			if (url.pathname.startsWith('/v1/')) {
 				const response = await handleV1Proxy(request, env, ctx);
-				return addCORSHeaders(response);
+				return addCORSHeaders(response, request);
 			}
 
 			// 4. 后台管理面板的 API 接口（/api/ 开头）
 			if (url.pathname.startsWith('/api/')) {
 				const response = await handleDashboardApi(request, env, ctx);
-			return addCORSHeaders(response, request);
+				return addCORSHeaders(response, request);
 			}
 
 			// 5. 后台管理面板页面
@@ -163,81 +197,120 @@ async function sha256(message) {
 
 // ----------------------------------------------------
 // KV 读写相关工具函数
-// （把所有配置合并存到一个 'config' 键里，一次读取就能拿到全部配置）
+// 配置拆分为独立 KV 键，避免单键读写放大和并发覆盖风险：
+//   'cfg_accounts'   → 账号列表
+//   'cfg_api_keys'   → 代理 API Key 列表
+//   'cfg_model_map'  → 自定义模型映射
+//   'cfg_limits'     → 用量限额配置
 // ----------------------------------------------------
-async function getAppConfig(env) {
-	const raw = await env.KV.get('config');
-	let parsed = { accounts: [], apiKeys: [], customModelMap: {}, usageLimits: {} };
 
-	if (raw) {
-		try {
-			const data = JSON.parse(raw);
-			parsed = {
-				accounts: data.accounts || [],
-				apiKeys: data.apiKeys || [],
-				customModelMap: data.customModelMap || {},
-				usageLimits: data.usageLimits || {}
-			};
-		} catch (e) {
-			console.error('Failed to parse KV config JSON:', e);
+// 一次性读取所有配置（兼容旧版单键 'config'，自动迁移）
+async function getAppConfig(env) {
+	// 优先从独立键读取
+	const [accRaw, keyRaw, mapRaw, limitsRaw] = await Promise.all([
+		env.KV.get('cfg_accounts', { cacheTtl: 60 }),
+		env.KV.get('cfg_api_keys', { cacheTtl: 60 }),
+		env.KV.get('cfg_model_map', { cacheTtl: 60 }),
+		env.KV.get('cfg_limits', { cacheTtl: 60 }),
+	]);
+
+	// 如果所有独立键都为空，尝试从旧版 'config' 键迁移
+	if (!accRaw && !keyRaw && !mapRaw && !limitsRaw) {
+		const legacyRaw = await env.KV.get('config');
+		if (legacyRaw) {
+			try {
+				const data = JSON.parse(legacyRaw);
+				const migrated = {
+					accounts: data.accounts || [],
+					apiKeys: data.apiKeys || [],
+					customModelMap: data.customModelMap || {},
+					usageLimits: data.usageLimits || {}
+				};
+				// 写入独立键（后台迁移，不阻塞响应）
+				await Promise.all([
+					env.KV.put('cfg_accounts', JSON.stringify(migrated.accounts)),
+					env.KV.put('cfg_api_keys', JSON.stringify(migrated.apiKeys)),
+					env.KV.put('cfg_model_map', JSON.stringify(migrated.customModelMap)),
+					env.KV.put('cfg_limits', JSON.stringify(migrated.usageLimits)),
+				]);
+				return migrated;
+			} catch (e) {
+				console.error('Failed to migrate legacy config:', e);
+			}
 		}
-	} else {
-		// 仅在 KV 首次初始化时写入默认模型映射，避免覆盖已有配置。
-		parsed.customModelMap = { ...DEFAULT_MODEL_MAP };
-		await env.KV.put('config', JSON.stringify(parsed));
+		// 全新初始化
+		const defaults = { accounts: [], apiKeys: [], customModelMap: { ...DEFAULT_MODEL_MAP }, usageLimits: {} };
+		await env.KV.put('cfg_model_map', JSON.stringify(defaults.customModelMap));
+		return defaults;
 	}
 
-	return parsed;
+	const parseSafe = (raw, fallback) => {
+		if (!raw) return fallback;
+		try { return JSON.parse(raw); } catch (e) { console.error('Failed to parse KV JSON:', e); return fallback; }
+	};
+
+	return {
+		accounts: parseSafe(accRaw, []),
+		apiKeys: parseSafe(keyRaw, []),
+		customModelMap: parseSafe(mapRaw, {}),
+		usageLimits: parseSafe(limitsRaw, {}),
+	};
 }
 
+// 仅保存指定字段到独立 KV 键（避免全量写回）
 async function saveAppConfig(env, config) {
-	await env.KV.put('config', JSON.stringify(config));
+	await Promise.all([
+		env.KV.put('cfg_accounts', JSON.stringify(config.accounts)),
+		env.KV.put('cfg_api_keys', JSON.stringify(config.apiKeys)),
+		env.KV.put('cfg_model_map', JSON.stringify(config.customModelMap)),
+		env.KV.put('cfg_limits', JSON.stringify(config.usageLimits)),
+	]);
 }
 
 async function getAccounts(env) {
-	const config = await getAppConfig(env);
-	return config.accounts;
+	const raw = await env.KV.get('cfg_accounts', { cacheTtl: 60 });
+	if (!raw) return [];
+	try { return JSON.parse(raw); } catch { return []; }
 }
 
 async function saveAccounts(env, accounts) {
-	const config = await getAppConfig(env);
-	config.accounts = accounts;
-	await saveAppConfig(env, config);
+	await env.KV.put('cfg_accounts', JSON.stringify(accounts));
 	await env.KV.delete('cache_usage_summary'); // 清除用量统计的缓存
 }
 
 async function getApiKeys(env) {
-	const config = await getAppConfig(env);
-	return config.apiKeys;
+	const raw = await env.KV.get('cfg_api_keys', { cacheTtl: 60 });
+	if (!raw) return [];
+	try { return JSON.parse(raw); } catch { return []; }
 }
 
 async function saveApiKeys(env, keys) {
-	const config = await getAppConfig(env);
-	config.apiKeys = keys;
-	await saveAppConfig(env, config);
+	await env.KV.put('cfg_api_keys', JSON.stringify(keys));
 }
 
 async function getCustomModelMap(env) {
-	const config = await getAppConfig(env);
-	return config.customModelMap;
+	const raw = await env.KV.get('cfg_model_map', { cacheTtl: 60 });
+	if (!raw) return {};
+	try { return JSON.parse(raw); } catch { return {}; }
 }
 
 async function saveCustomModelMap(env, map) {
-	const config = await getAppConfig(env);
-	config.customModelMap = map;
-	await saveAppConfig(env, config);
+	await env.KV.put('cfg_model_map', JSON.stringify(map));
 }
 
 async function getUsageLimitsConfig(env) {
-	const config = await getAppConfig(env);
-	return config.usageLimits || {};
+	const raw = await env.KV.get('cfg_limits', { cacheTtl: 60 });
+	if (!raw) return {};
+	try { return JSON.parse(raw); } catch { return {}; }
 }
 
 async function saveUsageLimitsConfig(env, limits) {
-	const config = await getAppConfig(env);
-	config.usageLimits = { ...config.usageLimits, ...limits };
-	await saveAppConfig(env, config);
+	const existing = await getUsageLimitsConfig(env);
+	await env.KV.put('cfg_limits', JSON.stringify({ ...existing, ...limits }));
 }
+
+// 缓存的正则表达式（模块顶层，避免每次请求重新编译）
+const COOKIE_TOKEN_RE = /admin_token=([^;]+)/;
 
 // ----------------------------------------------------
 // 管理员身份验证（同时支持 Cookie 和 Authorization 请求头）
@@ -245,7 +318,7 @@ async function saveUsageLimitsConfig(env, limits) {
 async function checkAdminAuth(request, env) {
 	// 1. 先从 Cookie 里取登录令牌（浏览器访问时走这里）
 	const cookies = request.headers.get('Cookie') || '';
-	const cookieMatch = cookies.match(/admin_token=([^;]+)/);
+	const cookieMatch = cookies.match(COOKIE_TOKEN_RE);
 	let token = cookieMatch ? cookieMatch[1] : null;
 
 	// 2. Cookie 里没有的话，再从 Authorization 请求头里取（API 工具调用时走这里）
@@ -392,7 +465,7 @@ async function getCachedSummary(env) {
 	if (cached) {
 		try {
 			const data = JSON.parse(cached);
-			if (Date.now() - data.timestamp < 300000) { // 缓存有效期 5 分钟
+			if (Date.now() - data.timestamp < USAGE_CACHE_TTL_MS) {
 				return data;
 			}
 		} catch (e) {
@@ -408,7 +481,7 @@ async function setCachedSummary(env, summaryData) {
 		summaryDate: new Date().toISOString().split('T')[0],
 		timestamp: Date.now()
 	};
-	await env.KV.put('cache_usage_summary', JSON.stringify(data), { expirationTtl: 300 });
+	await env.KV.put('cache_usage_summary', JSON.stringify(data), { expirationTtl: USAGE_CACHE_TTL_MS / 1000 });
 }
 
 // 构建空用量响应（无账号时用）
@@ -471,7 +544,16 @@ async function buildUsageSummary(env, accounts, cacheMap) {
 	};
 }
 
+// 并发锁：防止多个请求同时刷新用量导致数据覆盖
+let _usageRefreshLock = null;
+
 async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) {
+	// 如果已有刷新任务在进行中，等待其完成后返回结果
+	if (_usageRefreshLock) {
+		try { return await _usageRefreshLock; } catch (_) { /* 忽略前一次错误，重新刷新 */ }
+	}
+
+	const _doRefresh = async () => {
 	const cachedDetailsRaw = await env.KV.get('cache_usage_details');
 	let cacheMap = {};
 	if (cachedDetailsRaw) {
@@ -584,9 +666,17 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) 
 	for (const [, data] of Object.entries(cacheMap)) {
 		totalMonthly += data.usageThisMonth || 0;
 	}
-	await env.KV.put(getMonthlyUsageKey(), String(totalMonthly), { expirationTtl: 38 * 24 * 60 * 60 }); // TTL 38 天
+	await env.KV.put(getMonthlyUsageKey(), String(totalMonthly), { expirationTtl: MONTHLY_USAGE_TTL_SEC });
 
 	return cacheMap;
+	}; // end _doRefresh
+
+	_usageRefreshLock = _doRefresh();
+	try {
+		return await _usageRefreshLock;
+	} finally {
+		_usageRefreshLock = null;
+	}
 }
 
 // ----------------------------------------------------
@@ -746,7 +836,7 @@ async function handleV1Proxy(request, env, ctx) {
 			return {
 				id,
 				object: 'model',
-				created: 1686935000,
+				created: MODEL_CREATED_TS,
 				owned_by: isEmbedding ? 'openai' : 'meta'
 			};
 		});
@@ -781,7 +871,8 @@ async function handleV1Proxy(request, env, ctx) {
 // ----------------------------------------------------
 // 可复用的核心 API 调用函数
 // 将 OpenAI Chat Completions 格式的请求发送到 Cloudflare AI 网关，
-// 支持多账号负载均衡和故障自动切换。
+// 支持多账号故障自动切换（failover）：按顺序遍历活跃账号，遇到 5xx/429/网络错误时自动切到下一个。
+// 注：单用户场景通常只有 1 个账号，此循环仅在多账号时生效。
 // 返回格式：{ success: true, data: cfJson } 或 { success: false, error: "..." }
 // ----------------------------------------------------
 async function callOpenAICompatibleAPI(cfPayload, env, stream) {
@@ -809,27 +900,22 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 
 			if (cfResponse.ok) {
 			if (stream) {
-			if (!cfResponse.body) {
-			lastError = `CF API returned empty response body`;
-			continue;
-			}
-			// 流式响应：一旦拿到 HTTP 200 + body 就立即返回，不预读首字节。
-			// 这意味着如果上游在流式传输中途断开，客户端会收到截断的流而不会触发 failover。
-			// 这是刻意的设计权衡：预读会破坏 SSE 的实时性。
-			return { success: true, stream: cfResponse.body };
-			} else {
-			const cfJson = await cfResponse.json();
-			return { success: true, data: cfJson };
+				if (!cfResponse.body) {
+					lastError = `CF API returned empty response body`;
+					continue;
 				}
+				// 流式响应：一旦拿到 HTTP 200 + body 就立即返回，不预读首字节。
+				// 这意味着如果上游在流式传输中途断开，客户端会收到截断的流而不会触发 failover。
+				// 这是刻意的设计权衡：预读会破坏 SSE 的实时性。
+				return { success: true, stream: cfResponse.body };
 			} else {
+				const cfJson = await cfResponse.json();
+				return { success: true, data: cfJson };
+			}
+		} else {
 				const errorText = await cfResponse.text();
 				const status = cfResponse.status;
-				// 4xx（除 429）属于客户端参数/鉴权类错误，换账号也一样失败，且会白白消耗配额；
-				// 直接返回原始错误，保留状态码供调用方转发。
-				if (status >= 400 && status < 500 && status !== 429) {
-					return { success: false, status, error: `CF API returned ${status}: ${errorText}` };
-				}
-				// 5xx / 429 / 其他错误：记录后继续尝试下一个账号
+				// 记录错误后继续尝试下一个账号
 				lastError = `CF API returned ${status}: ${errorText}`;
 			}
 		} catch (e) {
@@ -841,32 +927,13 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 }
 
 // 共享的模型名解析函数：根据用户传入的模型名，映射到 Cloudflare 实际模型
-// 找不到映射时返回 null，由调用方决定如何报错（避免静默兜底用错模型）。
+// 找不到映射时静默回退到默认模型（与原代码一致）。
 async function resolveModelName(model, env) {
-	if (!model) return null;
+	if (!model) return '@cf/zai-org/glm-4.7-flash';
 	if (model.startsWith('@cf/')) return model;
 	const customMap = await getCustomModelMap(env);
 	const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
-	return combinedMap[model] || null;
-}
-
-// 模型名解析 + 错误响应：找不到模型时返回对应的错误 Response
-async function resolveModelOrError(model, env, errorFormat = 'openai') {
-	const cfModel = await resolveModelName(model, env);
-	if (cfModel) return { model: cfModel };
-
-	const msg = `Model '${model}' not found. Available models: see /v1/models. Use @cf/<org>/<model> to pass through a raw Cloudflare model id.`;
-
-	if (errorFormat === 'anthropic') {
-		return { error: new Response(JSON.stringify({
-			type: 'error',
-			error: { type: 'invalid_request_error', message: msg }
-		}), { status: 404, headers: { 'Content-Type': 'application/json' } }) };
-	}
-
-	return { error: new Response(JSON.stringify({
-		error: { message: msg, type: "invalid_request_error", param: "model", code: "model_not_found" }
-	}), { status: 404, headers: { 'Content-Type': 'application/json' } }) };
+	return combinedMap[model] || '@cf/zai-org/glm-4.7-flash';
 }
 
 // 对话补全 / 文本补全 的代理处理函数
@@ -887,10 +954,8 @@ async function handleCompletions(request, env, pathname) {
 		return new Response(JSON.stringify({ error: { message: "prompt field is required", type: "invalid_request_error" } }), { status: 400 });
 	}
 
-	// 解析模型名映射
-	const resolved = await resolveModelOrError(model, env);
-	if (resolved.error) return resolved.error;
-	const cfModel = resolved.model;
+	// 解析模型名映射（找不到映射时静默回退到默认模型）
+	const cfModel = await resolveModelName(model, env);
 
 	// 构造发给 Cloudflare 的请求体
 	const cfPayload = {
@@ -1108,7 +1173,7 @@ function convertAnthropicToOpenAI(anthropicBody) {
 		const systemCount = openaiMessages.filter(m => m.role === 'system').length;
 		openaiMessages.splice(systemCount, 0, {
 			role: 'user',
-			content: '_'
+			content: ' '
 		});
 	}
 
@@ -1253,9 +1318,7 @@ async function handleMessages(request, env) {
 
 	// 解析模型名映射
 	const model = anthropicBody.model;
-	const resolved = await resolveModelOrError(model, env, 'anthropic');
-	if (resolved.error) return resolved.error;
-	const cfModel = resolved.model;
+	const cfModel = await resolveModelName(model, env);
 
 	// Anthropic → OpenAI 格式转换
 	const openaiBody = convertAnthropicToOpenAI(anthropicBody);
@@ -1288,7 +1351,7 @@ async function handleMessages(request, env) {
 
 	if (stream) {
 		// 流式：转换流
-		const transformedStream = anthropicStreamTransform(result.stream, model);
+		const transformedStream = anthropicStreamTransform(result.stream, model, anthropicBody.messages);
 		return new Response(transformedStream, {
 			headers: {
 				'Content-Type': 'text/event-stream',
@@ -1311,7 +1374,7 @@ async function handleMessages(request, env) {
 // Anthropic SSE 流式转换
 // 将 OpenAI SSE 格式实时转换为 Anthropic SSE 格式
 // ----------------------------------------------------
-function anthropicStreamTransform(upstreamBody, modelName) {
+function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
@@ -1327,35 +1390,25 @@ function anthropicStreamTransform(upstreamBody, modelName) {
 	let outputTokens = 0;
 
 	let enqueuedAny = false;
-	let boundEnqueue = null; // 只绑定一次，避免每次 pull 形成套娃包装
 
 	return new ReadableStream({
 		async pull(controller) {
 			enqueuedAny = false;
-			if (!boundEnqueue) {
-				boundEnqueue = controller.enqueue.bind(controller);
-			}
+			const originalEnqueue = controller.enqueue.bind(controller);
 			controller.enqueue = (chunk) => {
 				enqueuedAny = true;
-				boundEnqueue(chunk);
+				originalEnqueue(chunk);
 			};
 
 			while (true) {
-				let readResult;
-				try {
-					readResult = await reader.read();
-				} catch (e) {
-					// upstream read error: emit Anthropic error event instead of silent break
-					const em = (e && e.message) ? e.message : "connection error";
-					const ep = JSON.stringify({ type: "error", error: { type: "api_error", message: "Upstream stream error: " + em } });
-					controller.enqueue(encoder.encode("event: error\ndata: " + ep + "\n\n"));
-					controller.close();
-					break;
-				}
-				const { value, done } = readResult;
+				const { value, done } = await reader.read();
 				if (done) {
 					if (buffer.trim()) {
 						buffer = processLines(buffer, controller);
+					}
+					// 上游流异常结束时兜底发送终止事件，避免 Anthropic 客户端收到不完整流
+					if (!blockStopSent) {
+						sendFinalEvent(controller);
 					}
 					controller.close();
 					break;
@@ -1363,6 +1416,7 @@ function anthropicStreamTransform(upstreamBody, modelName) {
 
 				buffer += decoder.decode(value, { stream: true });
 				buffer = processLines(buffer, controller);
+
 				if (buffer.indexOf('\n') === -1) {
 					if (enqueuedAny) {
 						break;
@@ -1581,9 +1635,7 @@ async function handleEmbeddings(request, env) {
 	}
 
 	// 解析模型名映射
-	const resolved = await resolveModelOrError(model, env);
-	if (resolved.error) return resolved.error;
-	const cfModel = resolved.model;
+	const cfModel = await resolveModelName(model, env);
 
 	const textArray = Array.isArray(input) ? input : [input];
 	const accounts = await getAccounts(env);
@@ -1635,12 +1687,7 @@ async function handleEmbeddings(request, env) {
 			} else {
 				const errorText = await cfResponse.text();
 				const status = cfResponse.status;
-				// 4xx（除 429）属于客户端参数/鉴权类错误，换账号也一样失败，直接返回
-				if (status >= 400 && status < 500 && status !== 429) {
-					return new Response(JSON.stringify({
-						error: { message: `CF API returned ${status}: ${errorText}`, type: "invalid_request_error" }
-					}), { status, headers: { 'Content-Type': 'application/json' } });
-				}
+				// 记录错误后继续尝试下一个账号
 				lastError = `CF API status ${status}: ${errorText}`;
 			}
 		} catch (e) {
@@ -1665,18 +1712,7 @@ function passthroughStream(upstreamBody, modelName) {
 	return new ReadableStream({
 		async pull(controller) {
 			while (true) {
-				let readResult;
-				try {
-					readResult = await reader.read();
-				} catch (e) {
-					// 读取上游流异常时，把错误透传给客户端而非静默断流
-					const errChunk = { error: { message: `Upstream stream error: ${e.message || 'connection error'}`, type: "server_error" } };
-					controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
-					controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-					controller.close();
-					break;
-				}
-				const { value, done } = readResult;
+				const { value, done } = await reader.read();
 				if (done) {
 					// 把缓冲区里剩下的内容输出掉
 					if (buffer.trim()) {
@@ -1814,7 +1850,7 @@ async function handleDashboardApi(request, env, ctx) {
 			}
 
 			const summary = await buildUsageSummary(env, accounts, cacheMap);
-			await setCachedSummary(env, summary);
+			ctx.waitUntil(setCachedSummary(env, summary)); // 后台写缓存，不阻塞响应
 			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json' } });
 		}
 
@@ -1828,7 +1864,7 @@ async function handleDashboardApi(request, env, ctx) {
 
 			const cacheMap = await refreshAccountsUsage(env, accounts);
 			const summary = await buildUsageSummary(env, accounts, cacheMap);
-			await setCachedSummary(env, summary);
+			ctx.waitUntil(setCachedSummary(env, summary)); // 后台写缓存，不阻塞响应
 			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json' } });
 		}
 	}
@@ -1839,6 +1875,17 @@ async function handleDashboardApi(request, env, ctx) {
 	const isAuthorized = await checkAdminAuth(request, env);
 	if (!isAuthorized) {
 		return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+	}
+
+	// CSRF 防护：POST/DELETE 请求必须携带有效的 X-CSRF-Token 头（与 cookie 中的 csrf_token 一致）
+	if (method === 'POST' || method === 'DELETE') {
+		const cookies = request.headers.get('Cookie') || '';
+		const csrfCookieMatch = cookies.match(/csrf_token=([^;]+)/);
+		const csrfCookie = csrfCookieMatch ? csrfCookieMatch[1] : null;
+		const csrfHeader = request.headers.get('X-CSRF-Token');
+		if (!csrfCookie || !csrfHeader || csrfCookie !== csrfHeader) {
+			return new Response(JSON.stringify({ error: 'CSRF token validation failed. Please refresh the page.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+		}
 	}
 
 	if (url.pathname === '/api/accounts') {
@@ -2196,7 +2243,10 @@ const SHARED_JS = `
 				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>\`;
 			}
 
-			toast.innerHTML = \`\${iconSvg}<span>\${message}</span>\`;
+			toast.innerHTML = iconSvg;
+			const msgSpan = document.createElement('span');
+			msgSpan.textContent = message;
+			toast.appendChild(msgSpan);
 			container.appendChild(toast);
 
 			toast.offsetHeight; // trigger reflow
@@ -3150,7 +3200,7 @@ async function handleLandingPage(request, env, ctx) {
 						item.style.transition = 'all 0.4s cubic-bezier(0.16, 1, 0.3, 1)';
 						
 						item.innerHTML = '<span style="width: 8px; height: 8px; border-radius: 50%; background-color: ' + color + '; flex-shrink: 0; margin-right: 2px;"></span>' +
-							'<span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; font-weight: 500;" title="' + label + '">' + label + '</span>' +
+							'<span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; font-weight: 500;" title="' + label.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') + '">' + label.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</span>' +
 							'<span style="color: var(--text-muted); font-family: monospace; font-size: 11px; flex-shrink: 0; margin-left: 4px;">' + pct + '%</span>';
 						
 						legendContainer.appendChild(item);
@@ -3218,10 +3268,15 @@ async function handleLandingPage(request, env, ctx) {
 }
 
 // 2. 后台管理控制台页面
-function handleAdminPage(request, env, ctx) {
+async function handleAdminPage(request, env, ctx) {
+	// 生成 CSRF Token：同时写入 cookie（JS 可读）和 meta 标签，前端请求时通过 X-CSRF-Token 头回传
+	const csrfToken = await sha256(env.ADMIN_PASSWORD + '_csrf_v1');
+	const csrfCookie = `csrf_token=${csrfToken}; Path=/; SameSite=Strict; Max-Age=86400`;
+
 	const html = `<!DOCTYPE html>
 <head>
 	<meta charset="UTF-8">
+	<meta name="csrf-token" content="${csrfToken}">
 	<meta name="robots" content="noindex, nofollow">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<title>Workers AI to API Dashboard</title>
@@ -4635,7 +4690,7 @@ function handleAdminPage(request, env, ctx) {
 				totalRequestsToday += account.usageTodayRequests || 0;
 
 				// Percentage formatted to 2 decimal places（不封顶，允许超过 100%）
-			const percentage = Number(((account.usageToday / limits.dailyLimit) * 100).toFixed(2));
+			const percentage = limits.dailyLimit > 0 ? Number(((account.usageToday / limits.dailyLimit) * 100).toFixed(2)) : 0;
 				const warningClass = account.status === 'error' ? 'badge-danger' : (account.status === 'pending' ? 'badge-info' : (percentage >= 90 ? 'badge-warning' : 'badge-success'));
 				const statusText = account.status === 'error' ? '连接异常' : (account.status === 'pending' ? '待刷新' : (percentage >= 100 ? '用尽 (' + limits.dailyLimit.toLocaleString() + ')' : '正常运行'));
 				
@@ -4712,7 +4767,7 @@ function handleAdminPage(request, env, ctx) {
 			const limitDisabled = threshold <= 0;
 
 			// 今日限额
-		const dailyPct = Number(((dailyUsage / dailyLimit) * 100).toFixed(2));
+		const dailyPct = dailyLimit > 0 ? Number(((dailyUsage / dailyLimit) * 100).toFixed(2)) : 0;
 		document.getElementById('stat-daily-usage').innerText = Math.ceil(dailyUsage).toLocaleString();
 		document.getElementById('stat-daily-progress').style.width = Math.min(100, dailyPct) + '%';
 			document.getElementById('stat-daily-desc').innerText = limitDisabled
@@ -4731,7 +4786,7 @@ function handleAdminPage(request, env, ctx) {
 			}
 
 			// 本月限额
-		const monthlyPct = Number(((monthlyUsage / monthlyLimit) * 100).toFixed(2));
+		const monthlyPct = monthlyLimit > 0 ? Number(((monthlyUsage / monthlyLimit) * 100).toFixed(2)) : 0;
 		document.getElementById('stat-monthly-usage').innerText = Math.ceil(monthlyUsage).toLocaleString();
 		document.getElementById('stat-monthly-progress').style.width = Math.min(100, monthlyPct) + '%';
 		document.getElementById('stat-monthly-desc').innerText = limitDisabled
@@ -4918,6 +4973,14 @@ function handleAdminPage(request, env, ctx) {
 		}
 
 		async function apiFetch(path, options = {}) {
+			// 对 POST/DELETE 请求自动附加 CSRF Token（从 meta 标签读取）
+			const method = (options.method || 'GET').toUpperCase();
+			if (method === 'POST' || method === 'DELETE') {
+				const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+				if (csrfMeta) {
+					options.headers = { ...options.headers, 'X-CSRF-Token': csrfMeta.getAttribute('content') };
+				}
+			}
 			const res = await fetch(path, options);
 			if (res.status === 401) {
 				window.location.href = '/';
@@ -5056,7 +5119,7 @@ function handleAdminPage(request, env, ctx) {
 					item.style.transition = 'all 0.4s cubic-bezier(0.16, 1, 0.3, 1)';
 					
 					item.innerHTML = '<span style="width: 8px; height: 8px; border-radius: 50%; background-color: ' + color + '; flex-shrink: 0; margin-right: 2px;"></span>' +
-						'<span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; font-weight: 500;" title="' + fullLabel + '">' + label + '</span>' +
+						'<span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; font-weight: 500;" title="' + fullLabel.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') + '">' + label.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</span>' +
 						'<span style="color: var(--text-muted); font-family: monospace; font-size: 11px; flex-shrink: 0; margin-left: 4px;">' + pct + '%</span>';
 					
 					legendContainer.appendChild(item);
@@ -5176,7 +5239,7 @@ function handleAdminPage(request, env, ctx) {
 		}
 
 		function escapeHtml(str) {
-			if (!str) return '';
+			if (str === null || str === undefined) return '';
 			return String(str)
 				.replace(/&/g, '&amp;')
 				.replace(/</g, '&lt;')
@@ -5344,7 +5407,7 @@ function handleAdminPage(request, env, ctx) {
 						<td>
 							<div style="display:flex; align-items:center; gap:8px;">
 								<code id="key-val-\${k.id}">\${k.key.length > 6 ? k.key.substring(0, 5) + '...' + k.key.substring(k.key.length - 1) : k.key.substring(0, Math.min(3, k.key.length)) + '...'}</code>
-								<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" onclick="copyKeyText('\${k.key}')">复制</button>
+								<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" onclick="copyKeyText('\${attrEscape(k.key)}')">复制</button>
 							</div>
 						</td>
 						<td>\${dateStr}</td>
@@ -5583,315 +5646,9 @@ function handleAdminPage(request, env, ctx) {
 </html>`;
 
 	return new Response(html, {
-		headers: { 'Content-Type': 'text/html; charset=utf-8' }
+		headers: {
+			'Content-Type': 'text/html; charset=utf-8',
+			'Set-Cookie': csrfCookie
+		}
 	});
-}
-
-// 3. KV 未绑定时的报错页面
-function handleKVError(request) {
-	const html = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>KV 绑定异常 - Workers AI to API</title>
-	<link rel="preconnect" href="https://fonts.googleapis.com">
-	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
-	<style>
-		:root {
-			--bg-color: #0b0f19;
-			--card-bg: rgba(30, 41, 59, 0.45);
-			--border-color: rgba(239, 68, 68, 0.2);
-			--text-main: #f8fafc;
-			--text-muted: #94a3b8;
-			--primary-gradient: linear-gradient(135deg, #ef4444 0%, #ec4899 100%);
-			--accent-color: #ec4899;
-			--glass-blur: 20px;
-			--card-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-			--orb-1-color: rgba(239, 68, 68, 0.08);
-			--orb-2-color: rgba(236, 72, 153, 0.06);
-		}
-
-		* {
-			box-sizing: border-box;
-			margin: 0;
-			padding: 0;
-		}
-
-		body {
-			font-family: 'Inter', sans-serif;
-			background-color: var(--bg-color);
-			color: var(--text-main);
-			min-height: 100vh;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			padding: 20px;
-			position: relative;
-			overflow: hidden;
-		}
-
-		/* Dynamic Background Orbs */
-		${SHARED_BG_CSS}
-
-		.bg-orb-1 {
-			top: -10%;
-			left: -10%;
-			width: 50vw;
-			height: 50vw;
-			background: var(--orb-1-color);
-		}
-
-		.bg-orb-2 {
-			bottom: -10%;
-			right: -10%;
-			width: 60vw;
-			height: 60vw;
-			background: var(--orb-2-color);
-		}
-
-		@keyframes float {
-			0% { transform: translate(0, 0) scale(1); }
-			100% { transform: translate(5%, 5%) scale(1.05); }
-		}
-
-		${SHARED_ERROR_CARD_CSS}
-
-		h1 {
-			font-family: 'Outfit', sans-serif;
-			font-size: 24px;
-			color: #ef4444;
-			margin-bottom: 16px;
-			font-weight: 600;
-		}
-
-		p {
-			color: var(--text-muted);
-			font-size: 15px;
-			line-height: 1.6;
-			margin-bottom: 24px;
-		}
-
-		.code-block {
-			background-color: rgba(0, 0, 0, 0.25);
-			padding: 20px;
-			border-radius: 12px;
-			font-family: monospace;
-			font-size: 13px;
-			color: #e9d5ff;
-			text-align: left;
-			margin-bottom: 26px;
-			border: 1px solid rgba(255, 255, 255, 0.05);
-			line-height: 1.8;
-		}
-
-		.btn {
-			display: inline-block;
-			background: var(--primary-gradient);
-			color: white;
-			text-decoration: none;
-			padding: 12px 28px;
-			border-radius: 10px;
-			font-weight: 600;
-			font-size: 14px;
-			transition: all 0.3s;
-			box-shadow: 0 4px 14px rgba(239, 68, 68, 0.2);
-		}
-
-		.btn:hover {
-			transform: translateY(-2px);
-			box-shadow: 0 6px 20px rgba(239, 68, 68, 0.35);
-			opacity: 0.95;
-		}
-	</style>
-</head>
-<body>
-	<div class="bg-orbs-container">
-		<div class="bg-orb bg-orb-1"></div>
-		<div class="bg-orb bg-orb-2"></div>
-	</div>
-	<div class="error-card">
-		<div style="font-size: 48px; margin-bottom: 16px;">⚠️</div>
-		<h1>KV 命名空间未绑定</h1>
-		<p>系统检测到您未在 Cloudflare 平台中为该项目绑定 KV 命名空间，或者绑定的变量名称不为 <strong>KV</strong>。这会导致数据无法保存，系统无法正常运行。</p>
-		
-		<div class="code-block">
-			<strong>解决方案：</strong><br>
-			1. 进入您的 Cloudflare Workers/Pages 仪表盘。<br>
-			2. 导航至 Settings -> Functions (或 Settings -> Variables) -> KV namespace bindings。<br>
-			3. 添加绑定，将【变量名称 (Variable name)】设置为: <strong>KV</strong><br>
-			4. 保存并重新部署项目即可。
-		</div>
-		
-		<a href="https://developers.cloudflare.com/kv/learning/kv-bindings/" target="_blank" class="btn">查看官方绑定教程</a>
-	</div>
-</body>
-</html>`;
-
-	const url = new URL(request.url);
-	if (url.pathname.startsWith('/v1/')) {
-		return new Response(JSON.stringify({
-			error: {
-				message: "Cloudflare KV namespace binding 'KV' is missing. Please bind a KV namespace to 'KV' in your Worker/Pages settings.",
-				type: "server_error"
-			}
-		}), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
-	}
-	if (url.pathname.startsWith('/api/')) {
-		return new Response(JSON.stringify({
-			error: {
-				message: "Cloudflare KV namespace binding 'KV' is missing. Please bind a KV namespace to 'KV' in your Worker/Pages settings.",
-				type: "server_error"
-			}
-		}), { status: 500, headers: { 'Content-Type': 'application/json' } });
-	}
-
-	return new Response(html, {
-		headers: { 'Content-Type': 'text/html; charset=utf-8' }
-	});
-}
-
-// 4. Password Error UI Page
-function handlePasswordError(request) {
-	const html = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>管理员密码未配置 - Workers AI to API</title>
-	<link rel="preconnect" href="https://fonts.googleapis.com">
-	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
-	<style>
-		:root {
-			--bg-color: #0b0f19;
-			--card-bg: rgba(30, 41, 59, 0.45);
-			--border-color: rgba(239, 68, 68, 0.2);
-			--text-main: #f8fafc;
-			--text-muted: #94a3b8;
-			--primary-gradient: linear-gradient(135deg, #ef4444 0%, #ec4899 100%);
-			--accent-color: #ec4899;
-			--glass-blur: 20px;
-			--card-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-			--orb-1-color: rgba(239, 68, 68, 0.08);
-			--orb-2-color: rgba(236, 72, 153, 0.06);
-		}
-
-		* {
-			box-sizing: border-box;
-			margin: 0;
-			padding: 0;
-		}
-
-		body {
-			font-family: 'Inter', sans-serif;
-			background-color: var(--bg-color);
-			color: var(--text-main);
-			min-height: 100vh;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			padding: 20px;
-			position: relative;
-			overflow: hidden;
-		}
-
-		/* Dynamic Background Orbs */
-		${SHARED_BG_CSS}
-
-		.bg-orb-1 {
-			top: -10%;
-			left: -10%;
-			width: 50vw;
-			height: 50vw;
-			background: var(--orb-1-color);
-		}
-
-		.bg-orb-2 {
-			bottom: -10%;
-			right: -10%;
-			width: 60vw;
-			height: 60vw;
-			background: var(--orb-2-color);
-		}
-
-		@keyframes float {
-			0% { transform: translate(0, 0) scale(1); }
-			100% { transform: translate(5%, 5%) scale(1.05); }
-		}
-
-		${SHARED_ERROR_CARD_CSS}
-
-		h1 {
-			font-family: 'Outfit', sans-serif;
-			font-size: 24px;
-			color: #ef4444;
-			margin-bottom: 16px;
-			font-weight: 600;
-		}
-
-		p {
-			color: var(--text-muted);
-			font-size: 15px;
-			line-height: 1.6;
-			margin-bottom: 24px;
-		}
-
-		.code-block {
-			background-color: rgba(0, 0, 0, 0.25);
-			padding: 20px;
-			border-radius: 12px;
-			font-family: monospace;
-			font-size: 13px;
-			color: #e9d5ff;
-			text-align: left;
-			margin-bottom: 26px;
-			border: 1px solid rgba(255, 255, 255, 0.05);
-			line-height: 1.8;
-		}
-	</style>
-</head>
-<body>
-	<div class="bg-orbs-container">
-		<div class="bg-orb bg-orb-1"></div>
-		<div class="bg-orb bg-orb-2"></div>
-	</div>
-	<div class="error-card">
-		<div style="font-size: 48px; margin-bottom: 16px;">🔑</div>
-		<h1>管理员密码未配置</h1>
-		<p>系统检测到您未在 Cloudflare 平台中为该项目配置 <strong>ADMIN_PASSWORD</strong> 环境变量。为了您的接口与管理后台安全，系统已拦截所有访问，直到密码配置完成。</p>
-		
-		<div class="code-block">
-			<strong>解决方案：</strong><br>
-			1. 进入您的 Cloudflare Workers/Pages 仪表盘。<br>
-			2. 导航至 Settings -> Variables (或 Settings -> Environment Variables)。<br>
-			3. 点击【Add variable】，将【Variable name】设置为: <strong>ADMIN_PASSWORD</strong><br>
-			4. 输入您的管理员登录密码作为其值，保存并部署即可。
-		</div>
-	</div>
-</body>
-</html>`;
-
-	const url = new URL(request.url);
-	if (url.pathname.startsWith('/v1/')) {
-		return new Response(JSON.stringify({
-			error: {
-				message: "ADMIN_PASSWORD environment variable is missing. Please add the ADMIN_PASSWORD variable to your Worker/Pages settings.",
-				type: "server_error"
-			}
-		}), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
-	}
-	if (url.pathname.startsWith('/api/')) {
-		return new Response(JSON.stringify({
-			error: {
-				message: "ADMIN_PASSWORD environment variable is missing. Please add the ADMIN_PASSWORD variable to your Worker/Pages settings.",
-				type: "server_error"
-			}
-		}), { status: 500, headers: { 'Content-Type': 'application/json' } });
-	}
-
-	return new Response(html, {
-		headers: { 'Content-Type': 'text/html; charset=utf-8' }
-	});
-}
+}
