@@ -1,4 +1,4 @@
-/**
+﻿/**
  * cf-ai-gw
  * 一个反向代理：把 Cloudflare Workers AI 转换成 OpenAI 兼容的接口格式，
  * 支持多账号负载均衡、故障自动切换重试，还自带一个可视化管理面板。
@@ -58,7 +58,7 @@ const DEFAULT_MODEL_MAP = {
 	'llava-1.5-7b': '@cf/llava-hf/llava-1.5-7b-hf',
 	'flux-1-schnell': '@cf/black-forest-labs/flux-1-schnell',
 	'sdxl': '@cf/stabilityai/stable-diffusion-xl-base-1.0',
-	'whisper': '@cf/openai/whisper'
+	'whisper': '@cf/openai/whisper-large-v3-turbo'
 };
 
 export default {
@@ -106,7 +106,7 @@ export default {
 				return new Response(null, {
 					headers: {
 						'Access-Control-Allow-Origin': allowOrigin,
-						'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
+						'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
 						'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key',
 						...(isApiPath && allowOrigin !== 'null' ? { 'Vary': 'Origin' } : {})
 					}
@@ -170,7 +170,7 @@ export default {
 // /v1/ 代理接口保持宽松（供 OpenAI 客户端跨域调用），/api/ 管理接口仅允许同源
 function addCORSHeaders(response, request) {
 	const newResponse = new Response(response.body, response);
-	newResponse.headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
+	newResponse.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
 	newResponse.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key');
 	try {
 		const url = new URL(request.url);
@@ -656,7 +656,8 @@ async function queryGraphQL(accountId, apiToken, startDateTime) {
 				accountId,
 				start: startDateTime
 			}
-		})
+		}),
+		signal: AbortSignal.timeout(15000),
 	});
 
 	if (!response.ok) {
@@ -772,12 +773,30 @@ async function handleV1Proxy(request, env, ctx) {
 		const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
 
 		const modelsData = Object.keys(combinedMap).map(id => {
-			const isEmbedding = id.includes('embedding');
+			const cfModel = combinedMap[id] || '';
+			let ownedBy = 'system';
+			if (cfModel.startsWith('@cf/meta/')) ownedBy = 'meta';
+			else if (cfModel.startsWith('@cf/google/')) ownedBy = 'google';
+			else if (cfModel.startsWith('@cf/mistral/')) ownedBy = 'mistral';
+			else if (cfModel.startsWith('@cf/microsoft/')) ownedBy = 'microsoft';
+			else if (cfModel.startsWith('@cf/openai/')) ownedBy = 'openai';
+			else if (cfModel.startsWith('@cf/nvidia/')) ownedBy = 'nvidia';
+			else if (cfModel.startsWith('@cf/deepseek-ai/')) ownedBy = 'deepseek';
+			else if (cfModel.startsWith('@cf/qwen/')) ownedBy = 'qwen';
+			else if (cfModel.startsWith('@cf/zai-org/')) ownedBy = 'zai-org';
+			else if (cfModel.startsWith('@cf/moonshotai/')) ownedBy = 'moonshotai';
+			else if (cfModel.startsWith('@cf/baai/')) ownedBy = 'baai';
+			else if (cfModel.startsWith('@cf/stabilityai/')) ownedBy = 'stabilityai';
+			else if (cfModel.startsWith('@cf/black-forest-labs/')) ownedBy = 'black-forest-labs';
+			else if (cfModel.startsWith('@cf/codellama/')) ownedBy = 'codellama';
+			else if (cfModel.startsWith('@cf/llava-hf/')) ownedBy = 'llava-hf';
+			else if (cfModel.startsWith('@cf/internlm/')) ownedBy = 'internlm';
+			else if (id.includes('embedding')) ownedBy = 'openai';
 			return {
 				id,
 				object: 'model',
 				created: MODEL_CREATED_TS,
-				owned_by: isEmbedding ? 'openai' : 'meta'
+				owned_by: ownedBy
 			};
 		});
 
@@ -801,6 +820,21 @@ async function handleV1Proxy(request, env, ctx) {
 	// 向量嵌入接口
 	if (url.pathname === '/v1/embeddings' && request.method === 'POST') {
 		return handleEmbeddings(request, env);
+	}
+
+	// 图片生成接口
+	if (url.pathname === '/v1/images/generations' && request.method === 'POST') {
+		return handleImageGenerations(request, env);
+	}
+
+	// 音频转录接口
+	if (url.pathname === '/v1/audio/transcriptions' && request.method === 'POST') {
+		return handleAudioTranscriptions(request, env);
+	}
+
+	// Anthropic token 计数接口
+	if (url.pathname === '/v1/messages/count_tokens' && request.method === 'POST') {
+		return handleCountTokens(request, env);
 	}
 
 	return new Response(JSON.stringify({
@@ -836,6 +870,7 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 						'Content-Type': 'application/json',
 					},
 					body: JSON.stringify(cfPayload),
+					signal: AbortSignal.timeout(30000),
 				}
 			);
 
@@ -868,13 +903,15 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 }
 
 // 共享的模型名解析函数：根据用户传入的模型名，映射到 Cloudflare 实际模型
-// 找不到映射时静默回退到默认模型（与原代码一致）。
+// 找不到映射时回退到默认模型，并标记 isFallback 以便调用方添加警告 header。
 async function resolveModelName(model, env) {
-	if (!model) return DEFAULT_FALLBACK_MODEL;
-	if (model.startsWith('@cf/')) return model;
+	if (!model) return { cfModel: DEFAULT_FALLBACK_MODEL, isFallback: true };
+	if (model.startsWith('@cf/')) return { cfModel: model, isFallback: false };
 	const customMap = await getCustomModelMap(env);
 	const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
-	return combinedMap[model] || DEFAULT_FALLBACK_MODEL;
+	const mapped = combinedMap[model];
+	if (mapped) return { cfModel: mapped, isFallback: false };
+	return { cfModel: DEFAULT_FALLBACK_MODEL, isFallback: true };
 }
 
 // 对话补全 / 文本补全 的代理处理函数
@@ -883,20 +920,21 @@ async function handleCompletions(request, env, pathname) {
 	try {
 		body = await request.json();
 	} catch (e) {
-		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400 });
+		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	const { model, messages, prompt, stream } = body;
 
 	if (pathname === '/v1/chat/completions' && !messages) {
-		return new Response(JSON.stringify({ error: { message: "messages field is required", type: "invalid_request_error" } }), { status: 400 });
+		return new Response(JSON.stringify({ error: { message: "messages field is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 	if (pathname === '/v1/completions' && !prompt) {
-		return new Response(JSON.stringify({ error: { message: "prompt field is required", type: "invalid_request_error" } }), { status: 400 });
+		return new Response(JSON.stringify({ error: { message: "prompt field is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 解析模型名映射（找不到映射时静默回退到默认模型）
-	const cfModel = await resolveModelName(model, env);
+	// 解析模型名映射（找不到映射时回退到默认模型并标记 isFallback）
+	const { cfModel, isFallback } = await resolveModelName(model, env);
+	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
 
 	// 构造发给 Cloudflare 的请求体
 	const cfPayload = {
@@ -906,11 +944,11 @@ async function handleCompletions(request, env, pathname) {
 	};
 
 	const passthroughFields = [
-		'temperature', 'max_tokens', 'top_p', 'n',
+		'temperature', 'max_tokens', 'max_completion_tokens', 'top_p', 'n',
 		'stop', 'presence_penalty', 'frequency_penalty',
 		'logprobs', 'top_logprobs', 'seed', 'user',
 		'tools', 'tool_choice', 'parallel_tool_calls',
-		'response_format',
+		'response_format', 'stream_options',
 	];
 	for (const field of passthroughFields) {
 		if (body[field] !== undefined) cfPayload[field] = body[field];
@@ -925,21 +963,39 @@ async function handleCompletions(request, env, pathname) {
 	}
 
 	if (stream) {
-		const transformedStream = passthroughStream(result.stream, model);
-		return new Response(transformedStream, {
-			headers: {
-				'Content-Type': 'text/event-stream',
-				'Cache-Control': 'no-cache',
-				'Connection': 'keep-alive',
-				'Transfer-Encoding': 'chunked',
-			},
-		});
+		const transformedStream = passthroughStream(result.stream, model, pathname === '/v1/completions');
+		const streamHeaders = {
+			'Content-Type': 'text/event-stream',
+			'Cache-Control': 'no-cache',
+			'Connection': 'keep-alive',
+			'Transfer-Encoding': 'chunked',
+		};
+		if (fallbackWarning) streamHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		return new Response(transformedStream, { headers: streamHeaders });
 	} else {
 		const cfJson = result.data;
 		if (cfJson.model !== undefined) cfJson.model = model;
-		return new Response(JSON.stringify(cfJson), {
-			headers: { 'Content-Type': 'application/json' },
-		});
+		const responseHeaders = { 'Content-Type': 'application/json' };
+		if (fallbackWarning) responseHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		if (pathname === '/v1/completions') {
+			// /v1/completions 返回 text_completion 格式（choices[].text）而非 chat 格式（choices[].message）
+			const textChoices = (cfJson.choices || []).map(c => ({
+				text: c.message?.content || '',
+				index: c.index ?? 0,
+				logprobs: c.logprobs ?? null,
+				finish_reason: c.finish_reason || 'stop'
+			}));
+			const textResponse = {
+				id: cfJson.id,
+				object: 'text_completion',
+				created: cfJson.created,
+				model: cfJson.model,
+				choices: textChoices,
+				usage: cfJson.usage
+			};
+			return new Response(JSON.stringify(textResponse), { headers: responseHeaders });
+		}
+		return new Response(JSON.stringify(cfJson), { headers: responseHeaders });
 	}
 }
 
@@ -975,6 +1031,14 @@ function convertAnthropicToOpenAI(anthropicBody) {
 	// stop_sequences → stop
 	if (anthropicBody.stop_sequences !== undefined) {
 		openaiBody.stop = anthropicBody.stop_sequences;
+	}
+
+	// top_k：OpenAI chat completions API 不支持 top_k，丢弃此字段。
+	// 若未来上游支持，可取消注释：if (anthropicBody.top_k !== undefined) openaiBody.top_k = anthropicBody.top_k;
+
+	// metadata.user_id → user 字段
+	if (anthropicBody.metadata && anthropicBody.metadata.user_id) {
+		openaiBody.user = anthropicBody.metadata.user_id;
 	}
 
 	// 构建 OpenAI 格式的 messages 数组
@@ -1171,6 +1235,14 @@ function convertOpenAIToAnthropic(openaiResponse, originalModel) {
 		}
 	};
 
+	// reasoning_content → thinking block（推理模型的思考内容，如 deepseek-r1）
+	if (message.reasoning_content) {
+		anthropicResponse.content.push({
+			type: 'thinking',
+			thinking: message.reasoning_content
+		});
+	}
+
 	// 文本内容 → text block
 	if (message.content) {
 		anthropicResponse.content.push({
@@ -1250,22 +1322,22 @@ async function handleMessages(request, env) {
 			error: { type: 'invalid_request_error', message: 'messages field is required and must be an array.' }
 		}), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
-	if (!anthropicBody.max_tokens) {
-		return new Response(JSON.stringify({
-			type: 'error',
-			error: { type: 'invalid_request_error', message: 'max_tokens is required.' }
-		}), { status: 400, headers: { 'Content-Type': 'application/json' } });
-	}
-
+	// max_tokens 在较新的 Anthropic SDK 中为可选字段，此处不再强制要求。
+	// 若未提供，则不设置 max_tokens，让上游模型使用其默认值。
 	// 解析模型名映射
 	const model = anthropicBody.model;
-	const cfModel = await resolveModelName(model, env);
+	const { cfModel, isFallback } = await resolveModelName(model, env);
+	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
 
 	// Anthropic → OpenAI 格式转换
 	const openaiBody = convertAnthropicToOpenAI(anthropicBody);
 	openaiBody.model = cfModel;
 
 	const stream = !!anthropicBody.stream;
+	// 流式模式下，请求上游返回 usage 信息
+	if (stream) {
+		openaiBody.stream_options = { include_usage: true };
+	}
 
 	const result = await callOpenAICompatibleAPI(openaiBody, env, stream);
 
@@ -1293,21 +1365,21 @@ async function handleMessages(request, env) {
 	if (stream) {
 		// 流式：转换流
 		const transformedStream = anthropicStreamTransform(result.stream, model, anthropicBody.messages);
-		return new Response(transformedStream, {
-			headers: {
-				'Content-Type': 'text/event-stream',
-				'Cache-Control': 'no-cache',
-				'Connection': 'keep-alive',
-				'Transfer-Encoding': 'chunked',
-			},
-		});
+		const streamHeaders = {
+			'Content-Type': 'text/event-stream',
+			'Cache-Control': 'no-cache',
+			'Connection': 'keep-alive',
+			'Transfer-Encoding': 'chunked',
+		};
+		if (fallbackWarning) streamHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		return new Response(transformedStream, { headers: streamHeaders });
 	} else {
 		// 非流式：转换响应
 		const openaiResponse = result.data;
 		const anthropicResponse = convertOpenAIToAnthropic(openaiResponse, model);
-		return new Response(JSON.stringify(anthropicResponse), {
-			headers: { 'Content-Type': 'application/json' },
-		});
+		const responseHeaders = { 'Content-Type': 'application/json' };
+		if (fallbackWarning) responseHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		return new Response(JSON.stringify(anthropicResponse), { headers: responseHeaders });
 	}
 }
 
@@ -1327,12 +1399,18 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 	let currentToolArgs = '';
 	let streamStarted = false;
 	let blockStopSent = false;  // 跟踪最后一个 content block 是否已发送 stop（Bug #2）
+	let finalEventSent = false;  // 跟踪 message_delta/message_stop 是否已发送（与 blockStopSent 解耦）
+	let thinkingBlockActive = false;  // 跟踪 thinking block 是否正在进行
 	let inputTokens = 0;
 	let outputTokens = 0;
 
 	let enqueuedAny = false;
 
 	return new ReadableStream({
+		start(controller) {
+			// 发送初始 ping 事件，保持连接活跃（推理模型首 token 前可能有较长延迟）
+			controller.enqueue(encoder.encode(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`));
+		},
 		async pull(controller) {
 			enqueuedAny = false;
 			const originalEnqueue = controller.enqueue.bind(controller);
@@ -1348,7 +1426,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 						buffer = processLines(buffer, controller);
 					}
 					// 上游流异常结束时兜底发送终止事件，避免 Anthropic 客户端收到不完整流
-					if (!blockStopSent) {
+					if (!finalEventSent) {
 						sendFinalEvent(controller);
 					}
 					controller.close();
@@ -1430,6 +1508,19 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 								sendToolUseDelta(controller, tc.function.arguments);
 							}
 						}
+					} else if (delta.reasoning_content) {
+						// 处理 thinking/reasoning 内容（对应 OpenAI 格式的 reasoning_content）
+						if (!streamStarted) {
+							sendMessageStart(controller);
+							streamStarted = true;
+						}
+						if (!thinkingBlockActive) {
+							contentBlockIndex++;
+							sendContentBlockStart(controller, 'thinking');
+							thinkingBlockActive = true;
+							blockStopSent = false;
+						}
+						sendThinkingDelta(controller, delta.reasoning_content);
 					} else if (delta.content) {
 						// 文本内容 delta
 						if (!streamStarted) {
@@ -1437,6 +1528,16 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 							contentBlockIndex++;
 							sendContentBlockStart(controller, 'text');
 							streamStarted = true;
+							blockStopSent = false;
+						}
+
+						// 如果之前有 thinking block 在进行中，先结束并开始 text block
+						if (thinkingBlockActive) {
+							sendContentBlockStop(controller);
+							blockStopSent = true;
+							thinkingBlockActive = false;
+							contentBlockIndex++;
+							sendContentBlockStart(controller, 'text');
 							blockStopSent = false;
 						}
 
@@ -1459,6 +1560,11 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 
 					// 检查 finish_reason
 					if (choice.finish_reason) {
+						if (thinkingBlockActive) {
+							sendContentBlockStop(controller);
+							blockStopSent = true;
+							thinkingBlockActive = false;
+						}
 						if (currentToolCallId && currentToolArgs) {
 							// 发送最终的 tool_use input
 							sendToolUseFinalInput(controller);
@@ -1495,7 +1601,9 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 			index: contentBlockIndex,
 			content_block: blockType === 'tool_use'
 				? { type: 'tool_use', id: currentToolCallId, name: currentToolName, input: {} }
-				: { type: 'text', text: '' }
+				: blockType === 'thinking'
+					? { type: 'thinking', thinking: '' }
+					: { type: 'text', text: '' }
 		};
 		controller.enqueue(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify(event)}\n\n`));
 	}
@@ -1505,6 +1613,15 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 			type: 'content_block_delta',
 			index: contentBlockIndex,
 			delta: { type: 'text_delta', text }
+		};
+		controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(event)}\n\n`));
+	}
+
+	function sendThinkingDelta(controller, thinking) {
+		const event = {
+			type: 'content_block_delta',
+			index: contentBlockIndex,
+			delta: { type: 'thinking_delta', thinking }
 		};
 		controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(event)}\n\n`));
 	}
@@ -1535,10 +1652,19 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 	}
 
 	function sendFinalEvent(controller) {
+		// 防止重复调用：[DONE] 和流结束都可能触发此函数，仅执行一次
+		if (finalEventSent) return; // 已发送过终止事件则直接返回
 		// 如果 finish_reason 触发时已发送过 content_block_stop，跳过重复发送（Bug #2）
+		if (!streamStarted) {
+			// 上游未产生任何内容（空响应），仍需发送 message_start 以符合 Anthropic 协议
+			sendMessageStart(controller);
+			contentBlockIndex++;
+			sendContentBlockStart(controller, 'text');
+		}
 		if (!blockStopSent) {
 			sendContentBlockStop(controller);
 		}
+		blockStopSent = true; // 确保 content_block_stop 不会重复发送
 
 		let stopReason = 'end_turn';
 		if (currentToolCallId) {
@@ -1558,6 +1684,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 		controller.enqueue(encoder.encode(`event: message_stop\ndata: ${JSON.stringify({
 			type: 'message_stop'
 		})}\n\n`));
+		finalEventSent = true;  // 标记终止事件已发送，防止重复调用
 	}
 }
 
@@ -1567,22 +1694,23 @@ async function handleEmbeddings(request, env) {
 	try {
 		body = await request.json();
 	} catch (e) {
-		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400 });
+		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	const { model, input } = body;
 	if (!input) {
-		return new Response(JSON.stringify({ error: { message: "input is required", type: "invalid_request_error" } }), { status: 400 });
+		return new Response(JSON.stringify({ error: { message: "input is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	// 解析模型名映射
-	const cfModel = await resolveModelName(model, env);
+	const { cfModel, isFallback } = await resolveModelName(model, env);
+	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
 
 	const textArray = Array.isArray(input) ? input : [input];
 	const accounts = await getAccounts(env);
 	const activeAccounts = accounts.filter(a => a.status === 'active').sort(() => Math.random() - 0.5);
 	if (activeAccounts.length === 0) {
-		return new Response(JSON.stringify({ error: { message: "No active accounts configured", type: "server_error" } }), { status: 503 });
+		return new Response(JSON.stringify({ error: { message: "No active accounts configured", type: "server_error" } }), { status: 503, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	let lastError = null;
@@ -1595,7 +1723,8 @@ async function handleEmbeddings(request, env) {
 					'Authorization': `Bearer ${account.apiToken}`,
 					'Content-Type': 'application/json'
 				},
-				body: JSON.stringify({ text: textArray })
+				body: JSON.stringify({ text: textArray }),
+				signal: AbortSignal.timeout(30000),
 			});
 
 			if (cfResponse.ok) {
@@ -1617,11 +1746,13 @@ async function handleEmbeddings(request, env) {
 						data: embeddings,
 						model: model,
 						usage: {
-							prompt_tokens: textArray.reduce((acc, text) => acc + Math.ceil(text.length / 4), 0),
-							total_tokens: textArray.reduce((acc, text) => acc + Math.ceil(text.length / 4), 0)
+							prompt_tokens: textArray.reduce((acc, text) => acc + Math.ceil(text.length / 3), 0),
+							total_tokens: textArray.reduce((acc, text) => acc + Math.ceil(text.length / 3), 0)
 						}
 					};
-					return new Response(JSON.stringify(responseObj), { headers: { 'Content-Type': 'application/json' } });
+					const embHeaders = { 'Content-Type': 'application/json' };
+					if (fallbackWarning) embHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+					return new Response(JSON.stringify(responseObj), { headers: embHeaders });
 				} else {
 					lastError = `CF Run failed: ${JSON.stringify(cfJson.errors)}`;
 				}
@@ -1641,10 +1772,277 @@ async function handleEmbeddings(request, env) {
 	}), { status: 502, headers: { 'Content-Type': 'application/json' } });
 }
 
+// ----------------------------------------------------
+// 图片生成接口 /v1/images/generations
+// 支持 Cloudflare Workers AI 的 flux-1-schnell 和 stable-diffusion-xl-base 模型
+// 调用 CF /ai/run/{model} 端点，返回 OpenAI Images 格式
+// ----------------------------------------------------
+async function handleImageGenerations(request, env) {
+	let body;
+	try {
+		body = await request.json();
+	} catch (e) {
+		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+	}
+
+	const { model, prompt, n, size, response_format, quality, style } = body;
+	if (!prompt) {
+		return new Response(JSON.stringify({ error: { message: "prompt is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+	}
+
+	// 模型映射：默认使用 flux-1-schnell
+	const { cfModel, isFallback } = await resolveModelName(model || 'flux-1-schnell', env);
+	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+
+	// 解析尺寸参数 (e.g. "1024x1024") → CF 的 width/height
+	let width = 1024, height = 1024;
+	if (size && typeof size === 'string') {
+		const parts = size.split('x');
+		if (parts.length === 2) {
+			width = parseInt(parts[0]) || 1024;
+			height = parseInt(parts[1]) || 1024;
+		}
+	}
+
+	const accounts = await getAccounts(env);
+	const activeAccounts = accounts.filter(a => a.status === 'active');
+	if (activeAccounts.length === 0) {
+		return new Response(JSON.stringify({ error: { message: "No active accounts configured", type: "server_error" } }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+	}
+
+	let lastError = null;
+
+	for (const account of activeAccounts) {
+		try {
+			const cfPayload = { prompt };
+			// flux-1-schnell 支持 width/height/num_steps，sdxl 支持 width/height
+			if (cfModel.includes('flux')) {
+				cfPayload.width = width;
+				cfPayload.height = height;
+				cfPayload.num_steps = 4; // flux-1-schnell 默认 4 步
+			} else {
+				cfPayload.width = width;
+				cfPayload.height = height;
+			}
+
+			const cfResponse = await fetch(
+				`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/run/${cfModel}`,
+				{
+					method: 'POST',
+					headers: {
+						'Authorization': `Bearer ${account.apiToken}`,
+						'Content-Type': 'application/json',
+					},
+					body: JSON.stringify(cfPayload),
+					signal: AbortSignal.timeout(60000),
+				}
+			);
+
+			if (cfResponse.ok) {
+				const cfJson = await cfResponse.json();
+				if (cfJson.success && cfJson.result) {
+					// CF flux/sdxl 返回 { image: "<base64-string>" } 格式
+					const rawImage = cfJson.result.image || cfJson.result;
+					// Cloudflare Workers 没有 Buffer 全局对象，使用 btoa/atob 处理二进制→base64
+					// CF AI 图片模型通常直接返回 base64 字符串
+					const base64Str = typeof rawImage === 'string'
+						? rawImage
+						: btoa(String.fromCharCode(...new Uint8Array(rawImage)));
+
+					// CF 图片生成端点单次调用只返回 1 张图片，不支持 n>1。
+					// 即使客户端传入 n>1，也只返回 1 张，不重复同一张图。
+					const images = [{
+						[response_format === 'b64_json' ? 'b64_json' : 'url']:
+							response_format === 'b64_json' ? base64Str : `data:image/png;base64,${base64Str}`
+					}];
+
+					const imgHeaders = { 'Content-Type': 'application/json' };
+					if (fallbackWarning) imgHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+					return new Response(JSON.stringify({
+						created: Math.floor(Date.now() / 1000),
+						data: images,
+					}), { headers: imgHeaders });
+				} else {
+					lastError = `CF Run failed: ${JSON.stringify(cfJson.errors || cfJson)}`;
+				}
+			} else {
+				const errorText = await cfResponse.text();
+				lastError = `CF API status ${cfResponse.status}: ${errorText}`;
+			}
+		} catch (e) {
+			lastError = `Connection error: ${e.message}`;
+		}
+	}
+
+	return new Response(JSON.stringify({
+		error: { message: `Image generation failed. Last error: ${lastError}`, type: "server_error" }
+	}), { status: 502, headers: { 'Content-Type': 'application/json' } });
+}
+
+// ----------------------------------------------------
+// 音频转录接口 /v1/audio/transcriptions
+// 支持 Cloudflare Workers AI 的 whisper 模型
+// 接受 multipart/form-data (audio file) 并转发给 CF
+// ----------------------------------------------------
+async function handleAudioTranscriptions(request, env) {
+	// 检查是否为 multipart/form-data
+	const contentType = request.headers.get('Content-Type') || '';
+	if (!contentType.includes('multipart/form-data')) {
+		return new Response(JSON.stringify({ error: { message: "Content-Type must be multipart/form-data", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+	}
+
+	// 检查文件大小（Cloudflare Workers 请求体限制 100MB）
+	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+	if (contentLength > 100 * 1024 * 1024) {
+		return new Response(JSON.stringify({ error: { message: "File size exceeds 100MB limit", type: "invalid_request_error" } }), { status: 413, headers: { 'Content-Type': 'application/json' } });
+	}
+
+	try {
+		const formData = await request.formData();
+		const audioFile = formData.get('file');
+		const model = formData.get('model') || 'whisper';
+
+		if (!audioFile) {
+			return new Response(JSON.stringify({ error: { message: "file is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		}
+
+		const { cfModel, isFallback } = await resolveModelName(model, env);
+		const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+
+		const accounts = await getAccounts(env);
+		const activeAccounts = accounts.filter(a => a.status === 'active');
+		if (activeAccounts.length === 0) {
+			return new Response(JSON.stringify({ error: { message: "No active accounts configured", type: "server_error" } }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+		}
+
+		let lastError = null;
+
+		for (const account of activeAccounts) {
+			try {
+				// 转发 multipart form 到 CF /ai/run/{model}
+				const cfFormData = new FormData();
+				cfFormData.append('audio', audioFile, audioFile.name || 'audio.wav');
+
+				const cfResponse = await fetch(
+					`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/run/${cfModel}`,
+					{
+						method: 'POST',
+						headers: {
+							'Authorization': `Bearer ${account.apiToken}`,
+						},
+						body: cfFormData,
+						signal: AbortSignal.timeout(120000),
+					}
+				);
+
+				if (cfResponse.ok) {
+					const cfJson = await cfResponse.json();
+					if (cfJson.success && cfJson.result) {
+						// CF whisper 返回 { text: "..." }
+						const transcribedText = cfJson.result.text || '';
+						const audioHeaders = { 'Content-Type': 'application/json' };
+						if (fallbackWarning) audioHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+						return new Response(JSON.stringify({
+							text: transcribedText,
+						}), { headers: audioHeaders });
+					} else {
+						lastError = `CF Run failed: ${JSON.stringify(cfJson.errors || cfJson)}`;
+					}
+				} else {
+					const errorText = await cfResponse.text();
+					lastError = `CF API status ${cfResponse.status}: ${errorText}`;
+				}
+			} catch (e) {
+				lastError = `Connection error: ${e.message}`;
+			}
+		}
+
+		return new Response(JSON.stringify({
+			error: { message: `Audio transcription failed. Last error: ${lastError}`, type: "server_error" }
+		}), { status: 502, headers: { 'Content-Type': 'application/json' } });
+	} catch (e) {
+		return new Response(JSON.stringify({ error: { message: `Failed to process audio: ${e.message}`, type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+	}
+}
+
+// ----------------------------------------------------
+// Anthropic token 计数接口 /v1/messages/count_tokens
+// 由于 Workers AI REST API 不直接提供 token 计数端点，
+// 我们使用近似估算：英文约 4 字符/token，中文约 2 字符/token
+// ----------------------------------------------------
+async function handleCountTokens(request, env) {
+	let body;
+	try {
+		body = await request.json();
+	} catch (e) {
+		return new Response(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: "Invalid JSON body" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+	}
+
+	if (!body.messages || !Array.isArray(body.messages)) {
+		return new Response(JSON.stringify({
+			type: 'error',
+			error: { type: 'invalid_request_error', message: 'messages field is required and must be an array.' }
+		}), { status: 400, headers: { 'Content-Type': 'application/json' } });
+	}
+
+	// 估算 token 数：遍历所有 messages 内容
+	let totalChars = 0;
+
+	// system 字段
+	if (body.system) {
+		if (typeof body.system === 'string') {
+			totalChars += body.system.length;
+		} else if (Array.isArray(body.system)) {
+			for (const block of body.system) {
+				if (block.type === 'text' && block.text) totalChars += block.text.length;
+			}
+		}
+	}
+
+	// messages 内容
+	for (const msg of body.messages) {
+		if (typeof msg.content === 'string') {
+			totalChars += msg.content.length;
+		} else if (Array.isArray(msg.content)) {
+			for (const block of msg.content) {
+				if (block.type === 'text' && block.text) {
+					totalChars += block.text.length;
+				} else if (block.type === 'tool_use') {
+					totalChars += JSON.stringify(block.input || {}).length;
+				} else if (block.type === 'tool_result') {
+					if (typeof block.content === 'string') {
+						totalChars += block.content.length;
+					} else if (Array.isArray(block.content)) {
+						for (const c of block.content) {
+							if (c.type === 'text' && c.text) totalChars += c.text.length;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// tools 字段也计入
+	if (body.tools && Array.isArray(body.tools)) {
+		for (const tool of body.tools) {
+			totalChars += (tool.name || '').length;
+			totalChars += (tool.description || '').length;
+			totalChars += JSON.stringify(tool.input_schema || {}).length;
+		}
+	}
+
+	// 近似估算：混合中英文场景下约 3 字符/token
+	const estimatedTokens = Math.ceil(totalChars / 3);
+
+	return new Response(JSON.stringify({
+		input_tokens: estimatedTokens,
+	}), { status: 200, headers: { 'Content-Type': 'application/json' } });
+}
+
 // 透传 CF /ai/v1/chat/completions 返回的 SSE 流
 // CF 返回的本来就是标准 OpenAI 的 SSE 格式，我们只把模型名改一下，
 // 这样 tool_calls、finish_reason、reasoning_content、usage 等字段都能原样保留。
-function passthroughStream(upstreamBody, modelName) {
+function passthroughStream(upstreamBody, modelName, isCompletion) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
@@ -1694,6 +2092,22 @@ function passthroughStream(upstreamBody, modelName) {
 					// 只改模型名，其他字段全部原样透传
 					// 这样 tool_calls、finish_reason、usage、reasoning_content 都能保留下来
 					if (chunk.model !== undefined) chunk.model = modelName;
+					// /v1/completions 需要将 chat completions 格式转换为 text completion 格式
+					if (isCompletion) {
+						chunk.object = 'text_completion';
+						if (chunk.choices) {
+							for (const c of chunk.choices) {
+								if (c.delta?.content !== undefined) {
+									c.text = c.delta.content;
+									delete c.delta;
+								}
+								if (c.message?.content !== undefined) {
+									c.text = c.message.content;
+									delete c.message;
+								}
+							}
+						}
+					}
 					controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
 				} catch (_) {
 					// 解析不了的行，按原样转发
@@ -1818,8 +2232,8 @@ async function handleDashboardApi(request, env, ctx) {
 		return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// CSRF 防护：POST/DELETE 请求必须携带有效的 X-CSRF-Token 头（与 cookie 中的 csrf_token 一致）
-	if (method === 'POST' || method === 'DELETE') {
+	// CSRF 防护：POST/PUT/PATCH/DELETE 写操作必须携带有效的 X-CSRF-Token 头（与 cookie 中的 csrf_token 一致）
+	if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
 		const cookies = request.headers.get('Cookie') || '';
 		const csrfCookieMatch = cookies.match(/csrf_token=([^;]+)/);
 		const csrfCookie = csrfCookieMatch ? csrfCookieMatch[1] : null;
@@ -1836,40 +2250,50 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 
 		if (method === 'POST') {
-			const { id, name, accountId, apiToken } = await safeJsonBody(request) || {};
+			const { name, accountId, apiToken } = await safeJsonBody(request) || {};
 			if (!accountId || !apiToken) {
-				return new Response(JSON.stringify({ error: 'AccountId and ApiToken are required' }), { status: 400 });
+				return new Response(JSON.stringify({ error: 'AccountId and ApiToken are required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 			}
 
-			let accounts = await getAccounts(env);
-			if (id) {
-				// 编辑已有账号
-				accounts = accounts.map(a => {
-					if (a.id === id) {
-						const updatedToken = (apiToken.includes('...') || apiToken === '********') ? a.apiToken : apiToken;
-						return { ...a, name: name || a.name, accountId, apiToken: updatedToken };
-					}
-					return a;
-				});
-			} else {
-				// 新增账号
-				accounts.push({
-					id: crypto.randomUUID(),
-					name: name || 'CF Account',
-					accountId,
-					apiToken,
-					status: 'active'
-				});
+			// 新增账号
+			const accounts = await getAccounts(env);
+			accounts.push({
+				id: crypto.randomUUID(),
+				name: name || 'CF Account',
+				accountId,
+				apiToken,
+				status: 'active'
+			});
+			await saveAccounts(env, accounts);
+			return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+		}
+	}
+
+	// /api/accounts/:id — 更新（PUT）或删除（DELETE）指定账号
+	// 放在 /api/accounts/test 和 /api/accounts/usage 之后，排除已知子路径避免误匹配
+	const accountPathId = url.pathname.startsWith('/api/accounts/')
+		? decodeURIComponent(url.pathname.slice('/api/accounts/'.length)) : null;
+	if (accountPathId && accountPathId !== 'test' && accountPathId !== 'usage') {
+		if (method === 'PUT') {
+			const { name, accountId, apiToken } = await safeJsonBody(request) || {};
+			if (!accountId || !apiToken) {
+				return new Response(JSON.stringify({ error: 'AccountId and ApiToken are required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 			}
+			const accounts = await getAccounts(env);
+			const idx = accounts.findIndex(a => a.id === accountPathId);
+			if (idx === -1) {
+				return new Response(JSON.stringify({ error: 'Account not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+			}
+			const updatedToken = (apiToken.includes('...') || apiToken === '********') ? accounts[idx].apiToken : apiToken;
+			accounts[idx] = { ...accounts[idx], name: name || accounts[idx].name, accountId, apiToken: updatedToken };
 			await saveAccounts(env, accounts);
 			return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
 		}
 
 		if (method === 'DELETE') {
-			const { id } = await safeJsonBody(request) || {};
-			let accounts = await getAccounts(env);
-			accounts = accounts.filter(a => a.id !== id);
-			await saveAccounts(env, accounts);
+			const accounts = await getAccounts(env);
+			const filtered = accounts.filter(a => a.id !== accountPathId);
+			await saveAccounts(env, filtered);
 			return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
 		}
 	}
@@ -1892,7 +2316,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 
 		if (!targetAccountId || !targetApiToken) {
-			return new Response(JSON.stringify({ success: false, error: 'Account info not found' }), { status: 400 });
+			return new Response(JSON.stringify({ success: false, error: 'Account info not found' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 		}
 
 		const [readResult, editResult, analyticsResult] = await Promise.all([
@@ -1903,7 +2327,8 @@ async function handleDashboardApi(request, env, ctx) {
 						headers: {
 							'Authorization': `Bearer ${targetApiToken}`,
 							'Content-Type': 'application/json'
-						}
+						},
+						signal: AbortSignal.timeout(10000),
 					});
 					const data = await res.json();
 					if (res.ok && data.success !== false) {
@@ -1922,7 +2347,8 @@ async function handleDashboardApi(request, env, ctx) {
 							'Authorization': `Bearer ${targetApiToken}`,
 							'Content-Type': 'application/json'
 						},
-						body: JSON.stringify({ text: ['test'] })
+						body: JSON.stringify({ text: ['test'] }),
+						signal: AbortSignal.timeout(15000),
 					});
 					const data = await res.json();
 					if (res.ok && data.success !== false) {
@@ -1965,7 +2391,8 @@ async function handleDashboardApi(request, env, ctx) {
 								accountId: targetAccountId,
 								start: startToday
 							}
-						})
+						}),
+						signal: AbortSignal.timeout(15000),
 					});
 					const data = await res.json();
 					if (res.ok && !data.errors && data.data?.viewer?.accounts) {
@@ -2071,7 +2498,7 @@ async function handleDashboardApi(request, env, ctx) {
 		if (method === 'POST') {
 			const { name, key } = await safeJsonBody(request) || {};
 			if (!name) {
-				return new Response(JSON.stringify({ error: 'Name is required' }), { status: 400 });
+				return new Response(JSON.stringify({ error: 'Name is required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 			}
 
 			const generatedKey = key || `sk-wa-${crypto.randomUUID().replace(/-/g, '')}`;
@@ -2086,13 +2513,15 @@ async function handleDashboardApi(request, env, ctx) {
 			return new Response(JSON.stringify({ success: true, key: generatedKey }), { headers: { 'Content-Type': 'application/json' } });
 		}
 
-		if (method === 'DELETE') {
-			const { id } = await safeJsonBody(request) || {};
-			let keys = await getApiKeys(env);
-			keys = keys.filter(k => k.id !== id);
-			await saveApiKeys(env, keys);
-			return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-		}
+	}
+
+	// /api/keys/:id — 删除指定 API 密钥
+	if (url.pathname.startsWith('/api/keys/') && method === 'DELETE') {
+		const id = decodeURIComponent(url.pathname.slice('/api/keys/'.length));
+		const keys = await getApiKeys(env);
+		const filtered = keys.filter(k => k.id !== id);
+		await saveApiKeys(env, filtered);
+		return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
 	}
 
 	// 7. 模型设置和映射
@@ -2102,10 +2531,10 @@ async function handleDashboardApi(request, env, ctx) {
 			return new Response(JSON.stringify({ customModelMap: customMap }), { headers: { 'Content-Type': 'application/json' } });
 		}
 
-		if (method === 'POST') {
+		if (method === 'PUT') {
 			const { customModelMap } = await safeJsonBody(request) || {};
 			if (!customModelMap || typeof customModelMap !== 'object') {
-				return new Response(JSON.stringify({ error: 'Invalid customModelMap payload' }), { status: 400 });
+				return new Response(JSON.stringify({ error: 'Invalid customModelMap payload' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 			}
 			await saveCustomModelMap(env, customModelMap);
 			return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
@@ -2119,33 +2548,33 @@ async function handleDashboardApi(request, env, ctx) {
 			return new Response(JSON.stringify(limits), { headers: { 'Content-Type': 'application/json' } });
 		}
 
-		if (method === 'POST') {
+		if (method === 'PUT') {
 			const body = await safeJsonBody(request);
 			const { dailyLimit, monthlyLimit, threshold } = body || {};
 			const updates = {};
 			if (dailyLimit !== undefined) {
 				const val = parseInt(dailyLimit, 10);
 				if (isNaN(val) || val < 0) {
-					return new Response(JSON.stringify({ error: 'dailyLimit must be a non-negative integer' }), { status: 400 });
+					return new Response(JSON.stringify({ error: 'dailyLimit must be a non-negative integer' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 				}
 				updates.dailyLimit = val;
 			}
 			if (monthlyLimit !== undefined) {
 				const val = parseInt(monthlyLimit, 10);
 				if (isNaN(val) || val < 0) {
-					return new Response(JSON.stringify({ error: 'monthlyLimit must be a non-negative integer' }), { status: 400 });
+					return new Response(JSON.stringify({ error: 'monthlyLimit must be a non-negative integer' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 				}
 				updates.monthlyLimit = val;
 			}
 			if (threshold !== undefined) {
 				const val = parseFloat(threshold);
 				if (isNaN(val) || val < 0 || val > 1) {
-					return new Response(JSON.stringify({ error: 'threshold must be a number between 0 and 1' }), { status: 400 });
+					return new Response(JSON.stringify({ error: 'threshold must be a number between 0 and 1' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 				}
 				updates.threshold = val;
 			}
 			if (Object.keys(updates).length === 0) {
-				return new Response(JSON.stringify({ error: 'No valid fields provided' }), { status: 400 });
+				return new Response(JSON.stringify({ error: 'No valid fields provided' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 			}
 
 			await saveUsageLimitsConfig(env, updates);
@@ -2155,7 +2584,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
-	return new Response(JSON.stringify({ error: 'Endpoint not found' }), { status: 404 });
+	return new Response(JSON.stringify({ error: 'Endpoint not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
 }
 
 // ----------------------------------------------------
@@ -3039,10 +3468,23 @@ async function handleLandingPage(request, env, ctx) {
 		async function loadPublicSummary() {
 			try {
 				const res = await fetch('/api/usage/summary');
+				if (res.status === 401) {
+					// 未登录：隐藏用量卡片和模型图表，不显示 spinner
+					const publicCard = document.querySelector('.dashboard-grid .stat-card');
+					if (publicCard) publicCard.style.display = 'none';
+					const modelsCard = document.getElementById('public-models-card');
+					if (modelsCard) modelsCard.style.display = 'none';
+					return;
+				}
 				const data = await res.json();
 				renderPublicSummary(data);
 			} catch (e) {
 				console.error(e);
+				// 网络错误时隐藏 spinner，显示空状态
+				const placeholder = document.getElementById('public-chart-placeholder');
+				if (placeholder) {
+					placeholder.innerHTML = '<span style="font-size: 13px;">数据加载失败</span>';
+				}
 			}
 		}
 
@@ -4682,9 +5124,9 @@ async function handleAdminPage(request, env, ctx) {
 		}
 
 		async function apiFetch(path, options = {}) {
-			// 对 POST/DELETE 请求自动附加 CSRF Token（从 meta 标签读取）
+			// 对 POST/PUT/PATCH/DELETE 请求自动附加 CSRF Token（从 meta 标签读取）
 			const method = (options.method || 'GET').toUpperCase();
-			if (method === 'POST' || method === 'DELETE') {
+			if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
 				const csrfMeta = document.querySelector('meta[name="csrf-token"]');
 				if (csrfMeta) {
 					options.headers = { ...options.headers, 'X-CSRF-Token': csrfMeta.getAttribute('content') };
@@ -5053,15 +5495,17 @@ async function handleAdminPage(request, env, ctx) {
 				showToast('Account ID 和 API Token 均为必填项！', 'warning');
 				return;
 			}
-			const res = await apiFetch('/api/accounts', {
-				method: 'POST',
+			const isEdit = id && id.trim();
+			const apiUrl = isEdit ? '/api/accounts/' + encodeURIComponent(id) : '/api/accounts';
+			const res = await apiFetch(apiUrl, {
+				method: isEdit ? 'PUT' : 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ id, name, accountId, apiToken })
+				body: JSON.stringify({ name, accountId, apiToken })
 			});
 			if (res.ok) {
 				closeAccountModal();
 				loadAccounts();
-				showToast('账号保存成功！');
+				showToast(isEdit ? '账号更新成功！' : '账号创建成功！');
 			} else {
 				showToast('保存失败！', 'error');
 			}
@@ -5069,10 +5513,8 @@ async function handleAdminPage(request, env, ctx) {
 
 		async function deleteAccount(id) {
 			if (!confirm('确定要删除这个 Cloudflare 账号吗？')) return;
-			const res = await apiFetch('/api/accounts', {
-				method: 'DELETE',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ id })
+			const res = await apiFetch('/api/accounts/' + encodeURIComponent(id), {
+				method: 'DELETE'
 			});
 			if (res.ok) {
 				loadAccounts();
@@ -5175,10 +5617,8 @@ async function handleAdminPage(request, env, ctx) {
 
 		async function deleteKey(id) {
 			if (!confirm('确定要删除这个 API 密钥吗？')) return;
-			const res = await apiFetch('/api/keys', {
-				method: 'DELETE',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ id })
+			const res = await apiFetch('/api/keys/' + encodeURIComponent(id), {
+				method: 'DELETE'
 			});
 			if (res.ok) {
 				loadKeys();
@@ -5233,7 +5673,7 @@ async function handleAdminPage(request, env, ctx) {
 			}
 			customMappings[source] = target;
 			const res = await apiFetch('/api/settings', {
-				method: 'POST',
+				method: 'PUT',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ customModelMap: customMappings })
 			});
@@ -5257,7 +5697,7 @@ async function handleAdminPage(request, env, ctx) {
 			}
 
 			const res = await apiFetch('/api/settings', {
-				method: 'POST',
+				method: 'PUT',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ customModelMap: mergedMappings })
 			});
@@ -5274,7 +5714,7 @@ async function handleAdminPage(request, env, ctx) {
 			if (!confirm('确定要删除此映射吗？')) return;
 			delete customMappings[source];
 			const res = await apiFetch('/api/settings', {
-				method: 'POST',
+				method: 'PUT',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ customModelMap: customMappings })
 			});
@@ -5318,7 +5758,7 @@ async function handleAdminPage(request, env, ctx) {
 			}
 
 			const res = await apiFetch('/api/limits', {
-				method: 'POST',
+				method: 'PUT',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ dailyLimit: daily, monthlyLimit: monthly, threshold })
 			});
@@ -5347,4 +5787,4 @@ async function handleAdminPage(request, env, ctx) {
 			'Set-Cookie': csrfCookie
 		}
 	});
-}
+}
