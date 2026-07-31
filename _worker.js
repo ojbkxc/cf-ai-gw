@@ -471,7 +471,7 @@ async function buildUsageSummary(env, accounts, cacheMap) {
 	};
 }
 
-async function refreshAccountsUsage(env, accounts, limit = 20) {
+async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) {
 	const cachedDetailsRaw = await env.KV.get('cache_usage_details');
 	let cacheMap = {};
 	if (cachedDetailsRaw) {
@@ -808,15 +808,18 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 			);
 
 			if (cfResponse.ok) {
-				if (stream) {
-					if (!cfResponse.body) {
-						lastError = `CF API returned empty response body`;
-						continue;
-					}
-					return { success: true, stream: cfResponse.body };
-				} else {
-					const cfJson = await cfResponse.json();
-					return { success: true, data: cfJson };
+			if (stream) {
+			if (!cfResponse.body) {
+			lastError = `CF API returned empty response body`;
+			continue;
+			}
+			// 流式响应：一旦拿到 HTTP 200 + body 就立即返回，不预读首字节。
+			// 这意味着如果上游在流式传输中途断开，客户端会收到截断的流而不会触发 failover。
+			// 这是刻意的设计权衡：预读会破坏 SSE 的实时性。
+			return { success: true, stream: cfResponse.body };
+			} else {
+			const cfJson = await cfResponse.json();
+			return { success: true, data: cfJson };
 				}
 			} else {
 				const errorText = await cfResponse.text();
@@ -1324,14 +1327,17 @@ function anthropicStreamTransform(upstreamBody, modelName) {
 	let outputTokens = 0;
 
 	let enqueuedAny = false;
+	let boundEnqueue = null; // 只绑定一次，避免每次 pull 形成套娃包装
 
 	return new ReadableStream({
 		async pull(controller) {
 			enqueuedAny = false;
-			const originalEnqueue = controller.enqueue.bind(controller);
+			if (!boundEnqueue) {
+				boundEnqueue = controller.enqueue.bind(controller);
+			}
 			controller.enqueue = (chunk) => {
 				enqueuedAny = true;
-				originalEnqueue(chunk);
+				boundEnqueue(chunk);
 			};
 
 			while (true) {
@@ -1581,7 +1587,7 @@ async function handleEmbeddings(request, env) {
 
 	const textArray = Array.isArray(input) ? input : [input];
 	const accounts = await getAccounts(env);
-	const activeAccounts = accounts.filter(a => a.status === 'active');
+	const activeAccounts = accounts.filter(a => a.status === 'active').sort(() => Math.random() - 0.5);
 	if (activeAccounts.length === 0) {
 		return new Response(JSON.stringify({ error: { message: "No active accounts configured", type: "server_error" } }), { status: 503 });
 	}
@@ -1820,7 +1826,7 @@ async function handleDashboardApi(request, env, ctx) {
 				return new Response(JSON.stringify(emptyUsageResponse(limits)), { headers: { 'Content-Type': 'application/json' } });
 			}
 
-			const cacheMap = await refreshAccountsUsage(env, accounts, 20);
+			const cacheMap = await refreshAccountsUsage(env, accounts);
 			const summary = await buildUsageSummary(env, accounts, cacheMap);
 			await setCachedSummary(env, summary);
 			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json' } });
@@ -2018,7 +2024,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 
 		// 刷新最老数据的20个账号
-		const cacheMap = await refreshAccountsUsage(env, accounts, 20);
+		const cacheMap = await refreshAccountsUsage(env, accounts);
 
 		// 构建完整结果列表，若没有缓存数据则标为 pending
 		const todayStr = new Date().toISOString().split('T')[0];
