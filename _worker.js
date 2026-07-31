@@ -21,7 +21,7 @@ const DEFAULT_MODEL_MAP = {
 	'glm-5.2': '@cf/zai-org/glm-5.2',
 	'glm-4.7-flash': '@cf/zai-org/glm-4.7-flash',
 	'kimi-k2.7-code': '@cf/moonshotai/kimi-k2.7-code',
-	'kimi-k2.6': '@cf/moonshotai/kimi-k2.6', // 就是一坨屎，别吃
+	'kimi-k2.6': '@cf/moonshotai/kimi-k2.6',
 	'gemma-4-26b-a4b-it': '@cf/google/gemma-4-26b-a4b-it',
 	'nemotron-3-120b-a12b': '@cf/nvidia/nemotron-3-120b-a12b',
 	'gpt-oss-20b': '@cf/openai/gpt-oss-20b',
@@ -2319,21 +2319,8 @@ const SHARED_ERROR_CARD_CSS = `
 			z-index: 10;
 		}`;
 
-// 1. 首页 / 登录页
-async function handleLandingPage(request, env, ctx) {
-	const isLoggedIn = await checkAdminAuth(request, env);
-
-	const html = `<!DOCTYPE html>
-<head>
-	<meta charset="UTF-8">
-	<meta name="robots" content="noindex, nofollow">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>Workers AI to API - Cloudflare Workers AI Proxy</title>
-	<link rel="preconnect" href="https://fonts.googleapis.com">
-	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
-	<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-	<style>
+// 两个页面共享的 CSS 变量（:root 主题色 + 通用 reset）
+const SHARED_THEME_CSS = `
 		:root {
 			--bg-color: #0b0f19;
 			--card-bg: rgba(30, 41, 59, 0.45);
@@ -2381,6 +2368,94 @@ async function handleLandingPage(request, env, ctx) {
 			margin: 0;
 			padding: 0;
 		}
+`;
+
+// 两个页面共享的 Toast 样式
+const SHARED_TOAST_CSS = `
+		.toast-container {
+			position: fixed;
+			top: 24px;
+			right: 24px;
+			display: flex;
+			flex-direction: column;
+			gap: 10px;
+			z-index: 9999;
+			pointer-events: none;
+		}
+
+		.toast {
+			min-width: 260px;
+			padding: 14px 20px;
+			border-radius: 12px;
+			box-shadow: var(--card-shadow);
+			font-size: 14px;
+			font-weight: 600;
+			display: flex;
+			align-items: center;
+			gap: 12px;
+			backdrop-filter: blur(15px);
+			-webkit-backdrop-filter: blur(15px);
+			transform: translateY(-20px);
+			opacity: 0;
+			transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+			pointer-events: auto;
+		}
+
+		.toast.show {
+			transform: translateY(0);
+			opacity: 1;
+		}
+
+		.toast-icon {
+			width: 20px;
+			height: 20px;
+			flex-shrink: 0;
+		}
+
+		.toast-success {
+			background-color: #10b981 !important;
+			color: #ffffff !important;
+			border: none !important;
+		}
+		.toast-success .toast-icon, .toast-success span {
+			color: #ffffff !important;
+		}
+
+		.toast-error {
+			background-color: #ef4444 !important;
+			color: #ffffff !important;
+			border: none !important;
+		}
+		.toast-error .toast-icon, .toast-error span {
+			color: #ffffff !important;
+		}
+		
+		.toast-warning {
+			background-color: #f59e0b !important;
+			color: #ffffff !important;
+			border: none !important;
+		}
+		.toast-warning .toast-icon, .toast-warning span {
+			color: #ffffff !important;
+		}
+`;
+
+// 1. 首页 / 登录页
+async function handleLandingPage(request, env, ctx) {
+	const isLoggedIn = await checkAdminAuth(request, env);
+
+	const html = `<!DOCTYPE html>
+<head>
+	<meta charset="UTF-8">
+	<meta name="robots" content="noindex, nofollow">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Workers AI to API - Cloudflare Workers AI Proxy</title>
+	<link rel="preconnect" href="https://fonts.googleapis.com">
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
+	<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+	<style>
+		${SHARED_THEME_CSS}
 
 		body {
 			font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
@@ -2850,73 +2925,7 @@ async function handleLandingPage(request, env, ctx) {
 			color: var(--text-main);
 		}
 
-		/* Toast Notification */
-		.toast-container {
-			position: fixed;
-			top: 24px;
-			right: 24px;
-			display: flex;
-			flex-direction: column;
-			gap: 10px;
-			z-index: 9999;
-			pointer-events: none;
-		}
-
-		.toast {
-			min-width: 260px;
-			padding: 14px 20px;
-			border-radius: 12px;
-			box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
-			font-size: 14px;
-			font-weight: 600;
-			display: flex;
-			align-items: center;
-			gap: 12px;
-			backdrop-filter: blur(15px);
-			-webkit-backdrop-filter: blur(15px);
-			transform: translateY(-20px);
-			opacity: 0;
-			transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-			pointer-events: auto;
-		}
-
-		.toast.show {
-			transform: translateY(0);
-			opacity: 1;
-		}
-
-		.toast-icon {
-			width: 20px;
-			height: 20px;
-			flex-shrink: 0;
-		}
-
-		.toast-success {
-			background-color: #10b981 !important;
-			color: #ffffff !important;
-			border: none !important;
-		}
-		.toast-success .toast-icon, .toast-success span {
-			color: #ffffff !important;
-		}
-
-		.toast-error {
-			background-color: #ef4444 !important;
-			color: #ffffff !important;
-			border: none !important;
-		}
-		.toast-error .toast-icon, .toast-error span {
-			color: #ffffff !important;
-		}
-		
-		.toast-warning {
-			background-color: #f59e0b !important;
-			color: #ffffff !important;
-			border: none !important;
-		}
-		.toast-warning .toast-icon, .toast-warning span {
-			color: #ffffff !important;
-		}
+		${SHARED_TOAST_CSS}
 	</style>
 </head>
 <body>
@@ -3257,7 +3266,7 @@ async function handleLandingPage(request, env, ctx) {
 		}
 	</script>
 	<footer style="text-align: center; padding: 24px 0 20px; font-size: 12px; color: var(--text-muted); opacity: 0.6; z-index: 10;">
-		由 <a href="https://github.com/cmliussss2024/WorkersAI2API" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">WorkersAI2API</a> 强力驱动
+		由 <a href="https://github.com/ojbkxc/cf-ai-gw" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">WorkersAI2API</a> 强力驱动
 	</footer>
 </body>
 </html>`;
@@ -3285,77 +3294,35 @@ async function handleAdminPage(request, env, ctx) {
 	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
 	<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 	<style>
+		${SHARED_THEME_CSS}
+
+		/* Admin 页面特有变量 */
 		:root {
-			--bg-color: #0b0f19;
 			--sidebar-bg: rgba(15, 23, 42, 0.6);
-			--card-bg: rgba(30, 41, 59, 0.45);
-			--border-color: rgba(255, 255, 255, 0.08);
-			--text-main: #f8fafc;
-			--text-muted: #94a3b8;
-			--primary-gradient: linear-gradient(135deg, #6366f1 0%, #a855f7 50%, #ec4899 100%);
-			--accent-color: #a855f7;
 			--success-color: #10b981;
 			--warning-color: #f59e0b;
 			--danger-color: #ef4444;
 			--sidebar-width: 260px;
 			--sidebar-menu-hover: rgba(255, 255, 255, 0.04);
-			--input-bg: rgba(15, 23, 42, 0.6);
-			--input-border: rgba(255, 255, 255, 0.1);
-			--input-text: #f8fafc;
 			--table-header-bg: rgba(0, 0, 0, 0.2);
-			--btn-secondary-bg: rgba(255, 255, 255, 0.06);
-			--btn-secondary-hover: rgba(255, 255, 255, 0.12);
-			--btn-secondary-text: #f8fafc;
-			--modal-overlay-bg: rgba(8, 10, 18, 0.6);
 			--section-item-bg: rgba(255, 255, 255, 0.02);
-			--glass-blur: 20px;
-			--card-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
 			--orb-1-color: rgba(99, 102, 241, 0.12);
 			--orb-2-color: rgba(236, 72, 153, 0.08);
-			
-			/* Theme aware code tag tokens */
 			--code-bg: rgba(0, 0, 0, 0.25);
 			--code-color: #e9d5ff;
 			--code-border: rgba(255, 255, 255, 0.04);
 		}
 
 		:root[data-theme="light"] {
-			--bg-color: #f1f5f9;
 			--sidebar-bg: rgba(255, 255, 255, 0.6);
-			--card-bg: rgba(255, 255, 255, 0.7);
-			--border-color: rgba(0, 0, 0, 0.06);
-			--text-main: #0f172a;
-			--text-muted: #64748b;
-			--primary-gradient: linear-gradient(135deg, #4f46e5 0%, #9333ea 50%, #db2777 100%);
-			--accent-color: #9333ea;
-			--success-color: #10b981;
-			--warning-color: #f59e0b;
-			--danger-color: #ef4444;
 			--sidebar-menu-hover: rgba(0, 0, 0, 0.04);
-			--input-bg: rgba(241, 245, 249, 0.8);
-			--input-border: rgba(0, 0, 0, 0.08);
-			--input-text: #0f172a;
 			--table-header-bg: rgba(0, 0, 0, 0.03);
-			--btn-secondary-bg: rgba(0, 0, 0, 0.04);
-			--btn-secondary-hover: rgba(0, 0, 0, 0.08);
-			--btn-secondary-text: #0f172a;
-			--modal-overlay-bg: rgba(241, 245, 249, 0.5);
 			--section-item-bg: rgba(0, 0, 0, 0.01);
-			--glass-blur: 20px;
-			--card-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.07);
 			--orb-1-color: rgba(99, 102, 241, 0.06);
 			--orb-2-color: rgba(236, 72, 153, 0.04);
-			
-			/* Theme aware code tag tokens */
 			--code-bg: rgba(79, 70, 229, 0.07);
 			--code-color: #4f46e5;
 			--code-border: rgba(79, 70, 229, 0.15);
-		}
-
-		* {
-			box-sizing: border-box;
-			margin: 0;
-			padding: 0;
 		}
 
 		body {
@@ -4060,73 +4027,7 @@ async function handleAdminPage(request, env, ctx) {
 			margin-top: 10px;
 		}
 
-		/* Toast Notification (Green for success, Red for error, Orange for warning) */
-		.toast-container {
-			position: fixed;
-			top: 24px;
-			right: 24px;
-			display: flex;
-			flex-direction: column;
-			gap: 10px;
-			z-index: 9999;
-			pointer-events: none;
-		}
-
-		.toast {
-			min-width: 260px;
-			padding: 14px 20px;
-			border-radius: 12px;
-			box-shadow: var(--card-shadow);
-			font-size: 14px;
-			font-weight: 600;
-			display: flex;
-			align-items: center;
-			gap: 12px;
-			backdrop-filter: blur(15px);
-			-webkit-backdrop-filter: blur(15px);
-			transform: translateY(-20px);
-			opacity: 0;
-			transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-			pointer-events: auto;
-		}
-
-		.toast.show {
-			transform: translateY(0);
-			opacity: 1;
-		}
-
-		.toast-icon {
-			width: 20px;
-			height: 20px;
-			flex-shrink: 0;
-		}
-
-		.toast-success {
-			background-color: #10b981 !important;
-			color: #ffffff !important;
-			border: none !important;
-		}
-		.toast-success .toast-icon, .toast-success span {
-			color: #ffffff !important;
-		}
-
-		.toast-error {
-			background-color: #ef4444 !important;
-			color: #ffffff !important;
-			border: none !important;
-		}
-		.toast-error .toast-icon, .toast-error span {
-			color: #ffffff !important;
-		}
-		
-		.toast-warning {
-			background-color: #f59e0b !important;
-			color: #ffffff !important;
-			border: none !important;
-		}
-		.toast-warning .toast-icon, .toast-warning span {
-			color: #ffffff !important;
-		}
+		${SHARED_TOAST_CSS}
 
 		/* Mobile Responsiveness */
 		.mobile-header {
@@ -4274,7 +4175,7 @@ async function handleAdminPage(request, env, ctx) {
 				</button>
 				<button class="btn btn-secondary" onclick="logout()">退出登录</button>
 				<div style="text-align: center; font-size: 11px; color: var(--text-muted); opacity: 0.55; padding-top: 4px;">
-					由 <a href="https://github.com/cmliussss2024/WorkersAI2API" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">WorkersAI2API</a> 强力驱动
+					由 <a href="https://github.com/ojbkxc/cf-ai-gw" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">WorkersAI2API</a> 强力驱动
 				</div>
 			</div>
 		</aside>
@@ -5136,22 +5037,9 @@ async function handleAdminPage(request, env, ctx) {
 		async function copyEndpointUrl(url) {
 			if (!url) return;
 			try {
-				if (navigator.clipboard && window.isSecureContext) {
-					await navigator.clipboard.writeText(url);
-				} else {
-					const input = document.createElement('input');
-					input.value = url;
-					input.style.position = 'fixed';
-					input.style.opacity = '0';
-					input.style.left = '-9999px';
-					document.body.appendChild(input);
-					input.select();
-					document.execCommand('copy');
-					document.body.removeChild(input);
-				}
+				await navigator.clipboard.writeText(url);
 				showToast('已复制接入地址！');
-			} catch (e) {
-				console.error(e);
+			} catch (_) {
 				showToast('复制失败，请手动复制 URL', 'error');
 			}
 		}
@@ -5422,14 +5310,13 @@ async function handleAdminPage(request, env, ctx) {
 			}
 		}
 
-		function copyKeyText(val) {
-			const input = document.createElement('input');
-			input.value = val;
-			document.body.appendChild(input);
-			input.select();
-			document.execCommand('copy');
-			document.body.removeChild(input);
-			showToast('API Key 复制成功！');
+		async function copyKeyText(val) {
+			try {
+				await navigator.clipboard.writeText(val);
+				showToast('API Key 复制成功！');
+			} catch (_) {
+				showToast('复制失败，请手动复制', 'error');
+			}
 		}
 
 		function openAddKeyModal() {
@@ -5469,11 +5356,13 @@ async function handleAdminPage(request, env, ctx) {
 			}
 		}
 
-		function copyGeneratedKey() {
-			const el = document.getElementById('generated-key-val');
-			el.select();
-			document.execCommand('copy');
-			showToast('API Key 复制成功！');
+		async function copyGeneratedKey() {
+			try {
+				await navigator.clipboard.writeText(document.getElementById('generated-key-val').value);
+				showToast('API Key 复制成功！');
+			} catch (_) {
+				showToast('复制失败，请手动复制', 'error');
+			}
 		}
 
 		async function deleteKey(id) {
@@ -5491,14 +5380,13 @@ async function handleAdminPage(request, env, ctx) {
 			}
 		}
 
-		function copyModelId(val) {
-			const input = document.createElement('input');
-			input.value = val;
-			document.body.appendChild(input);
-			input.select();
-			document.execCommand('copy');
-			document.body.removeChild(input);
-			showToast(\`已复制模型: \${val}\`);
+		async function copyModelId(val) {
+			try {
+				await navigator.clipboard.writeText(val);
+				showToast(\`已复制模型: \${val}\`);
+			} catch (_) {
+				showToast('复制失败，请手动复制', 'error');
+			}
 		}
 
 		async function loadSettings() {
