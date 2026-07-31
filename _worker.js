@@ -207,69 +207,6 @@ async function sha256(message) {
 //   'cfg_limits'     → 用量限额配置
 // ----------------------------------------------------
 
-// 一次性读取所有配置（兼容旧版单键 'config'，自动迁移）
-async function getAppConfig(env) {
-	// 优先从独立键读取
-	const [accRaw, keyRaw, mapRaw, limitsRaw] = await Promise.all([
-		env.KV.get('cfg_accounts', { cacheTtl: 60 }),
-		env.KV.get('cfg_api_keys', { cacheTtl: 60 }),
-		env.KV.get('cfg_model_map', { cacheTtl: 60 }),
-		env.KV.get('cfg_limits', { cacheTtl: 60 }),
-	]);
-
-	// 如果所有独立键都为空，尝试从旧版 'config' 键迁移
-	if (!accRaw && !keyRaw && !mapRaw && !limitsRaw) {
-		const legacyRaw = await env.KV.get('config');
-		if (legacyRaw) {
-			try {
-				const data = JSON.parse(legacyRaw);
-				const migrated = {
-					accounts: data.accounts || [],
-					apiKeys: data.apiKeys || [],
-					customModelMap: data.customModelMap || {},
-					usageLimits: data.usageLimits || {}
-				};
-				// 写入独立键（后台迁移，不阻塞响应）
-				await Promise.all([
-					env.KV.put('cfg_accounts', JSON.stringify(migrated.accounts)),
-					env.KV.put('cfg_api_keys', JSON.stringify(migrated.apiKeys)),
-					env.KV.put('cfg_model_map', JSON.stringify(migrated.customModelMap)),
-					env.KV.put('cfg_limits', JSON.stringify(migrated.usageLimits)),
-				]);
-				return migrated;
-			} catch (e) {
-				console.error('Failed to migrate legacy config:', e);
-			}
-		}
-		// 全新初始化
-		const defaults = { accounts: [], apiKeys: [], customModelMap: { ...DEFAULT_MODEL_MAP }, usageLimits: {} };
-		await env.KV.put('cfg_model_map', JSON.stringify(defaults.customModelMap));
-		return defaults;
-	}
-
-	const parseSafe = (raw, fallback) => {
-		if (!raw) return fallback;
-		try { return JSON.parse(raw); } catch (e) { console.error('Failed to parse KV JSON:', e); return fallback; }
-	};
-
-	return {
-		accounts: parseSafe(accRaw, []),
-		apiKeys: parseSafe(keyRaw, []),
-		customModelMap: parseSafe(mapRaw, {}),
-		usageLimits: parseSafe(limitsRaw, {}),
-	};
-}
-
-// 仅保存指定字段到独立 KV 键（避免全量写回）
-async function saveAppConfig(env, config) {
-	await Promise.all([
-		env.KV.put('cfg_accounts', JSON.stringify(config.accounts)),
-		env.KV.put('cfg_api_keys', JSON.stringify(config.apiKeys)),
-		env.KV.put('cfg_model_map', JSON.stringify(config.customModelMap)),
-		env.KV.put('cfg_limits', JSON.stringify(config.usageLimits)),
-	]);
-}
-
 async function getAccounts(env) {
 	const raw = await env.KV.get('cfg_accounts', { cacheTtl: 60 });
 	if (!raw) return [];
@@ -2305,22 +2242,6 @@ const SHARED_BG_CSS = `
 			border-radius: 50%;
 			filter: blur(100px);
 			animation: float 25s infinite alternate ease-in-out;
-		}`;
-
-// 错误页共享的 error-card CSS
-const SHARED_ERROR_CARD_CSS = `
-		.error-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 20px;
-			padding: 40px;
-			max-width: 500px;
-			width: 100%;
-			text-align: center;
-			box-shadow: var(--card-shadow);
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			z-index: 10;
 		}`;
 
 // 两个页面共享的 CSS 变量（:root 主题色 + 通用 reset）
