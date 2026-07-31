@@ -87,7 +87,7 @@ export default {
 			// 4. 后台管理面板的 API 接口（/api/ 开头）
 			if (url.pathname.startsWith('/api/')) {
 				const response = await handleDashboardApi(request, env, ctx);
-				return addCORSHeaders(response);
+			return addCORSHeaders(response, request);
 			}
 
 			// 5. 后台管理面板页面
@@ -130,11 +130,26 @@ export default {
 };
 
 // 工具函数：给响应加上跨域（CORS）响应头
-function addCORSHeaders(response) {
+// /v1/ 代理接口保持宽松（供 OpenAI 客户端跨域调用），/api/ 管理接口仅允许同源
+function addCORSHeaders(response, request) {
 	const newResponse = new Response(response.body, response);
-	newResponse.headers.set('Access-Control-Allow-Origin', '*');
 	newResponse.headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
 	newResponse.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key');
+	try {
+		const url = new URL(request.url);
+		if (url.pathname.startsWith('/api/')) {
+			// 管理接口仅允许同源访问，防止跨域调用
+			const origin = request.headers.get('Origin');
+			if (origin && origin === url.origin) {
+				newResponse.headers.set('Access-Control-Allow-Origin', origin);
+				newResponse.headers.set('Vary', 'Origin');
+			}
+		} else {
+			newResponse.headers.set('Access-Control-Allow-Origin', '*');
+		}
+	} catch (_) {
+		newResponse.headers.set('Access-Control-Allow-Origin', '*');
+	}
 	return newResponse;
 }
 
@@ -880,6 +895,12 @@ async function handleCompletions(request, env, pathname) {
 		messages: pathname === '/v1/chat/completions' ? messages : [{ role: 'user', content: prompt }],
 		stream: !!stream,
 	};
+
+	// 客户端未指定 max_tokens 时设一个较大默认值，
+	// 避免 CF Workers AI 默认值过小导致输出被截断
+	if (body.max_tokens === undefined) {
+		cfPayload.max_tokens = 4096;
+	}
 
 	const passthroughFields = [
 		'temperature', 'max_tokens', 'top_p', 'n',
@@ -1749,8 +1770,14 @@ async function handleDashboardApi(request, env, ctx) {
 		});
 	}
 
-	// 3. 公开的用量汇总（首页未登录时也能看到）
+	// 3. 用量汇总（需要认证后才能访问，防止用量明细泄露）
 	if (url.pathname === '/api/usage/summary') {
+		// GET 和 POST 均需要登录认证
+		const isAuthorized = await checkAdminAuth(request, env);
+		if (!isAuthorized) {
+			return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+		}
+
 		if (method === 'GET') {
 			const cached = await getCachedSummary(env);
 			const todayStr = new Date().toISOString().split('T')[0];
@@ -1792,12 +1819,6 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 
 		if (method === 'POST') {
-			// POST 会触发大量 GraphQL 查询，需要认证
-			const isAuthorized = await checkAdminAuth(request, env);
-			if (!isAuthorized) {
-				return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
-			}
-
 			const accounts = await getAccounts(env);
 			const limits = await getUsageLimits(env);
 
@@ -4646,8 +4667,8 @@ function handleAdminPage(request, env, ctx) {
 				item.innerHTML = \`
 					<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px; gap: 12px;">
 						<div style="min-width: 0; flex: 1; display: flex; align-items: center; gap: 8px;">
-							<strong style="font-size:15px; font-weight:600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto;" title="\${account.name}">\${account.name}</strong>
-							<span style="font-size:12px; color: var(--text-muted); font-family: monospace; white-space: nowrap; flex-shrink: 0;">(\${account.accountId.substring(0,6)}...\${account.accountId.substring(account.accountId.length-4)})</span>
+							<strong style="font-size:15px; font-weight:600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto;" title="\${escapeHtml(account.name)}">\${escapeHtml(account.name)}</strong>
+							<span style="font-size:12px; color: var(--text-muted); font-family: monospace; white-space: nowrap; flex-shrink: 0;">(\${escapeHtml(account.accountId.substring(0,6))}...\${escapeHtml(account.accountId.substring(account.accountId.length-4))})</span>
 						</div>
 						<span class="badge \${warningClass}" style="flex-shrink: 0;">\${statusText}</span>
 					</div>
@@ -4658,7 +4679,7 @@ function handleAdminPage(request, env, ctx) {
 						<span>今日已用: \${roundedUsage.toLocaleString()} / \${limits.dailyLimit.toLocaleString()} Neurons</span>
 						<span>\${percentage.toFixed(2)}%</span>
 					</div>
-					\${account.error ? \`<div style="color: var(--danger-color); font-size:11px; margin-top: 8px; background: rgba(239,68,68,0.08); padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(239,68,68,0.12);">错误信息: \${account.error}</div>\` : ''}
+					\${account.error ? \`<div style="color: var(--danger-color); font-size:11px; margin-top: 8px; background: rgba(239,68,68,0.08); padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(239,68,68,0.12);">错误信息: \${escapeHtml(account.error)}</div>\` : ''}
 				\`;
 				usageList.appendChild(item);
 
@@ -5165,7 +5186,7 @@ function handleAdminPage(request, env, ctx) {
 				el.innerHTML = '<span style="color: #10b981; font-weight: bold; margin-left: 6px;">✅ 有效</span>';
 			} else {
 				const err = (statusObj && statusObj.error) ? statusObj.error : '测试失败';
-				el.innerHTML = '<span style="color: #ef4444; font-weight: bold; margin-left: 6px;" title="' + err.replace(/"/g, '&quot;') + '">🔴 无效</span>';
+			el.innerHTML = '<span style="color: #ef4444; font-weight: bold; margin-left: 6px;" title="' + escapeHtml(err) + '">🔴 无效</span>';
 			}
 		}
 
@@ -5445,11 +5466,11 @@ function handleAdminPage(request, env, ctx) {
 					const typeText = isPreset ? '<span class="badge badge-success">预设映射</span>' : '<span class="badge badge-warning">自定义</span>';
 					const tr = document.createElement('tr');
 					tr.innerHTML = \`
-						<td><code style="cursor: pointer;" title="点击复制" onclick="copyModelId('\${source}')">\${source}</code></td>
-						<td><code style="cursor: pointer;" title="点击复制" onclick="copyModelId('\${target}')">\${target}</code></td>
-						<td>\${typeText}</td>
-						<td>
-							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteMapping('\${source}')">删除</button>
+					<td><code style="cursor: pointer;" title="点击复制" onclick="copyModelId('\${attrEscape(source)}')">\${escapeHtml(source)}</code></td>
+					<td><code style="cursor: pointer;" title="点击复制" onclick="copyModelId('\${attrEscape(target)}')">\${escapeHtml(target)}</code></td>
+					<td>\${typeText}</td>
+					<td>
+							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteMapping('\${attrEscape(source)}')">删除</button>
 						</td>
 					\`;
 					tbody.appendChild(tr);
@@ -5724,13 +5745,21 @@ function handleKVError(request) {
 </html>`;
 
 	const url = new URL(request.url);
-	if (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/api/')) {
+	if (url.pathname.startsWith('/v1/')) {
 		return new Response(JSON.stringify({
 			error: {
 				message: "Cloudflare KV namespace binding 'KV' is missing. Please bind a KV namespace to 'KV' in your Worker/Pages settings.",
 				type: "server_error"
 			}
 		}), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+	}
+	if (url.pathname.startsWith('/api/')) {
+		return new Response(JSON.stringify({
+			error: {
+				message: "Cloudflare KV namespace binding 'KV' is missing. Please bind a KV namespace to 'KV' in your Worker/Pages settings.",
+				type: "server_error"
+			}
+		}), { status: 500, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	return new Response(html, {
@@ -5846,7 +5875,7 @@ function handlePasswordError(request) {
 	<div class="error-card">
 		<div style="font-size: 48px; margin-bottom: 16px;">🔑</div>
 		<h1>管理员密码未配置</h1>
-		<p>系统检测到您未在 Cloudflare 平台中为该项目配置 <strong>ADMIN_PASSWORD</strong> 环境变量。为了您的接口 and 管理后台安全，系统已拦截所有访问，直到密码配置完成。</p>
+		<p>系统检测到您未在 Cloudflare 平台中为该项目配置 <strong>ADMIN_PASSWORD</strong> 环境变量。为了您的接口与管理后台安全，系统已拦截所有访问，直到密码配置完成。</p>
 		
 		<div class="code-block">
 			<strong>解决方案：</strong><br>
@@ -5860,13 +5889,21 @@ function handlePasswordError(request) {
 </html>`;
 
 	const url = new URL(request.url);
-	if (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/api/')) {
+	if (url.pathname.startsWith('/v1/')) {
 		return new Response(JSON.stringify({
 			error: {
 				message: "ADMIN_PASSWORD environment variable is missing. Please add the ADMIN_PASSWORD variable to your Worker/Pages settings.",
 				type: "server_error"
 			}
-		}), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key' } });
+		}), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+	}
+	if (url.pathname.startsWith('/api/')) {
+		return new Response(JSON.stringify({
+			error: {
+				message: "ADMIN_PASSWORD environment variable is missing. Please add the ADMIN_PASSWORD variable to your Worker/Pages settings.",
+				type: "server_error"
+			}
+		}), { status: 500, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	return new Response(html, {
