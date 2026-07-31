@@ -1,4 +1,4 @@
-# WorkersAI2API
+# cf-ai-gw
 
 一个反向代理:把 Cloudflare Workers AI 转换成 OpenAI / Anthropic 兼容的接口格式,支持多账号负载均衡、故障自动切换重试,并自带一个可视化管理面板(数据看板)。
 
@@ -29,7 +29,7 @@
 ### 2. 创建一个 KV 命名空间
 
 1. 进入 Cloudflare 控制台 → **Workers & Pages** → **KV** → **创建命名空间**。
-2. 给命名空间取个名字(例如 `WORKERSAI2API_KV`),创建完成。
+2. 给命名空间取个名字(例如 `CF_AI_GW_KV`),创建完成。
 3. 记住这个名字,下一步绑定时要选它。
 
 ### 3. 配置环境变量与绑定
@@ -44,11 +44,12 @@
   - **变量名称(Variable name)**:填大写 `KV`(必须为 `KV`,代码中通过 `env.KV` 读取)。
   - **KV 命名空间**:选择第 2 步创建的 KV 命名空间。
 
-- **Workers AI 绑定(Workers AI bindings)**
+- **Workers AI 绑定(Workers AI bindings)**(可选)
   - **变量名称(Variable name)**:填 `AI`(即 Workers AI 绑定的标识)。
   - 选择对应账号即可。
+  > 说明:当前代码实际通过 Cloudflare REST API 调用 Workers AI(使用面板中配置的账号 `Account ID` + `API Token`),并未直接使用 `env.AI` 绑定。此绑定可暂时不配,保留以备后续接入原生 Workers AI 绑定调用。
 
-> 绑定名称区分大小写,务必按上述大写填写 `KV` 与 `AI`。
+> 绑定名称区分大小写,务必按上述大写填写 `KV`(必填)。`AI` 为可选项。
 
 ### 4. 重新部署并验证
 

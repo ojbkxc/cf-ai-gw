@@ -1,5 +1,5 @@
 /**
- * WorkersAI2API
+ * cf-ai-gw
  * 一个反向代理：把 Cloudflare Workers AI 转换成 OpenAI 兼容的接口格式，
  * 支持多账号负载均衡、故障自动切换重试，还自带一个可视化管理面板。
  */
@@ -15,13 +15,16 @@ const USAGE_REFRESH_LIMIT = 20;        // 每次刷新最多更新的账号数
 const MONTHLY_USAGE_TTL_SEC = 38 * 24 * 60 * 60; // 月度用量 KV 键 TTL 38 天（秒）
 const MODEL_CREATED_TS = 1686935000;   // 模型列表中的 created 时间戳（2023-06-16）
 
+// 找不到模型映射时的兜底模型（resolveModelName 与 DEFAULT_MODEL_MAP 共用，改默认模型只改这里）
+const DEFAULT_FALLBACK_MODEL = '@cf/zai-org/glm-4.7-flash';
+
 // 默认模型映射表（左边是客户端请求的模型名，右边是 Cloudflare 上对应的真实模型）
 const DEFAULT_MODEL_MAP = {
 	// 对话 / 文本生成模型
 	'glm-5.2': '@cf/zai-org/glm-5.2',
 	'glm-4.7-flash': '@cf/zai-org/glm-4.7-flash',
 	'kimi-k2.7-code': '@cf/moonshotai/kimi-k2.7-code',
-	'kimi-k2.6': '@cf/moonshotai/kimi-k2.6',
+	'kimi-k2.6': '@cf/moonshotai/kimi-k2.6', // 效果一般，仅作兼容
 	'gemma-4-26b-a4b-it': '@cf/google/gemma-4-26b-a4b-it',
 	'nemotron-3-120b-a12b': '@cf/nvidia/nemotron-3-120b-a12b',
 	'gpt-oss-20b': '@cf/openai/gpt-oss-20b',
@@ -899,25 +902,23 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 			);
 
 			if (cfResponse.ok) {
-			if (stream) {
-				if (!cfResponse.body) {
-					lastError = `CF API returned empty response body`;
-					continue;
+				if (stream) {
+					if (!cfResponse.body) {
+						lastError = `CF API returned empty response body`;
+						continue;
+					}
+					// 流式响应：一旦拿到 HTTP 200 + body 就立即返回，不预读首字节。
+					// 这意味着如果上游在流式传输中途断开，客户端会收到截断的流而不会触发 failover。
+					// 这是刻意的设计权衡：预读会破坏 SSE 的实时性。
+					return { success: true, stream: cfResponse.body };
 				}
-				// 流式响应：一旦拿到 HTTP 200 + body 就立即返回，不预读首字节。
-				// 这意味着如果上游在流式传输中途断开，客户端会收到截断的流而不会触发 failover。
-				// 这是刻意的设计权衡：预读会破坏 SSE 的实时性。
-				return { success: true, stream: cfResponse.body };
-			} else {
 				const cfJson = await cfResponse.json();
 				return { success: true, data: cfJson };
 			}
-		} else {
-				const errorText = await cfResponse.text();
-				const status = cfResponse.status;
-				// 记录错误后继续尝试下一个账号
-				lastError = `CF API returned ${status}: ${errorText}`;
-			}
+
+			// 非 2xx：记录错误后继续尝试下一个账号（failover）
+			const errorText = await cfResponse.text();
+			lastError = `CF API returned ${cfResponse.status}: ${errorText}`;
 		} catch (e) {
 			lastError = `Connection error: ${e.message}`;
 		}
@@ -929,11 +930,11 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 // 共享的模型名解析函数：根据用户传入的模型名，映射到 Cloudflare 实际模型
 // 找不到映射时静默回退到默认模型（与原代码一致）。
 async function resolveModelName(model, env) {
-	if (!model) return '@cf/zai-org/glm-4.7-flash';
+	if (!model) return DEFAULT_FALLBACK_MODEL;
 	if (model.startsWith('@cf/')) return model;
 	const customMap = await getCustomModelMap(env);
 	const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
-	return combinedMap[model] || '@cf/zai-org/glm-4.7-flash';
+	return combinedMap[model] || DEFAULT_FALLBACK_MODEL;
 }
 
 // 对话补全 / 文本补全 的代理处理函数
@@ -2440,6 +2441,189 @@ const SHARED_TOAST_CSS = `
 		}
 `;
 
+// 背景装饰球（.bg-orb-1 / .bg-orb-2 + 统一的 float 动画）
+// 此前两个页面各写一份且 keyframes 不一致，现统一为三关键帧版本。
+const SHARED_ORB_CSS = `
+		.bg-orb-1 {
+			top: -10%;
+			left: -10%;
+			width: 50vw;
+			height: 50vw;
+			background: var(--orb-1-color);
+			animation-duration: 20s;
+		}
+
+		.bg-orb-2 {
+			bottom: -10%;
+			right: -10%;
+			width: 60vw;
+			height: 60vw;
+			background: var(--orb-2-color);
+			animation-duration: 30s;
+			animation-delay: -5s;
+		}
+
+		@keyframes float {
+			0% { transform: translate(0, 0) scale(1); }
+			50% { transform: translate(5%, 10%) scale(1.1); }
+			100% { transform: translate(-5%, -5%) scale(0.9); }
+		}`;
+
+// 统计卡片骨架（.stat-value / .stat-desc 等字号差异在各页面内覆盖）
+const SHARED_STAT_CARD_CSS = `
+		.stat-card {
+			background-color: var(--card-bg);
+			border: 1px solid var(--border-color);
+			border-radius: 18px;
+			padding: 26px;
+			display: flex;
+			flex-direction: column;
+			gap: 14px;
+			box-shadow: var(--card-shadow);
+			backdrop-filter: blur(var(--glass-blur));
+			-webkit-backdrop-filter: blur(var(--glass-blur));
+			transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.3s, border-color 0.3s;
+			min-width: 0;
+			overflow: hidden;
+		}
+
+		.stat-card:hover {
+			transform: translateY(-4px);
+			border-color: rgba(168, 85, 247, 0.3);
+			box-shadow: 0 12px 30px rgba(168, 85, 247, 0.1);
+		}
+
+		.stat-title {
+			font-size: 14px;
+			color: var(--text-muted);
+			font-weight: 500;
+		}`;
+
+// 进度条基础（容器高度 / 圆角 / shimmer / threshold 等差异在各页面内覆盖）
+const SHARED_PROGRESS_CSS = `
+		.progress-container {
+			width: 100%;
+			background-color: rgba(255, 255, 255, 0.06);
+			overflow: hidden;
+		}
+
+		:root[data-theme="light"] .progress-container {
+			background-color: rgba(0, 0, 0, 0.05);
+		}
+
+		.progress-bar {
+			height: 100%;
+			background: var(--primary-gradient);
+			width: 0%;
+			transition: width 1.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+		}`;
+
+// 表单输入框（.form-group 因页面布局差异保留在各页面内）
+const SHARED_FORM_CSS = `
+		.form-group label {
+			font-size: 13px;
+			font-weight: 500;
+			color: var(--text-muted);
+		}
+
+		input {
+			background-color: var(--input-bg);
+			border: 1px solid var(--input-border);
+			color: var(--input-text);
+			padding: 12px 16px;
+			border-radius: 10px;
+			outline: none;
+			font-size: 14px;
+			transition: all 0.3s ease;
+			backdrop-filter: blur(10px);
+		}
+
+		input:focus {
+			border-color: var(--accent-color);
+			box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.2);
+			background-color: rgba(15, 23, 42, 0.8);
+		}
+
+		:root[data-theme="light"] input:focus {
+			background-color: rgba(255, 255, 255, 0.95);
+		}`;
+
+// 按钮主/次态（.btn 基础因 padding/gap 差异保留在各页面内）
+const SHARED_BUTTON_CSS = `
+		.btn-primary {
+			background: var(--primary-gradient);
+			color: white;
+			box-shadow: 0 4px 14px rgba(168, 85, 247, 0.3);
+		}
+
+		.btn-primary:hover {
+			transform: translateY(-2px);
+			box-shadow: 0 6px 20px rgba(168, 85, 247, 0.5);
+			opacity: 0.95;
+		}
+
+		.btn-primary:active {
+			transform: translateY(0);
+		}
+
+		.btn-secondary {
+			background-color: var(--btn-secondary-bg);
+			color: var(--btn-secondary-text);
+			border: 1px solid var(--border-color);
+		}
+
+		.btn-secondary:hover {
+			background-color: var(--btn-secondary-hover);
+			transform: translateY(-1px);
+		}`;
+
+// 模态框骨架（.modal-card 的 max-width 差异在各页面内覆盖）
+const SHARED_MODAL_CSS = `
+		.modal-overlay {
+			position: fixed;
+			top: 0;
+			left: 0;
+			right: 0;
+			bottom: 0;
+			background-color: var(--modal-overlay-bg);
+			backdrop-filter: blur(0px);
+			-webkit-backdrop-filter: blur(0px);
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			z-index: 1000;
+			opacity: 0;
+			pointer-events: none;
+			transition: opacity 0.3s ease, backdrop-filter 0.3s ease, -webkit-backdrop-filter 0.3s ease;
+		}
+
+		.modal-overlay.active {
+			opacity: 1;
+			pointer-events: auto;
+			backdrop-filter: blur(8px);
+			-webkit-backdrop-filter: blur(8px);
+		}
+
+		.modal-card {
+			background-color: var(--card-bg);
+			border: 1px solid var(--border-color);
+			border-radius: 20px;
+			width: 100%;
+			padding: 32px;
+			box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
+			display: flex;
+			flex-direction: column;
+			gap: 20px;
+			transform: scale(0.9) translateY(20px);
+			transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.3s;
+			backdrop-filter: blur(var(--glass-blur));
+			-webkit-backdrop-filter: blur(var(--glass-blur));
+		}
+
+		.modal-overlay.active .modal-card {
+			transform: scale(1) translateY(0);
+		}`;
+
 // 1. 首页 / 登录页
 async function handleLandingPage(request, env, ctx) {
 	const isLoggedIn = await checkAdminAuth(request, env);
@@ -2449,7 +2633,7 @@ async function handleLandingPage(request, env, ctx) {
 	<meta charset="UTF-8">
 	<meta name="robots" content="noindex, nofollow">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>Workers AI to API - Cloudflare Workers AI Proxy</title>
+	<title>cf-ai-gw - Cloudflare Workers AI Proxy</title>
 	<link rel="preconnect" href="https://fonts.googleapis.com">
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
@@ -2482,36 +2666,7 @@ async function handleLandingPage(request, env, ctx) {
 
 		${SHARED_BG_CSS}
 
-		.bg-orb-1 {
-			top: -10%;
-			left: -10%;
-			width: 50vw;
-			height: 50vw;
-			background: var(--orb-1-color);
-			animation-duration: 20s;
-		}
-
-		.bg-orb-2 {
-			bottom: -10%;
-			right: -10%;
-			width: 60vw;
-			height: 60vw;
-			background: var(--orb-2-color);
-			animation-duration: 30s;
-			animation-delay: -5s;
-		}
-
-		@keyframes float {
-			0% {
-				transform: translate(0, 0) scale(1);
-			}
-			50% {
-				transform: translate(5%, 10%) scale(1.1);
-			}
-			100% {
-				transform: translate(-5%, -5%) scale(0.9);
-			}
-		}
+		${SHARED_ORB_CSS}
 
 		.action-btn-group {
 			position: fixed;
@@ -2686,33 +2841,7 @@ async function handleLandingPage(request, env, ctx) {
 			-webkit-text-fill-color: transparent;
 		}
 
-		.stat-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 18px;
-			padding: 26px;
-			display: flex;
-			flex-direction: column;
-			gap: 14px;
-			box-shadow: var(--card-shadow);
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.3s, border-color 0.3s;
-			min-width: 0;
-			overflow: hidden;
-		}
-
-		.stat-card:hover {
-			transform: translateY(-4px);
-			border-color: rgba(168, 85, 247, 0.3);
-			box-shadow: 0 12px 30px rgba(168, 85, 247, 0.1);
-		}
-
-		.stat-title {
-			font-size: 14px;
-			color: var(--text-muted);
-			font-weight: 500;
-		}
+		${SHARED_STAT_CARD_CSS}
 
 		.stat-value {
 			font-size: 36px;
@@ -2720,25 +2849,16 @@ async function handleLandingPage(request, env, ctx) {
 			font-family: 'Outfit', sans-serif;
 		}
 
+		${SHARED_PROGRESS_CSS}
+
 		.progress-container {
-			width: 100%;
 			height: 8px;
-			background-color: rgba(255, 255, 255, 0.06);
 			border-radius: 4px;
-			overflow: hidden;
 			position: relative;
 		}
 
-		:root[data-theme="light"] .progress-container {
-			background-color: rgba(0, 0, 0, 0.05);
-		}
-
 		.progress-bar {
-			height: 100%;
-			background: var(--primary-gradient);
 			border-radius: 4px;
-			width: 0%;
-			transition: width 1.2s cubic-bezier(0.34, 1.56, 0.64, 1);
 			position: relative;
 			overflow: hidden;
 		}
@@ -2779,33 +2899,7 @@ async function handleLandingPage(request, env, ctx) {
 			gap: 8px;
 		}
 
-		.form-group label {
-			font-size: 13px;
-			font-weight: 500;
-			color: var(--text-muted);
-		}
-
-		input {
-			background-color: var(--input-bg);
-			border: 1px solid var(--input-border);
-			color: var(--input-text);
-			padding: 12px 16px;
-			border-radius: 10px;
-			outline: none;
-			font-size: 14px;
-			transition: all 0.3s ease;
-			backdrop-filter: blur(10px);
-		}
-
-		input:focus {
-			border-color: var(--accent-color);
-			box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.2);
-			background-color: rgba(15, 23, 42, 0.8);
-		}
-
-		:root[data-theme="light"] input:focus {
-			background-color: rgba(255, 255, 255, 0.95);
-		}
+		${SHARED_FORM_CSS}
 
 		.btn {
 			display: inline-flex;
@@ -2821,78 +2915,13 @@ async function handleLandingPage(request, env, ctx) {
 			text-decoration: none;
 		}
 
-		.btn-primary {
-			background: var(--primary-gradient);
-			color: white;
-			box-shadow: 0 4px 14px rgba(168, 85, 247, 0.3);
-		}
-
-		.btn-primary:hover {
-			transform: translateY(-2px);
-			box-shadow: 0 6px 20px rgba(168, 85, 247, 0.5);
-			opacity: 0.95;
-		}
-
-		.btn-primary:active {
-			transform: translateY(0);
-		}
-
-		.btn-secondary {
-			background-color: var(--btn-secondary-bg);
-			color: var(--btn-secondary-text);
-			border: 1px solid var(--border-color);
-		}
-
-		.btn-secondary:hover {
-			background-color: var(--btn-secondary-hover);
-			transform: translateY(-1px);
-		}
+		${SHARED_BUTTON_CSS}
 
 		/* Modal Styling */
-		.modal-overlay {
-			position: fixed;
-			top: 0;
-			left: 0;
-			right: 0;
-			bottom: 0;
-			background-color: var(--modal-overlay-bg);
-			backdrop-filter: blur(0px);
-			-webkit-backdrop-filter: blur(0px);
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			z-index: 1000;
-			opacity: 0;
-			pointer-events: none;
-			transition: opacity 0.3s ease, backdrop-filter 0.3s ease, -webkit-backdrop-filter 0.3s ease;
-		}
-
-		.modal-overlay.active {
-			opacity: 1;
-			pointer-events: auto;
-			backdrop-filter: blur(8px);
-			-webkit-backdrop-filter: blur(8px);
-		}
+		${SHARED_MODAL_CSS}
 
 		.modal-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 20px;
-			width: 100%;
 			max-width: 400px;
-			padding: 32px;
-			box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
-			display: flex;
-			flex-direction: column;
-			gap: 20px;
-			transform: scale(0.9) translateY(20px);
-			transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.3s;
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-		}
-
-		.modal-overlay.active .modal-card {
-			transform: scale(1) translateY(0);
 		}
 
 		.modal-header {
@@ -2968,7 +2997,7 @@ async function handleLandingPage(request, env, ctx) {
 	<div class="dashboard-container">
 		<div class="login-header animate-fade-in-up" style="margin-bottom: 8px;">
 			<div class="logo-icon">AI</div>
-			<span class="logo-text">Workers AI to API</span>
+			<span class="logo-text">cf-ai-gw</span>
 		</div>
 
 		<div class="dashboard-grid">
@@ -3266,7 +3295,7 @@ async function handleLandingPage(request, env, ctx) {
 		}
 	</script>
 	<footer style="text-align: center; padding: 24px 0 20px; font-size: 12px; color: var(--text-muted); opacity: 0.6; z-index: 10;">
-		由 <a href="https://github.com/ojbkxc/cf-ai-gw" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">WorkersAI2API</a> 强力驱动
+		由 <a href="https://github.com/ojbkxc/cf-ai-gw" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">cf-ai-gw</a> 强力驱动
 	</footer>
 </body>
 </html>`;
@@ -3288,7 +3317,7 @@ async function handleAdminPage(request, env, ctx) {
 	<meta name="csrf-token" content="${csrfToken}">
 	<meta name="robots" content="noindex, nofollow">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>Workers AI to API Dashboard</title>
+	<title>cf-ai-gw Dashboard</title>
 	<link rel="preconnect" href="https://fonts.googleapis.com">
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -3449,29 +3478,7 @@ async function handleAdminPage(request, env, ctx) {
 		/* Dynamic Background Orbs */
 		${SHARED_BG_CSS}
 
-		.bg-orb-1 {
-			top: -10%;
-			left: -10%;
-			width: 50vw;
-			height: 50vw;
-			background: var(--orb-1-color);
-			animation-duration: 20s;
-		}
-
-		.bg-orb-2 {
-			bottom: -10%;
-			right: -10%;
-			width: 60vw;
-			height: 60vw;
-			background: var(--orb-2-color);
-			animation-duration: 30s;
-			animation-delay: -5s;
-		}
-
-		@keyframes float {
-			0% { transform: translate(0, 0) scale(1); }
-			100% { transform: translate(5%, 5%) scale(1.05); }
-		}
+		${SHARED_ORB_CSS}
 
 		/* Sidebar Layout */
 		.app-container {
@@ -3598,31 +3605,7 @@ async function handleAdminPage(request, env, ctx) {
 			gap: 20px;
 		}
 
-		.stat-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 18px;
-			padding: 26px;
-			display: flex;
-			flex-direction: column;
-			gap: 14px;
-			box-shadow: var(--card-shadow);
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.3s, border-color 0.3s;
-		}
-
-		.stat-card:hover {
-			transform: translateY(-4px);
-			border-color: rgba(168, 85, 247, 0.3);
-			box-shadow: 0 12px 30px rgba(168, 85, 247, 0.1);
-		}
-
-		.stat-title {
-			font-size: 14px;
-			color: var(--text-muted);
-			font-weight: 500;
-		}
+		${SHARED_STAT_CARD_CSS}
 
 		.stat-value {
 			font-size: 32px;
@@ -3635,23 +3618,11 @@ async function handleAdminPage(request, env, ctx) {
 			color: var(--text-muted);
 		}
 
+		${SHARED_PROGRESS_CSS}
+
 		.progress-container {
-			width: 100%;
 			height: 6px;
-			background-color: rgba(255, 255, 255, 0.06);
 			border-radius: 3px;
-			overflow: hidden;
-		}
-
-		:root[data-theme="light"] .progress-container {
-			background-color: rgba(0, 0, 0, 0.05);
-		}
-
-		.progress-bar {
-			height: 100%;
-			background: var(--primary-gradient);
-			width: 0%;
-			transition: width 1.2s cubic-bezier(0.34, 1.56, 0.64, 1);
 		}
 
 		.progress-threshold {
@@ -3771,33 +3742,7 @@ async function handleAdminPage(request, env, ctx) {
 			margin-bottom: 16px;
 		}
 
-		.form-group label {
-			font-size: 13px;
-			font-weight: 500;
-			color: var(--text-muted);
-		}
-
-		input {
-			background-color: var(--input-bg);
-			border: 1px solid var(--input-border);
-			color: var(--input-text);
-			padding: 12px 16px;
-			border-radius: 10px;
-			outline: none;
-			font-size: 14px;
-			transition: all 0.3s ease;
-			backdrop-filter: blur(10px);
-		}
-
-		input:focus {
-			border-color: var(--accent-color);
-			box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.2);
-			background-color: rgba(15, 23, 42, 0.8);
-		}
-
-		:root[data-theme="light"] input:focus {
-			background-color: rgba(255, 255, 255, 0.95);
-		}
+		${SHARED_FORM_CSS}
 
 		/* Buttons */
 		.btn {
@@ -3814,28 +3759,7 @@ async function handleAdminPage(request, env, ctx) {
 			gap: 8px;
 		}
 
-		.btn-primary {
-			background: var(--primary-gradient);
-			color: white;
-			box-shadow: 0 4px 14px rgba(168, 85, 247, 0.3);
-		}
-
-		.btn-primary:hover {
-			transform: translateY(-2px);
-			box-shadow: 0 6px 20px rgba(168, 85, 247, 0.5);
-			opacity: 0.95;
-		}
-
-		.btn-secondary {
-			background-color: var(--btn-secondary-bg);
-			color: var(--btn-secondary-text);
-			border: 1px solid var(--border-color);
-		}
-
-		.btn-secondary:hover {
-			background-color: var(--btn-secondary-hover);
-			transform: translateY(-1px);
-		}
+		${SHARED_BUTTON_CSS}
 
 		.btn-success {
 			background-color: var(--success-color);
@@ -3959,50 +3883,10 @@ async function handleAdminPage(request, env, ctx) {
 		}
 
 		/* Modals */
-		.modal-overlay {
-			position: fixed;
-			top: 0;
-			left: 0;
-			right: 0;
-			bottom: 0;
-			background-color: var(--modal-overlay-bg);
-			backdrop-filter: blur(0px);
-			-webkit-backdrop-filter: blur(0px);
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			z-index: 1000;
-			opacity: 0;
-			pointer-events: none;
-			transition: opacity 0.3s ease, backdrop-filter 0.3s ease, -webkit-backdrop-filter 0.3s ease;
-		}
-
-		.modal-overlay.active {
-			opacity: 1;
-			pointer-events: auto;
-			backdrop-filter: blur(8px);
-			-webkit-backdrop-filter: blur(8px);
-		}
+		${SHARED_MODAL_CSS}
 
 		.modal-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 20px;
-			width: 100%;
 			max-width: 500px;
-			padding: 32px;
-			box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
-			display: flex;
-			flex-direction: column;
-			gap: 20px;
-			transform: scale(0.9) translateY(20px);
-			transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.3s;
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-		}
-
-		.modal-overlay.active .modal-card {
-			transform: scale(1) translateY(0);
 		}
 
 		.modal-header {
@@ -4121,7 +4005,7 @@ async function handleAdminPage(request, env, ctx) {
 	<div style="display: flex; justify-content: space-between; align-items: center; padding: 15px 20px; background-color: var(--sidebar-bg); border-bottom: 1px solid var(--border-color); z-index: 90;" class="mobile-header">
 		<div class="logo-area" style="margin-bottom: 0;">
 			<div class="logo-icon">AI</div>
-			<span class="logo-text">Workers AI to API</span>
+			<span class="logo-text">cf-ai-gw</span>
 		</div>
 		<div style="display: flex; align-items: center; gap: 12px;">
 			<button class="mobile-nav-toggle" onclick="toggleSidebar()">
@@ -4136,7 +4020,7 @@ async function handleAdminPage(request, env, ctx) {
 		<aside id="sidebar">
 			<div class="logo-area">
 				<div class="logo-icon">AI</div>
-				<span class="logo-text">Workers AI to API</span>
+				<span class="logo-text">cf-ai-gw</span>
 			</div>
 			
 			<div class="nav-menu">
@@ -4175,7 +4059,7 @@ async function handleAdminPage(request, env, ctx) {
 				</button>
 				<button class="btn btn-secondary" onclick="logout()">退出登录</button>
 				<div style="text-align: center; font-size: 11px; color: var(--text-muted); opacity: 0.55; padding-top: 4px;">
-					由 <a href="https://github.com/ojbkxc/cf-ai-gw" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">WorkersAI2API</a> 强力驱动
+					由 <a href="https://github.com/ojbkxc/cf-ai-gw" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">cf-ai-gw</a> 强力驱动
 				</div>
 			</div>
 		</aside>
