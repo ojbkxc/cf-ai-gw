@@ -54,68 +54,78 @@ const DEFAULT_MODEL_MAP = {
 
 export default {
 	async fetch(request, env, ctx) {
-		// 1. 检查是否绑定了 KV 存储
-		if (!env.KV) {
-			return handleKVError(request);
-		}
+		try {
+			// 1. 检查是否绑定了 KV 存储
+			if (!env.KV) {
+				return handleKVError(request);
+			}
 
-		// 2. 检查是否配置了 ADMIN_PASSWORD 环境变量
-		if (!env.ADMIN_PASSWORD) {
-			return handlePasswordError(request);
-		}
+			// 2. 检查是否配置了 ADMIN_PASSWORD 环境变量
+			if (!env.ADMIN_PASSWORD) {
+				return handlePasswordError(request);
+			}
 
-		// 处理跨域预检请求（OPTIONS）
-		if (request.method === 'OPTIONS') {
-			return new Response(null, {
-				headers: {
-					'Access-Control-Allow-Origin': '*',
-					'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
-					'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key'
-				}
-			});
-		}
-
-		const url = new URL(request.url);
-
-		// 3. OpenAI 兼容的代理接口（/v1/ 开头）
-		if (url.pathname.startsWith('/v1/')) {
-			const response = await handleV1Proxy(request, env, ctx);
-			return addCORSHeaders(response);
-		}
-
-		// 4. 后台管理面板的 API 接口（/api/ 开头）
-		if (url.pathname.startsWith('/api/')) {
-			const response = await handleDashboardApi(request, env, ctx);
-			return addCORSHeaders(response);
-		}
-
-		// 5. 后台管理面板页面
-		if (url.pathname === '/admin' || url.pathname === '/admin/') {
-			const isLoggedIn = await checkAdminAuth(request, env);
-			if (isLoggedIn) {
-				return handleAdminPage(request, env, ctx);
-			} else {
+			// 处理跨域预检请求（OPTIONS）
+			if (request.method === 'OPTIONS') {
 				return new Response(null, {
-					status: 302,
-					headers: { 'Location': '/' }
+					headers: {
+						'Access-Control-Allow-Origin': '*',
+						'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
+						'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key'
+					}
 				});
 			}
-		}
 
-		// 6. 首页 / 登录页
-		if (url.pathname === '/') {
-			return handleLandingPage(request, env, ctx);
-		}
+			const url = new URL(request.url);
 
-		// robots.txt 支持，用于屏蔽搜索引擎爬虫
-		if (url.pathname === '/robots.txt') {
-			return new Response('User-agent: *\nDisallow: /', {
-				headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+			// 3. OpenAI 兼容的代理接口（/v1/ 开头）
+			if (url.pathname.startsWith('/v1/')) {
+				const response = await handleV1Proxy(request, env, ctx);
+				return addCORSHeaders(response);
+			}
+
+			// 4. 后台管理面板的 API 接口（/api/ 开头）
+			if (url.pathname.startsWith('/api/')) {
+				const response = await handleDashboardApi(request, env, ctx);
+				return addCORSHeaders(response);
+			}
+
+			// 5. 后台管理面板页面
+			if (url.pathname === '/admin' || url.pathname === '/admin/') {
+				const isLoggedIn = await checkAdminAuth(request, env);
+				if (isLoggedIn) {
+					return handleAdminPage(request, env, ctx);
+				} else {
+					return new Response(null, {
+						status: 302,
+						headers: { 'Location': '/' }
+					});
+				}
+			}
+
+			// 6. 首页 / 登录页
+			if (url.pathname === '/') {
+				return handleLandingPage(request, env, ctx);
+			}
+
+			// robots.txt 支持，用于屏蔽搜索引擎爬虫
+			if (url.pathname === '/robots.txt') {
+				return new Response('User-agent: *\nDisallow: /', {
+					headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+				});
+			}
+
+			// 7. 其他路径一律返回 404
+			return new Response('404 Not Found', { status: 404 });
+		} catch (e) {
+			// 顶层兜底：仅记录安全信息，不打印异常对象本身，
+			// 避免异常可能携带的 Authorization 请求头被 Cloudflare tail workers 捕获
+			console.error(`Unhandled error: ${e?.message || e}`);
+			return new Response(JSON.stringify({ error: { message: 'Internal Server Error', type: 'server_error' } }), {
+				status: 500,
+				headers: { 'Content-Type': 'application/json' }
 			});
 		}
-
-		// 7. 其他路径一律返回 404
-		return new Response('404 Not Found', { status: 404 });
 	}
 };
 
@@ -1703,13 +1713,18 @@ function passthroughStream(upstreamBody, modelName) {
 // ----------------------------------------------------
 // 后台管理面板的 API 接口处理函数
 // ----------------------------------------------------
+// 安全解析 JSON body，非法 JSON 返回 null 而非抛异常（避免冒泡到 Workers 运行时）
+async function safeJsonBody(request) {
+	try { return await request.json(); } catch { return null; }
+}
+
 async function handleDashboardApi(request, env, ctx) {
 	const url = new URL(request.url);
 	const method = request.method;
 
 	// 1. 登录（直接比对密码，不读写 KV，既快又省钱）
 	if (url.pathname === '/api/auth/login' && method === 'POST') {
-		const { password } = await request.json();
+		const { password } = await safeJsonBody(request) || {};
 		const expectedPassword = env.ADMIN_PASSWORD ? env.ADMIN_PASSWORD.trim() : '';
 		if (password === expectedPassword) {
 			const token = await sha256(password);
@@ -1812,7 +1827,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 
 		if (method === 'POST') {
-			const { id, name, accountId, apiToken } = await request.json();
+			const { id, name, accountId, apiToken } = await safeJsonBody(request) || {};
 			if (!accountId || !apiToken) {
 				return new Response(JSON.stringify({ error: 'AccountId and ApiToken are required' }), { status: 400 });
 			}
@@ -1842,7 +1857,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 
 		if (method === 'DELETE') {
-			const { id } = await request.json();
+			const { id } = await safeJsonBody(request) || {};
 			let accounts = await getAccounts(env);
 			accounts = accounts.filter(a => a.id !== id);
 			await saveAccounts(env, accounts);
@@ -1852,7 +1867,7 @@ async function handleDashboardApi(request, env, ctx) {
 
 	// 4. 测试账号是否能正常连接
 	if (url.pathname === '/api/accounts/test' && method === 'POST') {
-		const { id, accountId, apiToken } = await request.json();
+		const { id, accountId, apiToken } = await safeJsonBody(request) || {};
 		let targetAccountId = accountId;
 		let targetApiToken = apiToken;
 
@@ -2045,7 +2060,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 
 		if (method === 'POST') {
-			const { name, key } = await request.json();
+			const { name, key } = await safeJsonBody(request) || {};
 			if (!name) {
 				return new Response(JSON.stringify({ error: 'Name is required' }), { status: 400 });
 			}
@@ -2063,7 +2078,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 
 		if (method === 'DELETE') {
-			const { id } = await request.json();
+			const { id } = await safeJsonBody(request) || {};
 			let keys = await getApiKeys(env);
 			keys = keys.filter(k => k.id !== id);
 			await saveApiKeys(env, keys);
@@ -2079,7 +2094,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 
 		if (method === 'POST') {
-			const { customModelMap } = await request.json();
+			const { customModelMap } = await safeJsonBody(request) || {};
 			if (!customModelMap || typeof customModelMap !== 'object') {
 				return new Response(JSON.stringify({ error: 'Invalid customModelMap payload' }), { status: 400 });
 			}
@@ -2096,7 +2111,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 
 		if (method === 'POST') {
-			const body = await request.json();
+			const body = await safeJsonBody(request);
 			const { dailyLimit, monthlyLimit, threshold } = body || {};
 			const updates = {};
 			if (dailyLimit !== undefined) {
