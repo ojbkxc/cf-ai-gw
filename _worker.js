@@ -1,4 +1,4 @@
-﻿/**
+/**
  * cf-ai-gw
  * 一个反向代理：把 Cloudflare Workers AI 转换成 OpenAI 兼容的接口格式，
  * 支持多账号负载均衡、故障自动切换重试，还自带一个可视化管理面板。
@@ -60,6 +60,16 @@ const DEFAULT_MODEL_MAP = {
 	'sdxl': '@cf/stabilityai/stable-diffusion-xl-base-1.0',
 	'whisper': '@cf/openai/whisper-large-v3-turbo'
 };
+
+// CF 模型前缀 → owned_by 映射表（替代 /v1/models 中的 if/else 判断链）
+const CF_OWNER_MAP = [
+	['@cf/meta/', 'meta'], ['@cf/google/', 'google'], ['@cf/mistral/', 'mistral'],
+	['@cf/microsoft/', 'microsoft'], ['@cf/openai/', 'openai'], ['@cf/nvidia/', 'nvidia'],
+	['@cf/deepseek-ai/', 'deepseek'], ['@cf/qwen/', 'qwen'], ['@cf/zai-org/', 'zai-org'],
+	['@cf/moonshotai/', 'moonshotai'], ['@cf/baai/', 'baai'], ['@cf/stabilityai/', 'stabilityai'],
+	['@cf/black-forest-labs/', 'black-forest-labs'], ['@cf/codellama/', 'codellama'],
+	['@cf/llava-hf/', 'llava-hf'], ['@cf/internlm/', 'internlm'],
+];
 
 export default {
 	async fetch(request, env, ctx) {
@@ -783,23 +793,10 @@ async function handleV1Proxy(request, env, ctx) {
 		const modelsData = Object.keys(combinedMap).map(id => {
 			const cfModel = combinedMap[id] || '';
 			let ownedBy = 'system';
-			if (cfModel.startsWith('@cf/meta/')) ownedBy = 'meta';
-			else if (cfModel.startsWith('@cf/google/')) ownedBy = 'google';
-			else if (cfModel.startsWith('@cf/mistral/')) ownedBy = 'mistral';
-			else if (cfModel.startsWith('@cf/microsoft/')) ownedBy = 'microsoft';
-			else if (cfModel.startsWith('@cf/openai/')) ownedBy = 'openai';
-			else if (cfModel.startsWith('@cf/nvidia/')) ownedBy = 'nvidia';
-			else if (cfModel.startsWith('@cf/deepseek-ai/')) ownedBy = 'deepseek';
-			else if (cfModel.startsWith('@cf/qwen/')) ownedBy = 'qwen';
-			else if (cfModel.startsWith('@cf/zai-org/')) ownedBy = 'zai-org';
-			else if (cfModel.startsWith('@cf/moonshotai/')) ownedBy = 'moonshotai';
-			else if (cfModel.startsWith('@cf/baai/')) ownedBy = 'baai';
-			else if (cfModel.startsWith('@cf/stabilityai/')) ownedBy = 'stabilityai';
-			else if (cfModel.startsWith('@cf/black-forest-labs/')) ownedBy = 'black-forest-labs';
-			else if (cfModel.startsWith('@cf/codellama/')) ownedBy = 'codellama';
-			else if (cfModel.startsWith('@cf/llava-hf/')) ownedBy = 'llava-hf';
-			else if (cfModel.startsWith('@cf/internlm/')) ownedBy = 'internlm';
-			else if (id.includes('embedding')) ownedBy = 'openai';
+			for (const [prefix, owner] of CF_OWNER_MAP) {
+				if (cfModel.startsWith(prefix)) { ownedBy = owner; break; }
+			}
+			if (ownedBy === 'system' && id.includes('embedding')) ownedBy = 'openai';
 			return {
 				id,
 				object: 'model',
@@ -922,12 +919,54 @@ async function resolveModelName(model, env) {
 	return { cfModel: DEFAULT_FALLBACK_MODEL, isFallback: true };
 }
 
+// 通用的 CF /ai/run/{model} failover 调用函数
+// 用于 embeddings、images、audio 等非 chat 端点，统一多账号 failover 逻辑
+async function callCFRunAPI(cfModel, buildPayload, processResult, env, timeout = 30000) {
+	const accounts = await getAccounts(env);
+	const activeAccounts = accounts.filter(a => a.status === 'active');
+	if (activeAccounts.length === 0) {
+		return { success: false, status: 503, error: "No active accounts configured" };
+	}
+
+	let lastError = null;
+	for (const account of activeAccounts) {
+		try {
+			const cfPayload = buildPayload(account);
+			const cfResponse = await fetch(
+				`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/run/${cfModel}`,
+				cfPayload
+			);
+
+			if (cfResponse.ok) {
+				const cfJson = await cfResponse.json();
+				if (cfJson.success && cfJson.result) {
+					return { success: true, data: processResult(cfJson.result) };
+				} else {
+					lastError = `CF Run failed: ${JSON.stringify(cfJson.errors || cfJson)}`;
+				}
+			} else {
+				const errorText = await cfResponse.text();
+				lastError = `CF API status ${cfResponse.status}: ${errorText}`;
+			}
+		} catch (e) {
+			lastError = `Connection error: ${e.message}`;
+		}
+	}
+
+	return { success: false, status: 502, error: `All Cloudflare accounts failed. Last error: ${lastError}` };
+}
+
+// 统一的模型名解析 + fallback warning 构造
+async function resolveModelWithFallback(model, env) {
+	const { cfModel, isFallback } = await resolveModelName(model, env);
+	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	return { cfModel, isFallback, fallbackWarning };
+}
+
 // 对话补全 / 文本补全 的代理处理函数
 async function handleCompletions(request, env, pathname) {
-	let body;
-	try {
-		body = await request.json();
-	} catch (e) {
+	const body = await safeJsonBody(request);
+	if (!body) {
 		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
@@ -941,8 +980,7 @@ async function handleCompletions(request, env, pathname) {
 	}
 
 	// 解析模型名映射（找不到映射时回退到默认模型并标记 isFallback）
-	const { cfModel, isFallback } = await resolveModelName(model, env);
-	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model, env);
 
 	// 构造发给 Cloudflare 的请求体
 	const cfPayload = {
@@ -1313,10 +1351,8 @@ async function handleMessages(request, env) {
 	// 认证由 handleV1Proxy 的 checkProxyAuth 统一处理（支持 x-api-key + Bearer）
 
 	// 解析请求体
-	let anthropicBody;
-	try {
-		anthropicBody = await request.json();
-	} catch (e) {
+	const anthropicBody = await safeJsonBody(request);
+	if (!anthropicBody) {
 		return new Response(JSON.stringify({
 			type: 'error',
 			error: { type: 'invalid_request_error', message: 'Invalid JSON body.' }
@@ -1334,8 +1370,7 @@ async function handleMessages(request, env) {
 	// 若未提供，则不设置 max_tokens，让上游模型使用其默认值。
 	// 解析模型名映射
 	const model = anthropicBody.model;
-	const { cfModel, isFallback } = await resolveModelName(model, env);
-	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model, env);
 
 	// Anthropic → OpenAI 格式转换
 	const openaiBody = convertAnthropicToOpenAI(anthropicBody);
@@ -1698,10 +1733,8 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 
 // 向量嵌入（Embeddings）的代理处理函数
 async function handleEmbeddings(request, env) {
-	let body;
-	try {
-		body = await request.json();
-	} catch (e) {
+	const body = await safeJsonBody(request);
+	if (!body) {
 		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
@@ -1710,74 +1743,40 @@ async function handleEmbeddings(request, env) {
 		return new Response(JSON.stringify({ error: { message: "input is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 解析模型名映射
-	const { cfModel, isFallback } = await resolveModelName(model, env);
-	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
-
+	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model, env);
 	const textArray = Array.isArray(input) ? input : [input];
-	const accounts = await getAccounts(env);
-	const activeAccounts = accounts.filter(a => a.status === 'active').sort(() => Math.random() - 0.5);
-	if (activeAccounts.length === 0) {
-		return new Response(JSON.stringify({ error: { message: "No active accounts configured", type: "server_error" } }), { status: 503, headers: { 'Content-Type': 'application/json' } });
-	}
 
-	let lastError = null;
-
-	for (const account of activeAccounts) {
-		try {
-			const cfResponse = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/run/${cfModel}`, {
-				method: 'POST',
-				headers: {
-					'Authorization': `Bearer ${account.apiToken}`,
-					'Content-Type': 'application/json'
-				},
-				body: JSON.stringify({ text: textArray }),
-				signal: AbortSignal.timeout(30000),
-			});
-
-			if (cfResponse.ok) {
-				const cfJson = await cfResponse.json();
-				if (cfJson.success) {
-					const data = cfJson.result?.data;
-					if (!Array.isArray(data)) {
-						lastError = `CF Run returned unexpected result format`;
-						continue;
-					}
-					const embeddings = data.map((emb, index) => ({
-						object: "embedding",
-						index: index,
-						embedding: emb
-					}));
-
-					const responseObj = {
-						object: "list",
-						data: embeddings,
-						model: model,
-						usage: {
-							prompt_tokens: textArray.reduce((acc, text) => acc + Math.ceil(text.length / 3), 0),
-							total_tokens: textArray.reduce((acc, text) => acc + Math.ceil(text.length / 3), 0)
-						}
-					};
-					const embHeaders = { 'Content-Type': 'application/json' };
-					if (fallbackWarning) embHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
-					return new Response(JSON.stringify(responseObj), { headers: embHeaders });
-				} else {
-					lastError = `CF Run failed: ${JSON.stringify(cfJson.errors)}`;
+	const result = await callCFRunAPI(
+		cfModel,
+		(account) => ({
+			method: 'POST',
+			headers: { 'Authorization': `Bearer ${account.apiToken}`, 'Content-Type': 'application/json' },
+			body: JSON.stringify({ text: textArray }),
+			signal: AbortSignal.timeout(30000),
+		}),
+		(cfResult) => {
+			const data = cfResult.data || cfResult;
+			const embeddings = (Array.isArray(data) ? data : [data]).map((emb, index) => ({
+				object: "embedding", index, embedding: emb
+			}));
+			return {
+				object: "list", data: embeddings, model,
+				usage: {
+					prompt_tokens: textArray.reduce((acc, text) => acc + Math.ceil(text.length / 3), 0),
+					total_tokens: textArray.reduce((acc, text) => acc + Math.ceil(text.length / 3), 0)
 				}
-			} else {
-				const errorText = await cfResponse.text();
-				const status = cfResponse.status;
-				// 记录错误后继续尝试下一个账号
-				lastError = `CF API status ${status}: ${errorText}`;
-			}
-		} catch (e) {
-			lastError = `Connection error: ${e.message}`;
-		}
+			};
+		},
+		env
+	);
+
+	if (!result.success) {
+		return new Response(JSON.stringify({ error: { message: result.error, type: "server_error" } }), { status: result.status, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	return new Response(JSON.stringify({
-		error: { message: `All Cloudflare accounts failed. Last error: ${lastError}`, type: "server_error" }
-	}), { status: 502, headers: { 'Content-Type': 'application/json' } });
+	const embHeaders = { 'Content-Type': 'application/json' };
+	if (fallbackWarning) embHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+	return new Response(JSON.stringify(result.data), { headers: embHeaders });
 }
 
 // ----------------------------------------------------
@@ -1786,105 +1785,65 @@ async function handleEmbeddings(request, env) {
 // 调用 CF /ai/run/{model} 端点，返回 OpenAI Images 格式
 // ----------------------------------------------------
 async function handleImageGenerations(request, env) {
-	let body;
-	try {
-		body = await request.json();
-	} catch (e) {
+	const body = await safeJsonBody(request);
+	if (!body) {
 		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	const { model, prompt, n, size, response_format, quality, style } = body;
+	const { model, prompt, response_format } = body;
 	if (!prompt) {
 		return new Response(JSON.stringify({ error: { message: "prompt is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	// 模型映射：默认使用 flux-1-schnell
-	const { cfModel, isFallback } = await resolveModelName(model || 'flux-1-schnell', env);
-	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model || 'flux-1-schnell', env);
 
 	// 解析尺寸参数 (e.g. "1024x1024") → CF 的 width/height
 	let width = 1024, height = 1024;
-	if (size && typeof size === 'string') {
-		const parts = size.split('x');
+	if (body.size && typeof body.size === 'string') {
+		const parts = body.size.split('x');
 		if (parts.length === 2) {
 			width = parseInt(parts[0]) || 1024;
 			height = parseInt(parts[1]) || 1024;
 		}
 	}
 
-	const accounts = await getAccounts(env);
-	const activeAccounts = accounts.filter(a => a.status === 'active');
-	if (activeAccounts.length === 0) {
-		return new Response(JSON.stringify({ error: { message: "No active accounts configured", type: "server_error" } }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+	const result = await callCFRunAPI(
+		cfModel,
+		(account) => {
+			const cfPayload = { prompt, width, height };
+			if (cfModel.includes('flux')) cfPayload.num_steps = 4;
+			return {
+				method: 'POST',
+				headers: { 'Authorization': `Bearer ${account.apiToken}`, 'Content-Type': 'application/json' },
+				body: JSON.stringify(cfPayload),
+				signal: AbortSignal.timeout(60000),
+			};
+		},
+		(cfResult) => {
+			const rawImage = cfResult.image || cfResult;
+			const base64Str = typeof rawImage === 'string'
+				? rawImage
+				: btoa(String.fromCharCode(...new Uint8Array(rawImage)));
+			return {
+				created: Math.floor(Date.now() / 1000),
+				data: [{
+					[response_format === 'b64_json' ? 'b64_json' : 'url']:
+						response_format === 'b64_json' ? base64Str : `data:image/png;base64,${base64Str}`
+				}],
+			};
+		},
+		env,
+		60000
+	);
+
+	if (!result.success) {
+		return new Response(JSON.stringify({ error: { message: result.error, type: "server_error" } }), { status: result.status, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	let lastError = null;
-
-	for (const account of activeAccounts) {
-		try {
-			const cfPayload = { prompt };
-			// flux-1-schnell 支持 width/height/num_steps，sdxl 支持 width/height
-			if (cfModel.includes('flux')) {
-				cfPayload.width = width;
-				cfPayload.height = height;
-				cfPayload.num_steps = 4; // flux-1-schnell 默认 4 步
-			} else {
-				cfPayload.width = width;
-				cfPayload.height = height;
-			}
-
-			const cfResponse = await fetch(
-				`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/run/${cfModel}`,
-				{
-					method: 'POST',
-					headers: {
-						'Authorization': `Bearer ${account.apiToken}`,
-						'Content-Type': 'application/json',
-					},
-					body: JSON.stringify(cfPayload),
-					signal: AbortSignal.timeout(60000),
-				}
-			);
-
-			if (cfResponse.ok) {
-				const cfJson = await cfResponse.json();
-				if (cfJson.success && cfJson.result) {
-					// CF flux/sdxl 返回 { image: "<base64-string>" } 格式
-					const rawImage = cfJson.result.image || cfJson.result;
-					// Cloudflare Workers 没有 Buffer 全局对象，使用 btoa/atob 处理二进制→base64
-					// CF AI 图片模型通常直接返回 base64 字符串
-					const base64Str = typeof rawImage === 'string'
-						? rawImage
-						: btoa(String.fromCharCode(...new Uint8Array(rawImage)));
-
-					// CF 图片生成端点单次调用只返回 1 张图片，不支持 n>1。
-					// 即使客户端传入 n>1，也只返回 1 张，不重复同一张图。
-					const images = [{
-						[response_format === 'b64_json' ? 'b64_json' : 'url']:
-							response_format === 'b64_json' ? base64Str : `data:image/png;base64,${base64Str}`
-					}];
-
-					const imgHeaders = { 'Content-Type': 'application/json' };
-					if (fallbackWarning) imgHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
-					return new Response(JSON.stringify({
-						created: Math.floor(Date.now() / 1000),
-						data: images,
-					}), { headers: imgHeaders });
-				} else {
-					lastError = `CF Run failed: ${JSON.stringify(cfJson.errors || cfJson)}`;
-				}
-			} else {
-				const errorText = await cfResponse.text();
-				lastError = `CF API status ${cfResponse.status}: ${errorText}`;
-			}
-		} catch (e) {
-			lastError = `Connection error: ${e.message}`;
-		}
-	}
-
-	return new Response(JSON.stringify({
-		error: { message: `Image generation failed. Last error: ${lastError}`, type: "server_error" }
-	}), { status: 502, headers: { 'Content-Type': 'application/json' } });
+	const imgHeaders = { 'Content-Type': 'application/json' };
+	if (fallbackWarning) imgHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+	return new Response(JSON.stringify(result.data), { headers: imgHeaders });
 }
 
 // ----------------------------------------------------
@@ -1914,60 +1873,32 @@ async function handleAudioTranscriptions(request, env) {
 			return new Response(JSON.stringify({ error: { message: "file is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 		}
 
-		const { cfModel, isFallback } = await resolveModelName(model, env);
-		const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+		const { cfModel, fallbackWarning } = await resolveModelWithFallback(model, env);
 
-		const accounts = await getAccounts(env);
-		const activeAccounts = accounts.filter(a => a.status === 'active');
-		if (activeAccounts.length === 0) {
-			return new Response(JSON.stringify({ error: { message: "No active accounts configured", type: "server_error" } }), { status: 503, headers: { 'Content-Type': 'application/json' } });
-		}
-
-		let lastError = null;
-
-		for (const account of activeAccounts) {
-			try {
-				// 转发 multipart form 到 CF /ai/run/{model}
+		const result = await callCFRunAPI(
+			cfModel,
+			(account) => {
 				const cfFormData = new FormData();
 				cfFormData.append('audio', audioFile, audioFile.name || 'audio.wav');
+				return {
+					method: 'POST',
+					headers: { 'Authorization': `Bearer ${account.apiToken}` },
+					body: cfFormData,
+					signal: AbortSignal.timeout(120000),
+				};
+			},
+			(cfResult) => ({ text: cfResult.text || '' }),
+			env,
+			120000
+		);
 
-				const cfResponse = await fetch(
-					`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/run/${cfModel}`,
-					{
-						method: 'POST',
-						headers: {
-							'Authorization': `Bearer ${account.apiToken}`,
-						},
-						body: cfFormData,
-						signal: AbortSignal.timeout(120000),
-					}
-				);
-
-				if (cfResponse.ok) {
-					const cfJson = await cfResponse.json();
-					if (cfJson.success && cfJson.result) {
-						// CF whisper 返回 { text: "..." }
-						const transcribedText = cfJson.result.text || '';
-						const audioHeaders = { 'Content-Type': 'application/json' };
-						if (fallbackWarning) audioHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
-						return new Response(JSON.stringify({
-							text: transcribedText,
-						}), { headers: audioHeaders });
-					} else {
-						lastError = `CF Run failed: ${JSON.stringify(cfJson.errors || cfJson)}`;
-					}
-				} else {
-					const errorText = await cfResponse.text();
-					lastError = `CF API status ${cfResponse.status}: ${errorText}`;
-				}
-			} catch (e) {
-				lastError = `Connection error: ${e.message}`;
-			}
+		if (!result.success) {
+			return new Response(JSON.stringify({ error: { message: result.error, type: "server_error" } }), { status: result.status, headers: { 'Content-Type': 'application/json' } });
 		}
 
-		return new Response(JSON.stringify({
-			error: { message: `Audio transcription failed. Last error: ${lastError}`, type: "server_error" }
-		}), { status: 502, headers: { 'Content-Type': 'application/json' } });
+		const audioHeaders = { 'Content-Type': 'application/json' };
+		if (fallbackWarning) audioHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		return new Response(JSON.stringify(result.data), { headers: audioHeaders });
 	} catch (e) {
 		return new Response(JSON.stringify({ error: { message: `Failed to process audio: ${e.message}`, type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
@@ -1979,10 +1910,8 @@ async function handleAudioTranscriptions(request, env) {
 // 我们使用近似估算：英文约 4 字符/token，中文约 2 字符/token
 // ----------------------------------------------------
 async function handleCountTokens(request, env) {
-	let body;
-	try {
-		body = await request.json();
-	} catch (e) {
+	const body = await safeJsonBody(request);
+	if (!body) {
 		return new Response(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: "Invalid JSON body" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
@@ -2602,7 +2531,7 @@ async function handleDashboardApi(request, env, ctx) {
 // 前端页面处理函数（按页面拆分）
 // ----------------------------------------------------
 
-// 两个页面共享的 JS 工具函数（toast / theme）
+// 两个页面共享的 JS 工具函数（toast / theme / escapeHtml / chart legend）
 const SHARED_JS = `
 		function showToast(message, type = 'success') {
 			let container = document.querySelector('.toast-container');
@@ -2662,9 +2591,70 @@ const SHARED_JS = `
 				sunIcons.forEach(el => el.style.display = 'block');
 				moonIcons.forEach(el => el.style.display = 'none');
 			}
+		}
+
+		function escapeHtml(str) {
+			if (str === null || str === undefined) return '';
+			return String(str)
+				.replace(/&/g, '&amp;')
+				.replace(/</g, '&lt;')
+				.replace(/>/g, '&gt;')
+				.replace(/"/g, '&quot;')
+				.replace(/'/g, '&#39;');
+		}
+
+		function attrEscape(str) {
+			return JSON.stringify(String(str)).replace(/"/g, '&quot;');
+		}
+
+		// 共享的 toggleTheme（通过回调参数在主题切换后触发页面特定的重渲染）
+		function toggleTheme(onThemeChange) {
+			const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+			const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+			document.documentElement.setAttribute('data-theme', newTheme);
+			localStorage.setItem('theme', newTheme);
+			updateThemeIcons();
+			if (typeof onThemeChange === 'function') onThemeChange();
+		}
+
+		// 共享的图表 Legend 渲染函数
+		const CHART_COLORS = ['#6366f1', '#a855f7', '#ec4899', '#10b981', '#f59e0b', '#3b82f6'];
+		function renderChartLegend(legendContainer, labels, data, fullLabels) {
+			if (!legendContainer) return;
+			legendContainer.innerHTML = '';
+			const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+			const textColor = isLight ? '#64748b' : '#94a3b8';
+			const total = data.reduce((a, b) => a + b, 0);
+
+			labels.forEach((label, index) => {
+				const val = data[index];
+				const color = CHART_COLORS[index % CHART_COLORS.length];
+				const pct = total > 0 ? ((val / total) * 100).toFixed(1) : '0.0';
+				const title = fullLabels ? fullLabels[index] : label;
+
+				const item = document.createElement('div');
+				item.style.display = 'flex';
+				item.style.alignItems = 'center';
+				item.style.gap = '8px';
+				item.style.fontSize = '12px';
+				item.style.color = textColor;
+				item.style.opacity = '0';
+				item.style.transform = 'translateX(10px)';
+				item.style.transition = 'all 0.4s cubic-bezier(0.16, 1, 0.3, 1)';
+
+				item.innerHTML = '<span style="width: 8px; height: 8px; border-radius: 50%; background-color: ' + color + '; flex-shrink: 0; margin-right: 2px;"></span>' +
+					'<span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; font-weight: 500;" title="' + escapeHtml(title) + '">' + escapeHtml(label) + '</span>' +
+					'<span style="color: var(--text-muted); font-family: monospace; font-size: 11px; flex-shrink: 0; margin-left: 4px;">' + pct + '%</span>';
+
+				legendContainer.appendChild(item);
+				setTimeout(() => {
+					item.style.opacity = '1';
+					item.style.transform = 'translateX(0)';
+				}, index * 80);
+			});
 		}`;
 
-// 各页面共享的 CSS（背景装饰 orb）
+// 各页面共享的 CSS（背景装饰 orb 容器 + orb 样式 + float 动画）
 const SHARED_BG_CSS = `
 		.bg-orbs-container {
 			position: fixed;
@@ -2682,9 +2672,82 @@ const SHARED_BG_CSS = `
 			border-radius: 50%;
 			filter: blur(100px);
 			animation: float 25s infinite alternate ease-in-out;
+		}
+
+		.bg-orb-1 {
+			top: -10%;
+			left: -10%;
+			width: 50vw;
+			height: 50vw;
+			background: var(--orb-1-color);
+			animation-duration: 20s;
+		}
+
+		.bg-orb-2 {
+			bottom: -10%;
+			right: -10%;
+			width: 60vw;
+			height: 60vw;
+			background: var(--orb-2-color);
+			animation-duration: 30s;
+			animation-delay: -5s;
+		}
+
+		@keyframes float {
+			0% { transform: translate(0, 0) scale(1); }
+			50% { transform: translate(5%, 10%) scale(1.1); }
+			100% { transform: translate(-5%, -5%) scale(0.9); }
 		}`;
 
-// 两个页面共享的 CSS 变量（:root 主题色 + 通用 reset）
+// 两个页面共享的图表 wrapper CSS（含移动端响应式）
+const SHARED_CHART_CSS = `
+		.public-chart-wrapper {
+			position: relative;
+			height: 190px;
+			width: 100%;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			gap: 40px;
+			overflow: hidden;
+		}
+
+		.public-chart-wrapper canvas {
+			max-width: 100% !important;
+		}
+
+		.chart-legend {
+			scrollbar-width: none;
+			-ms-overflow-style: none;
+		}
+		.chart-legend::-webkit-scrollbar {
+			display: none;
+		}
+
+		@media (max-width: 768px) {
+			.public-chart-wrapper {
+				flex-direction: column !important;
+				height: auto !important;
+				padding: 10px 0;
+				gap: 20px !important;
+			}
+			.public-chart-wrapper > div:first-child {
+				width: 160px !important;
+				height: 160px !important;
+			}
+			.public-chart-wrapper > div:nth-child(2) {
+				width: 100% !important;
+				height: auto !important;
+				align-items: center !important;
+			}
+			.chart-legend {
+				width: 100%;
+				display: grid !important;
+				grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+				gap: 8px !important;
+				max-height: none !important;
+			}
+		}`;
 const SHARED_THEME_CSS = `
 		:root {
 			--bg-color: #0b0f19;
@@ -2804,34 +2867,6 @@ const SHARED_TOAST_CSS = `
 			color: #ffffff !important;
 		}
 `;
-
-// 背景装饰球（.bg-orb-1 / .bg-orb-2 + 统一的 float 动画）
-// 此前两个页面各写一份且 keyframes 不一致，现统一为三关键帧版本。
-const SHARED_ORB_CSS = `
-		.bg-orb-1 {
-			top: -10%;
-			left: -10%;
-			width: 50vw;
-			height: 50vw;
-			background: var(--orb-1-color);
-			animation-duration: 20s;
-		}
-
-		.bg-orb-2 {
-			bottom: -10%;
-			right: -10%;
-			width: 60vw;
-			height: 60vw;
-			background: var(--orb-2-color);
-			animation-duration: 30s;
-			animation-delay: -5s;
-		}
-
-		@keyframes float {
-			0% { transform: translate(0, 0) scale(1); }
-			50% { transform: translate(5%, 10%) scale(1.1); }
-			100% { transform: translate(-5%, -5%) scale(0.9); }
-		}`;
 
 // 统计卡片骨架（.stat-value / .stat-desc 等字号差异在各页面内覆盖）
 const SHARED_STAT_CARD_CSS = `
@@ -3030,8 +3065,6 @@ async function handleLandingPage(request, env, ctx) {
 
 		${SHARED_BG_CSS}
 
-		${SHARED_ORB_CSS}
-
 		.action-btn-group {
 			position: fixed;
 			top: 20px;
@@ -3083,46 +3116,11 @@ async function handleLandingPage(request, env, ctx) {
 			width: 100%;
 		}
 
-		.public-chart-wrapper {
-			position: relative;
-			height: 190px;
-			width: 100%;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			gap: 40px;
-			overflow: hidden;
-		}
-
-		.public-chart-wrapper canvas {
-			max-width: 100% !important;
-		}
+		${SHARED_CHART_CSS}
 
 		@media (max-width: 768px) {
 			.dashboard-grid {
 				grid-template-columns: 1fr !important;
-			}
-			.public-chart-wrapper {
-				flex-direction: column !important;
-				height: auto !important;
-				padding: 10px 0;
-				gap: 20px !important;
-			}
-			.public-chart-wrapper > div:first-child {
-				width: 160px !important;
-				height: 160px !important;
-			}
-			.public-chart-wrapper > div:nth-child(2) {
-				width: 100% !important;
-				height: auto !important;
-				align-items: center !important;
-			}
-			#public-chart-legend {
-				width: 100%;
-				display: grid !important;
-				grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
-				gap: 8px !important;
-				max-height: none !important;
 			}
 		}
 
@@ -3162,14 +3160,6 @@ async function handleLandingPage(request, env, ctx) {
 			border-radius: 50%;
 			border-top-color: var(--accent-color);
 			animation: spin 1s linear infinite;
-		}
-
-		#public-chart-legend {
-			scrollbar-width: none;
-			-ms-overflow-style: none;
-		}
-		#public-chart-legend::-webkit-scrollbar {
-			display: none;
 		}
 
 		.login-header {
@@ -3331,7 +3321,7 @@ async function handleLandingPage(request, env, ctx) {
 
 	<!-- Floating Action Buttons -->
 	<div class="action-btn-group">
-		<button class="floating-btn" onclick="toggleTheme()" title="切换日间/夜间模式">
+		<button class="floating-btn" onclick="toggleTheme(onThemeChange)" title="切换日间/夜间模式">
 			<svg class="theme-icon-sun" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none; width: 20px; height: 20px;">
 				<circle cx="12" cy="12" r="4" />
 				<path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
@@ -3395,7 +3385,7 @@ async function handleLandingPage(request, env, ctx) {
 					</div>
 					<!-- Right column: Legend list -->
 					<div style="flex: 1; display: flex; flex-direction: column; justify-content: center; min-width: 0; align-self: stretch; height: 190px;">
-						<div id="public-chart-legend" style="flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; max-height: 180px; overflow-y: auto; padding-right: 4px;"></div>
+						<div id="public-chart-legend" class="chart-legend" style="flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; max-height: 180px; overflow-y: auto; padding-right: 4px;"></div>
 					</div>
 				</div>
 				
@@ -3446,15 +3436,8 @@ async function handleLandingPage(request, env, ctx) {
 		let publicModelsChartInstance = null;
 		let lastPublicSummaryData = null;
 
-		function toggleTheme() {
-			const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-			const newTheme = currentTheme === 'light' ? 'dark' : 'light';
-			document.documentElement.setAttribute('data-theme', newTheme);
-			localStorage.setItem('theme', newTheme);
-			updateThemeIcons();
-			if (lastPublicSummaryData) {
-				renderPublicSummary(lastPublicSummaryData);
-			}
+		function onThemeChange() {
+			if (lastPublicSummaryData) renderPublicSummary(lastPublicSummaryData);
 		}
 
 		function openLoginModal() {
@@ -3554,16 +3537,12 @@ async function handleLandingPage(request, env, ctx) {
 				const chartData = sortedModelsToday.map(m => m.neurons);
 				
 				const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-				const textColor = isLight ? '#64748b' : '#94a3b8';
 				const borderColor = isLight ? '#ffffff' : '#1e293b';
 				
 				const ctx = document.getElementById('publicModelsChart').getContext('2d');
 				if (publicModelsChartInstance) {
 					publicModelsChartInstance.destroy();
 				}
-				
-				// 清空旧的 HTML Legend 标签
-				if (legendContainer) legendContainer.innerHTML = '';
 
 				publicModelsChartInstance = new Chart(ctx, {
 					type: 'doughnut',
@@ -3595,38 +3574,7 @@ async function handleLandingPage(request, env, ctx) {
 				});
 
 				// 动态且逐个淡入渲染模型说明 ID
-				if (legendContainer) {
-					const colors = ['#6366f1', '#a855f7', '#ec4899', '#10b981', '#f59e0b', '#3b82f6'];
-					const total = chartData.reduce((a, b) => a + b, 0);
-					
-					labels.forEach((label, index) => {
-						const val = chartData[index];
-						const color = colors[index % colors.length];
-						const pct = total > 0 ? ((val / total) * 100).toFixed(1) : '0.0';
-						
-						const item = document.createElement('div');
-						item.style.display = 'flex';
-						item.style.alignItems = 'center';
-						item.style.gap = '8px';
-						item.style.fontSize = '12px';
-						item.style.color = textColor;
-						item.style.opacity = '0';
-						item.style.transform = 'translateX(10px)';
-						item.style.transition = 'all 0.4s cubic-bezier(0.16, 1, 0.3, 1)';
-						
-						item.innerHTML = '<span style="width: 8px; height: 8px; border-radius: 50%; background-color: ' + color + '; flex-shrink: 0; margin-right: 2px;"></span>' +
-							'<span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; font-weight: 500;" title="' + label.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') + '">' + label.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</span>' +
-							'<span style="color: var(--text-muted); font-family: monospace; font-size: 11px; flex-shrink: 0; margin-left: 4px;">' + pct + '%</span>';
-						
-						legendContainer.appendChild(item);
-						
-						// 与环形图同时开始加载，依次淡入滑出
-						setTimeout(() => {
-							item.style.opacity = '1';
-							item.style.transform = 'translateX(0)';
-						}, index * 80);
-					});
-				}
+				renderChartLegend(legendContainer, labels, chartData);
 			} else {
 				if (wrapper) wrapper.style.display = 'none';
 				if (placeholder) {
@@ -3854,8 +3802,6 @@ async function handleAdminPage(request, env, ctx) {
 
 		/* Dynamic Background Orbs */
 		${SHARED_BG_CSS}
-
-		${SHARED_ORB_CSS}
 
 		/* Sidebar Layout */
 		.app-container {
@@ -4322,53 +4268,7 @@ async function handleAdminPage(request, env, ctx) {
 			}
 		}
 
-		.public-chart-wrapper {
-			position: relative;
-			height: 190px;
-			width: 100%;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			gap: 40px;
-			overflow: hidden;
-		}
-
-		.public-chart-wrapper canvas {
-			max-width: 100% !important;
-		}
-
-		#admin-chart-legend {
-			scrollbar-width: none;
-			-ms-overflow-style: none;
-		}
-		#admin-chart-legend::-webkit-scrollbar {
-			display: none;
-		}
-
-		@media (max-width: 768px) {
-			.public-chart-wrapper {
-				flex-direction: column !important;
-				height: auto !important;
-				padding: 10px 0;
-				gap: 20px !important;
-			}
-			.public-chart-wrapper > div:first-child {
-				width: 160px !important;
-				height: 160px !important;
-			}
-			.public-chart-wrapper > div:nth-child(2) {
-				width: 100% !important;
-				height: auto !important;
-				align-items: center !important;
-			}
-			#admin-chart-legend {
-				width: 100%;
-				display: grid !important;
-				grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
-				gap: 8px !important;
-				max-height: none !important;
-			}
-		}
+		${SHARED_CHART_CSS}
 	</style>
 </head>
 <body>
@@ -4424,7 +4324,7 @@ async function handleAdminPage(request, env, ctx) {
 			</div>
 
 			<div class="aside-footer">
-				<button class="btn btn-secondary" onclick="toggleTheme()" title="切换日间/夜间模式" style="width: 100%; display: flex; justify-content: center; gap: 8px; align-items: center;">
+				<button class="btn btn-secondary" onclick="toggleTheme(onAdminThemeChange)" title="切换日间/夜间模式" style="width: 100%; display: flex; justify-content: center; gap: 8px; align-items: center;">
 					<svg class="theme-icon-sun" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none; width: 18px; height: 18px;">
 						<circle cx="12" cy="12" r="4" />
 						<path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
@@ -4543,7 +4443,7 @@ async function handleAdminPage(request, env, ctx) {
 								</div>
 								<!-- Right: Legend -->
 								<div id="admin-legend-wrapper" style="flex: 1; display: flex; flex-direction: column; justify-content: center; min-width: 0; align-self: stretch; height: 100%;">
-									<div id="admin-chart-legend" style="flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; max-height: 260px; overflow-y: auto; padding-right: 4px;"></div>
+									<div id="admin-chart-legend" class="chart-legend" style="flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; max-height: 260px; overflow-y: auto; padding-right: 4px;"></div>
 								</div>
 								<!-- Empty Placeholder -->
 								<div id="admin-chart-placeholder" style="display: none; flex-direction: column; align-items: center; justify-content: center; height: 100%; width: 100%; color: var(--text-muted); font-size: 13px; gap: 12px; margin: auto;">
@@ -5059,15 +4959,8 @@ async function handleAdminPage(request, env, ctx) {
 			label.innerText = '最后更新: ' + yyyy + '-' + MM + '-' + dd + ' ' + hh + ':' + mm + ':' + ss;
 		}
 
-		function toggleTheme() {
-			const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-			const newTheme = currentTheme === 'light' ? 'dark' : 'light';
-			document.documentElement.setAttribute('data-theme', newTheme);
-			localStorage.setItem('theme', newTheme);
-			updateThemeIcons();
-			if (currentTab === 'overview') {
-				loadUsageDetails();
-			}
+		function onAdminThemeChange() {
+			if (currentTab === 'overview') loadUsageDetails();
 		}
 
 		initTheme();
@@ -5225,7 +5118,6 @@ async function handleAdminPage(request, env, ctx) {
 			const sortedData = combined.map(x => x.value);
 
 			const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-			const textColor = isLight ? '#64748b' : '#94a3b8';
 			const borderColor = isLight ? '#ffffff' : '#1e293b';
 			const ctx = document.getElementById('modelsChart').getContext('2d');
 			
@@ -5259,40 +5151,7 @@ async function handleAdminPage(request, env, ctx) {
 			});
 
 			// Render Custom HTML Legend for Admin Page
-			if (legendContainer) {
-				const colors = ['#6366f1', '#a855f7', '#ec4899', '#10b981', '#f59e0b', '#3b82f6'];
-				const total = sortedData.reduce((a, b) => a + b, 0);
-				
-				combined.forEach((itemData, index) => {
-					const label = itemData.cleanLabel;
-					const fullLabel = itemData.fullLabel;
-					const val = itemData.value;
-					const color = colors[index % colors.length];
-					const pct = total > 0 ? ((val / total) * 100).toFixed(1) : '0.0';
-					
-					const item = document.createElement('div');
-					item.style.display = 'flex';
-					item.style.alignItems = 'center';
-					item.style.gap = '8px';
-					item.style.fontSize = '12px';
-					item.style.color = textColor;
-					item.style.opacity = '0';
-					item.style.transform = 'translateX(10px)';
-					item.style.transition = 'all 0.4s cubic-bezier(0.16, 1, 0.3, 1)';
-					
-					item.innerHTML = '<span style="width: 8px; height: 8px; border-radius: 50%; background-color: ' + color + '; flex-shrink: 0; margin-right: 2px;"></span>' +
-						'<span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; font-weight: 500;" title="' + fullLabel.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') + '">' + label.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</span>' +
-						'<span style="color: var(--text-muted); font-family: monospace; font-size: 11px; flex-shrink: 0; margin-left: 4px;">' + pct + '%</span>';
-					
-					legendContainer.appendChild(item);
-					
-					// 与环形图同时开始加载，依次淡入滑出
-					setTimeout(() => {
-						item.style.opacity = '1';
-						item.style.transform = 'translateX(0)';
-					}, index * 80);
-				});
-			}
+			renderChartLegend(legendContainer, sortedLabels, sortedData, combined.map(x => x.fullLabel));
 		}
 
 		async function copyEndpointUrl(url) {
@@ -5385,21 +5244,6 @@ async function handleAdminPage(request, env, ctx) {
 				const err = (statusObj && statusObj.error) ? statusObj.error : '测试失败';
 			el.innerHTML = '<span style="color: #ef4444; font-weight: bold; margin-left: 6px;" title="' + escapeHtml(err) + '">🔴 无效</span>';
 			}
-		}
-
-		function escapeHtml(str) {
-			if (str === null || str === undefined) return '';
-			return String(str)
-				.replace(/&/g, '&amp;')
-				.replace(/</g, '&lt;')
-				.replace(/>/g, '&gt;')
-				.replace(/"/g, '&quot;')
-				.replace(/'/g, '&#39;');
-		}
-
-		// 对 HTML 属性中 JS 字符串字面量的值做转义（用于 onclick 等内联属性）
-		function attrEscape(str) {
-			return JSON.stringify(String(str)).replace(/"/g, '&quot;');
 		}
 
 		function setAlertStyle(el, type) {
