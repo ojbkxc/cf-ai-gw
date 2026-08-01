@@ -10,12 +10,306 @@ const DEFAULT_MONTHLY_LIMIT = 100000;
 const DEFAULT_USAGE_THRESHOLD = 0; // 0 表示关闭限额拦截（仅统计不拦截）
 
 // 缓存与刷新常量
-const USAGE_CACHE_TTL_MS = 300000;
-const USAGE_REFRESH_LIMIT = 20;
+const USAGE_CACHE_TTL_MS = 600000; // 从 5min 增加到 10min，减少检测频率
+const USAGE_REFRESH_LIMIT = 10; // 从 20 减少到 10，每次刷新更少账号
 const MONTHLY_USAGE_TTL_SEC = 38 * 24 * 60 * 60;
 const MODEL_CREATED_TS = 1686935000;
 
-// Token 统计：从 CF 响应 usage 字段实时累加写入 KV
+// 随机 User-Agent 池，模拟真实浏览器请求，避免被识别为自动化脚本
+const USER_AGENTS = [
+	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+	'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+	'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+];
+
+function randomUA() {
+	return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+// 随机延迟（用于账号切换时的短暂暂停，避免被检测到连续请求模式）
+function randomDelay(minMs = 200, maxMs = 1500) {
+	const delay = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+	return new Promise(r => setTimeout(r, delay));
+}
+
+// ===== 参照 cloudflare_ai 实现的错误分类体系 =====
+// 将 HTTP 状态码分类为可读的错误类型，附带是否可重试的提示
+function classifyStatus(status) {
+	if (status === 401 || status === 403) return { code: 'auth', recoverable: false };
+	if (status === 429) return { code: 'rate-limit', recoverable: true };
+	if (status === 404) return { code: 'not-found', recoverable: false };
+	if (status === 400 || status === 422) return { code: 'bad-request', recoverable: false };
+	if (status >= 500) return { code: 'provider-error', recoverable: true };
+	return { code: 'unknown', recoverable: false };
+}
+
+// 从各种错误响应体中提取人类可读的错误信息
+// 支持 CF 网关格式: { errors: [{ code, message }] }
+// 提供商格式: { error: { message } } / { error: "..." } / { message }
+function extractErrorMessage(raw) {
+	if (typeof raw === 'string') {
+		const trimmed = raw.trim();
+		if (!trimmed) return undefined;
+		try {
+			return extractErrorMessage(JSON.parse(trimmed));
+		} catch {
+			return trimmed.slice(0, 500);
+		}
+	}
+	if (!raw || typeof raw !== 'object') return undefined;
+	const obj = raw;
+	// CF 网关格式
+	if (Array.isArray(obj.errors) && obj.errors.length > 0) {
+		const first = obj.errors[0];
+		if (typeof first?.message === 'string') return first.message;
+	}
+	// 提供商格式
+	if (obj.error && typeof obj.error === 'object') {
+		const err = obj.error;
+		if (typeof err.message === 'string') return err.message;
+	}
+	if (typeof obj.error === 'string') return obj.error;
+	if (typeof obj.message === 'string') return obj.message;
+	return undefined;
+}
+
+// ===== 参照 cloudflare_ai 实现的响应文本提取 =====
+// 处理多种 Workers AI 响应格式:
+// - OpenAI 格式: { choices: [{ message: { content: "..." } }] }
+// - 原生格式: { response: "..." }
+// - 结构化输出: { response: { ... } } (对象转JSON)
+// - 数值: { response: 42 }
+function processText(output) {
+	const choices = output.choices;
+	if (choices && choices[0]?.message?.content) {
+		return String(choices[0].message.content);
+	}
+	if ('response' in output) {
+		const response = output.response;
+		if (typeof response === 'object' && response !== null) {
+			return JSON.stringify(response);
+		}
+		if (typeof response === 'number') return String(response);
+		if (response === null || response === undefined) return undefined;
+		return String(response);
+	}
+	return undefined;
+}
+
+// ===== 参照 cloudflare_ai 实现的 binary 输出统一处理 =====
+// 将各种输出格式统一转换为 Uint8Array
+// 处理: Uint8Array, ArrayBuffer, ReadableStream, Response, { image: base64 }, { audio: base64 }
+async function toUint8Array(output) {
+	if (output instanceof Uint8Array) return output;
+	if (output instanceof ArrayBuffer) return new Uint8Array(output);
+	if (output instanceof ReadableStream) {
+		const reader = output.getReader();
+		const chunks = [];
+		let totalLength = 0;
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			chunks.push(value);
+			totalLength += value.length;
+		}
+		const result = new Uint8Array(totalLength);
+		let offset = 0;
+		for (const chunk of chunks) {
+			result.set(chunk, offset);
+			offset += chunk.length;
+		}
+		return result;
+	}
+	if (output instanceof Response) {
+		return new Uint8Array(await output.arrayBuffer());
+	}
+	if (typeof output === 'object' && output !== null) {
+		const obj = output;
+		if (typeof obj.image === 'string') {
+			return Uint8Array.from(atob(obj.image), c => c.charCodeAt(0));
+		}
+		if (typeof obj.audio === 'string') {
+			return Uint8Array.from(atob(obj.audio), c => c.charCodeAt(0));
+		}
+		if (obj.data instanceof Uint8Array) return obj.data;
+		if (obj.data instanceof ArrayBuffer) return new Uint8Array(obj.data);
+	}
+	throw new Error(`Unexpected output type: ${Object.prototype.toString.call(output)}`);
+}
+
+// ===== 可恢复流（客户端断点续传） =====
+// 跟踪 SSE 事件边界，在流中断时自动重连。
+// 由于 CF API 不支持服务端断点续传，重连时重新拉取完整请求，
+// 然后通过事件计数跳过已发出的 SSE 事件，避免下游输出重复。
+// 支持最多 5 次重连，每次重连间隔递增。
+function createResumableStream(reader, options) {
+	const {
+		createRetryFetch,   // (emittedEvents, reconnects) => Promise<ReadableStream>
+		maxReconnects = 5,
+		onResumeExpired = 'error',
+		onProgress,
+		signal,
+	} = options;
+
+	// 已成功发出的完整 SSE 事件数（绝对计数）
+	let emittedEvents = 0;
+	// 重连后需要跳过的事件数（= 重连前已发出的事件数）
+	let skipCount = 0;
+	let pending = new Uint8Array(0);
+	let reconnects = 0;
+	let canceled = false;
+	let currentReader = reader;
+
+	const isAborted = () => canceled || (signal && signal.aborted);
+
+	function lastEventBoundary(buf) {
+		for (let i = buf.length - 2; i >= 0; i--) {
+			if (buf[i] === 0x0a && buf[i + 1] === 0x0a) return i + 2;
+		}
+		return -1;
+	}
+
+	function countEvents(buf) {
+		let n = 0;
+		for (let i = 0; i + 1 < buf.length; i++) {
+			if (buf[i] === 0x0a && buf[i + 1] === 0x0a) {
+				n++;
+				i++;
+			}
+		}
+		return n;
+	}
+
+	// 找到第 eventIndex 个 SSE 事件边界的位置（0-based）
+	// 返回边界后的第一个字节位置
+	function findNthBoundary(buf, eventIndex) {
+		let n = 0;
+		for (let i = 0; i + 1 < buf.length; i++) {
+			if (buf[i] === 0x0a && buf[i + 1] === 0x0a) {
+				if (n === eventIndex) return i + 2;
+				n++;
+				i++;
+			}
+		}
+		return -1;
+	}
+
+	function concat(a, b) {
+		const out = new Uint8Array(a.length + b.length);
+		out.set(a, 0);
+		out.set(b, a.length);
+		return out;
+	}
+
+	return new ReadableStream({
+		async pull(controller) {
+			while (true) {
+				if (isAborted()) {
+					try { controller.close(); } catch (_) {}
+					return;
+				}
+
+				try {
+					const { done, value } = await currentReader.read();
+					if (done) {
+						if (pending.length > 0) {
+							controller.enqueue(pending);
+						}
+						controller.close();
+						return;
+					}
+					if (!value || value.length === 0) continue;
+
+					pending = concat(pending, value);
+					const boundary = lastEventBoundary(pending);
+					if (boundary > 0) {
+						const complete = pending.slice(0, boundary);
+
+						if (skipCount > 0) {
+							// 重连后跳过已发出的事件
+							const eventCount = countEvents(complete);
+							if (eventCount <= skipCount) {
+								// 整块都在跳过范围内
+								skipCount -= eventCount;
+								pending = pending.slice(boundary);
+								continue; // 继续读取，不返回（当前块全部跳过）
+							} else {
+								// 部分跳过，部分需要发送
+								const skipBoundary = findNthBoundary(complete, skipCount);
+								if (skipBoundary > 0) {
+									const toEmit = complete.slice(skipBoundary);
+									controller.enqueue(toEmit);
+									const emitted = countEvents(toEmit);
+									emittedEvents += emitted;
+									if (onProgress) onProgress(emittedEvents);
+									skipCount = 0;
+								} else {
+									// 理论上不会发生，兜底全跳
+									skipCount = 0;
+								}
+								pending = pending.slice(boundary);
+							}
+						} else {
+							controller.enqueue(complete);
+							emittedEvents += countEvents(complete);
+							if (onProgress) onProgress(emittedEvents);
+							pending = pending.slice(boundary);
+						}
+					}
+					// 每收到一个 chunk 就返回，允许下游消费
+					return;
+				} catch (err) {
+					if (isAborted()) {
+						try { controller.close(); } catch (_) {}
+						return;
+					}
+
+					if (reconnects >= maxReconnects) {
+						console.error(`[ResumableStream] Exceeded ${maxReconnects} reconnects at event ${emittedEvents}.`);
+						if (onResumeExpired === 'accept-partial') {
+							try { controller.close(); } catch (_) {}
+						} else {
+							controller.error(new Error(`Stream broken after ${maxReconnects} reconnects at event ${emittedEvents}.`));
+						}
+						return;
+					}
+
+					reconnects++;
+					console.warn(`[ResumableStream] Stream broken at event ${emittedEvents}, reconnecting (attempt ${reconnects}/${maxReconnects})...`);
+
+					// 丢弃未完成的部分
+					pending = new Uint8Array(0);
+					// 重连后需要跳过已发出的事件
+					skipCount = emittedEvents;
+
+					try {
+						const newStream = await createRetryFetch(emittedEvents, reconnects);
+						if (!newStream) {
+							controller.error(new Error('Resume fetch returned no stream.'));
+							return;
+						}
+						currentReader = newStream.getReader();
+					} catch (fetchErr) {
+						controller.error(fetchErr);
+						return;
+					}
+				}
+			}
+		},
+		cancel(reason) {
+			canceled = true;
+			if (currentReader) {
+				currentReader.cancel(reason).catch(() => {});
+			}
+		},
+	});
+}
+
+// ===== Token 统计（参照 cloudflare_ai 的 mapWorkersAIUsage 模式） =====
+
+// 格式化 token 数为可读形式
 function fmtTok(n) {
 	if (n < 1000) return String(n);
 	if (n < 1000000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
@@ -25,27 +319,67 @@ function fmtTok(n) {
 
 const TOKEN_KV_TTL_SEC = 86400 * 2;    // KV 键保留 2 天
 
-// 获取今日 token 统计的 KV 键名（按 UTC 日期）
+// 获取 token 统计 KV 键名
 function getTokenDailyKey() {
 	return `tokens_daily_${new Date().toISOString().split('T')[0]}`;
 }
 
+// 获取月度 token 统计 KV 键名
+function getTokenMonthlyKey() {
+	const d = new Date();
+	return `tokens_monthly_${d.getFullYear()}_${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+// 参照 cloudflare_ai 的 mapWorkersAIUsage，从 CF 响应中提取完整的 usage 信息
+// 处理多种格式: { usage: { prompt_tokens, completion_tokens, ... } }
+//            或 { result: { usage: ... } }
+// 支持 prompt_tokens_details.cached_tokens（云flare_ai 的标准方式）
+function extractUsage(response) {
+	const usage = response.usage || response.result?.usage || {};
+	const promptDetails = usage.prompt_tokens_details || {};
+	return {
+		input: usage.prompt_tokens || usage.inputTokens || 0,
+		output: usage.completion_tokens || usage.outputTokens || 0,
+		// 推理 token 统计（推理模型特有）
+		reasoning: usage.reasoning_tokens || 0,
+		total: usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0),
+		// 缓存信息（cloudflare_ai 标准格式）
+		cacheRead: promptDetails.cached_tokens || usage.cache_read_tokens || usage.cacheReadTokens || 0,
+		cacheWrite: usage.cache_write_tokens || usage.cacheWriteTokens || 0,
+	};
+}
+
 // 累加 token 直接写入 KV（无内存缓冲，避免冷启动丢失）
 // 用 ctx.waitUntil() 后台执行，不阻塞响应
-async function accumulateTokens(env, ctx, { input = 0, output = 0, durationSec = 0 }) {
+// 参照 cloudflare_ai 的 mapWorkersAIUsage 格式，增加了 reasoning/cache 字段
+async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0, cacheRead = 0, cacheWrite = 0, durationSec = 0 }) {
 	ctx.waitUntil((async () => {
 		try {
-			const key = getTokenDailyKey();
-			const raw = await env.KV.get(key);
-			const cur = raw ? JSON.parse(raw) : { input: 0, output: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0 };
+			// 今日统计
+			const dailyKey = getTokenDailyKey();
+			const raw = await env.KV.get(dailyKey);
+			const cur = raw ? JSON.parse(raw) : { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0 };
 			cur.input += input;
 			cur.output += output;
+			cur.reasoning = (cur.reasoning || 0) + reasoning;
+			cur.cacheRead = (cur.cacheRead || 0) + cacheRead;
+			cur.cacheWrite = (cur.cacheWrite || 0) + cacheWrite;
 			cur.requests += 1;
 			if (durationSec > 0 && output > 0) {
 				cur.tokPerSecSum = (cur.tokPerSecSum || 0) + Math.round(output / durationSec);
 				cur.tokPerSecCount = (cur.tokPerSecCount || 0) + 1;
 			}
-			await env.KV.put(key, JSON.stringify(cur), { expirationTtl: TOKEN_KV_TTL_SEC });
+			await env.KV.put(dailyKey, JSON.stringify(cur), { expirationTtl: TOKEN_KV_TTL_SEC });
+
+			// 月度统计（累加模式）
+			const monthlyKey = getTokenMonthlyKey();
+			const monthlyRaw = await env.KV.get(monthlyKey);
+			const monthly = monthlyRaw ? JSON.parse(monthlyRaw) : { input: 0, output: 0, reasoning: 0, requests: 0 };
+			monthly.input += input;
+			monthly.output += output;
+			monthly.reasoning = (monthly.reasoning || 0) + reasoning;
+			monthly.requests += 1;
+			await env.KV.put(monthlyKey, JSON.stringify(monthly), { expirationTtl: 32 * 86400 });
 		} catch (e) {
 			console.error('Failed to accumulate tokens:', e?.message || e);
 		}
@@ -55,7 +389,7 @@ async function accumulateTokens(env, ctx, { input = 0, output = 0, durationSec =
 // 从 KV 读取今日 token 统计
 async function getTodayTokenStats(env) {
 	const key = getTokenDailyKey();
-	let kvData = { input: 0, output: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0 };
+	let kvData = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0 };
 	try {
 		const raw = await env.KV.get(key);
 		if (raw) kvData = JSON.parse(raw);
@@ -66,10 +400,32 @@ async function getTodayTokenStats(env) {
 	return {
 		input: kvData.input || 0,
 		output: kvData.output || 0,
+		reasoning: kvData.reasoning || 0,
+		cacheRead: kvData.cacheRead || 0,
+		cacheWrite: kvData.cacheWrite || 0,
 		total: (kvData.input || 0) + (kvData.output || 0),
 		requests: kvData.requests || 0,
 		avgTokPerSec,
 	};
+}
+
+// 获取月度 token 统计
+async function getMonthlyTokenStats(env) {
+	const key = getTokenMonthlyKey();
+	try {
+		const raw = await env.KV.get(key);
+		if (raw) {
+			const data = JSON.parse(raw);
+			return {
+				input: data.input || 0,
+				output: data.output || 0,
+				reasoning: data.reasoning || 0,
+				requests: data.requests || 0,
+				total: (data.input || 0) + (data.output || 0),
+			};
+		}
+	} catch (e) { console.error('Failed to read monthly token stats:', e?.message || e); }
+	return { input: 0, output: 0, reasoning: 0, requests: 0, total: 0 };
 }
 
 // 找不到模型映射时的兜底模型（resolveModelName 与 DEFAULT_MODEL_MAP 共用，改默认模型只改这里）
@@ -136,6 +492,8 @@ const CF_OWNER_MAP = [
 export default {
 	async fetch(request, env, ctx) {
 		try {
+			// 清空请求级缓存，确保每次请求独立
+			clearRequestCache();
 			// 1. 检查是否绑定了 KV 存储
 			if (!env.KV) {
 				const url = new URL(request.url);
@@ -261,47 +619,113 @@ async function sha256(message) {
 	return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+// 请求级缓存：同一请求内复用 KV 读取结果，避免重复读取
+let _accountsCache = null;
+let _accountsPromise = null;
+let _apiKeysCache = null;
+let _apiKeysPromise = null;
+let _modelMapCache = null;
+let _modelMapPromise = null;
+let _limitsCache = null;
+let _limitsPromise = null;
+
+function clearRequestCache() {
+	_accountsCache = null;
+	_accountsPromise = null;
+	_apiKeysCache = null;
+	_apiKeysPromise = null;
+	_modelMapCache = null;
+	_modelMapPromise = null;
+	_limitsCache = null;
+	_limitsPromise = null;
+}
+
 // KV 工具函数：配置拆分为独立键，避免单键放大
 async function getAccounts(env) {
-	const raw = await env.KV.get('cfg_accounts', { cacheTtl: 60 });
-	if (!raw) return [];
-	try { return JSON.parse(raw); } catch { return []; }
+	if (_accountsCache !== null) return _accountsCache;
+	if (_accountsPromise) return _accountsPromise;
+	_accountsPromise = (async () => {
+		const raw = await env.KV.get('cfg_accounts', { cacheTtl: 60 });
+		if (!raw) return [];
+		try { return JSON.parse(raw); } catch { return []; }
+	})();
+	try {
+		_accountsCache = await _accountsPromise;
+		return _accountsCache;
+	} finally {
+		_accountsPromise = null;
+	}
 }
 
 async function saveAccounts(env, accounts) {
 	await env.KV.put('cfg_accounts', JSON.stringify(accounts));
+	_accountsCache = accounts; // 更新缓存
 	await env.KV.delete('cache_usage_summary'); // 清除用量统计的缓存
 }
 
 async function getApiKeys(env) {
-	const raw = await env.KV.get('cfg_api_keys', { cacheTtl: 60 });
-	if (!raw) return [];
-	try { return JSON.parse(raw); } catch { return []; }
+	if (_apiKeysCache !== null) return _apiKeysCache;
+	if (_apiKeysPromise) return _apiKeysPromise;
+	_apiKeysPromise = (async () => {
+		const raw = await env.KV.get('cfg_api_keys', { cacheTtl: 60 });
+		if (!raw) return [];
+		try { return JSON.parse(raw); } catch { return []; }
+	})();
+	try {
+		_apiKeysCache = await _apiKeysPromise;
+		return _apiKeysCache;
+	} finally {
+		_apiKeysPromise = null;
+	}
 }
 
 async function saveApiKeys(env, keys) {
 	await env.KV.put('cfg_api_keys', JSON.stringify(keys));
+	_apiKeysCache = keys; // 更新缓存
 }
 
 async function getCustomModelMap(env) {
-	const raw = await env.KV.get('cfg_model_map', { cacheTtl: 60 });
-	if (!raw) return {};
-	try { return JSON.parse(raw); } catch { return {}; }
+	if (_modelMapCache !== null) return _modelMapCache;
+	if (_modelMapPromise) return _modelMapPromise;
+	_modelMapPromise = (async () => {
+		const raw = await env.KV.get('cfg_model_map', { cacheTtl: 60 });
+		if (!raw) return {};
+		try { return JSON.parse(raw); } catch { return {}; }
+	})();
+	try {
+		_modelMapCache = await _modelMapPromise;
+		return _modelMapCache;
+	} finally {
+		_modelMapPromise = null;
+	}
 }
 
 async function saveCustomModelMap(env, map) {
 	await env.KV.put('cfg_model_map', JSON.stringify(map));
+	_modelMapCache = map; // 更新缓存
 }
 
 async function getUsageLimitsConfig(env) {
-	const raw = await env.KV.get('cfg_limits', { cacheTtl: 60 });
-	if (!raw) return {};
-	try { return JSON.parse(raw); } catch { return {}; }
+	if (_limitsCache !== null) return _limitsCache;
+	if (_limitsPromise) return _limitsPromise;
+	_limitsPromise = (async () => {
+		const raw = await env.KV.get('cfg_limits', { cacheTtl: 60 });
+		if (!raw) return {};
+		try { return JSON.parse(raw); } catch { return {}; }
+	})();
+	try {
+		_limitsCache = await _limitsPromise;
+		return _limitsCache;
+	} finally {
+		_limitsPromise = null;
+	}
 }
 
 async function saveUsageLimitsConfig(env, limits) {
 	const existing = await getUsageLimitsConfig(env);
-	await env.KV.put('cfg_limits', JSON.stringify({ ...existing, ...limits }));
+	const merged = { ...existing, ...limits };
+	await env.KV.put('cfg_limits', JSON.stringify(merged));
+	_limitsCache = merged; // 更新缓存
 }
 
 const COOKIE_TOKEN_RE = /admin_token=([^;]+)/;
@@ -368,6 +792,9 @@ function jsonError(message, status = 500, type = 'server_error') {
 
 // 从 CF API 错误响应中提取可读的错误消息
 function extractCleanCFError(errorText) {
+	// 使用 extractErrorMessage 统一处理多种错误格式
+	const extracted = extractErrorMessage(errorText);
+	if (extracted) return extracted;
 	try {
 		const errJson = JSON.parse(errorText);
 		let msg = errJson.errors?.[0]?.message || errorText;
@@ -382,15 +809,28 @@ function extractCleanCFError(errorText) {
 	}
 }
 
-// 带超时的流读取：reader.read() 本身没有超时机制，
-// 如果上游 CF API 流式传输中途挂起，Worker 会一直等待直到 CPU 时间限制被强制终止。
-// 此函数通过 Promise.race 在规定时间内未读到数据则抛超时异常。
+// 带超时的流读取（初始读取）：用于首次预读校验。
+// 超时时会取消 reader，避免后续无效等待。
 function readWithTimeout(reader, timeoutMs) {
 	let timer;
 	const read = reader.read();
 	const timeout = new Promise((_, reject) => {
 		timer = setTimeout(() => {
 			try { reader.cancel(); } catch (_) {}
+			reject(new Error('Initial read timed out'));
+		}, timeoutMs);
+	});
+	return Promise.race([read, timeout]).finally(() => clearTimeout(timer));
+}
+
+// 带超时的流读取（持续读取）：用于流式传输过程中的持续读取。
+// 超时时不会取消 reader，而是抛出可重试的错误，避免中断活跃流。
+// 适合推理模型长时间思考、输出间隔大的场景。
+function readStreamWithTimeout(reader, timeoutMs) {
+	let timer;
+	const read = reader.read();
+	const timeout = new Promise((_, reject) => {
+		timer = setTimeout(() => {
 			reject(new Error('Stream read timed out'));
 		}, timeoutMs);
 	});
@@ -711,7 +1151,8 @@ async function queryGraphQL(accountId, apiToken, startDateTime) {
 		method: 'POST',
 		headers: {
 			'Authorization': `Bearer ${apiToken}`,
-			'Content-Type': 'application/json'
+			'Content-Type': 'application/json',
+			'User-Agent': randomUA(),
 		},
 		body: JSON.stringify({
 			query,
@@ -864,15 +1305,15 @@ async function handleV1Proxy(request, env, ctx) {
 	}
 
 	if (url.pathname === '/v1/images/generations' && request.method === 'POST') {
-		return handleImageGenerations(request, env);
+		return handleImageGenerations(request, env, ctx);
 	}
 
 	if (url.pathname === '/v1/audio/transcriptions' && request.method === 'POST') {
-		return handleAudioTranscriptions(request, env);
+		return handleAudioTranscriptions(request, env, ctx);
 	}
 
 	if (url.pathname === '/v1/audio/speech' && request.method === 'POST') {
-		return handleAudioSpeech(request, env);
+		return handleAudioSpeech(request, env, ctx);
 	}
 
 	if (url.pathname === '/v1/messages/count_tokens' && request.method === 'POST') {
@@ -883,7 +1324,55 @@ async function handleV1Proxy(request, env, ctx) {
 }
 
 // 可复用的核心 API 调用：OpenAI Chat Completions → CF AI 网关，支持多账号 failover
-async function callOpenAICompatibleAPI(cfPayload, env, stream) {
+// 从客户端请求头透传到上游的 cf-aig-* 头（零延迟开销，仅携带元数据）
+// 参照 cloudflare_ai 的 applyGatewayCacheHeaders 实现，补充了缓存/重试/日志等控制头
+const CF_AIG_PASSTHROUGH_HEADERS = [
+	// 日志与追踪（零延迟）
+	'cf-aig-event-id',       // 事件追踪 ID
+	'cf-aig-metadata',       // 日志元数据 (JSON)
+	'cf-aig-collect-log',    // 是否记录日志 (true/false)
+	'cf-aig-run-id',         // 可恢复流运行 ID（输出响应头）
+	// 上游超时控制（零延迟，仅控制上游超时时间）
+	'cf-aig-request-timeout', // 上游超时 (ms)
+	// 缓存控制（零延迟或加速）
+	'cf-aig-cache-ttl',      // 缓存 TTL (秒)
+	'cf-aig-cache-key',      // 自定义缓存键
+	'cf-aig-skip-cache',     // 跳过缓存 (true)
+	// 重试控制（仅在失败时生效，无延迟代价）
+	'cf-aig-max-attempts',   // 最大重试次数
+	'cf-aig-retry-delay',    // 重试间隔 (ms)
+	'cf-aig-backoff',        // 退避策略 (constant/linear/exponential)
+	// 高级控制
+	'cf-aig-byok-alias',     // BYOK 密钥别名
+	'cf-aig-zdr',            // 零数据保留 (true/false)
+];
+
+// 从客户端请求头中提取 cf-aig-* 头，用于透传到上游
+function pickCfAigHeaders(headers) {
+	if (!headers) return {};
+	const picked = {};
+	for (const key of CF_AIG_PASSTHROUGH_HEADERS) {
+		const val = headers.get(key);
+		if (val) picked[key] = val;
+	}
+	return picked;
+}
+
+// 从上游响应头中提取 cf-aig-* 头，用于透传到客户端响应
+// 这些是 AI Gateway 返回的元数据头（如运行 ID、事件追踪等）
+function pickCfAigResponseHeaders(headers) {
+	if (!headers) return {};
+	const picked = {};
+	// cf-aig-* 响应头通常包含运行 ID、事件追踪、元数据等
+	for (const [key, val] of headers) {
+		if (key.startsWith('cf-aig-')) {
+			picked[key] = val;
+		}
+	}
+	return picked;
+}
+
+async function callOpenAICompatibleAPI(cfPayload, env, stream, incomingHeaders) {
 	const accounts = await getAccounts(env);
 	const activeAccounts = accounts.filter(a => a.status === 'active');
 	if (activeAccounts.length === 0) {
@@ -892,8 +1381,14 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 
 	let lastError = null;
 	let lastStatus = 502; // 记录最后一次上游 HTTP 状态码，用于透传给客户端（区分 429 限流 / 5xx 故障等）
+	let accountIndex = 0;
 
 	for (const account of activeAccounts) {
+		// 非第一个账号时，添加随机延迟后再切换，避免被检测到连续请求模式
+		if (accountIndex > 0) {
+			await randomDelay(300, 2000);
+		}
+		accountIndex++;
 		try {
 			// 流式超时 5min，非流式 60s（大上下文处理需要更长时间）
 			const timeoutMs = stream ? 300000 : 60000;
@@ -904,6 +1399,8 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 					headers: {
 						'Authorization': `Bearer ${account.apiToken}`,
 						'Content-Type': 'application/json',
+						'User-Agent': randomUA(),
+						...pickCfAigHeaders(incomingHeaders),
 					},
 					body: JSON.stringify(cfPayload),
 					signal: AbortSignal.timeout(timeoutMs),
@@ -911,6 +1408,8 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 			);
 
 			if (cfResponse.ok) {
+			// 捕获上游 cf-aig-* 响应头，透传给客户端
+			const aigRespHeaders = pickCfAigResponseHeaders(cfResponse.headers);
 			if (stream) {
 				if (!cfResponse.body) {
 					lastError = `CF API returned empty response body`;
@@ -918,8 +1417,9 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 				}
 				// 预读第一个 chunk 校验响应格式，
 				// 避免 CF 返回 HTTP 200 + {"success":false,...} 错误体被当作 SSE 流处理
+				// 推理模型首 token 可能较长，用 120s 超时
 				const streamReader = cfResponse.body.getReader();
-				const firstResult = await readWithTimeout(streamReader, 60000);
+				const firstResult = await readWithTimeout(streamReader, 120000);
 				if (firstResult.done) {
 					lastError = `CF API returned empty stream`;
 					continue;
@@ -938,22 +1438,67 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 					lastError = `CF API error: ${extractCleanCFError(errBody)}`;
 					continue;
 				}
-				// 是有效的 SSE 流，重新包装流（把预读的 chunk 放回去）
-				const wrappedStream = new ReadableStream({
-					start(controller) { controller.enqueue(firstResult.value); },
-					async pull(controller) {
-						try {
-							const { value, done } = await readWithTimeout(streamReader, 60000);
-							if (done) controller.close();
-							else controller.enqueue(value);
-						} catch (e) { console.error('wrappedStream pull error:', e?.message || e); try { controller.close(); } catch (_) {} }
+				// 是有效的 SSE 流，使用可恢复流包装（断点续传 + 事件边界对齐）
+				// 创建一个包装 reader，先把预读的 chunk 返回，再委托给真实 streamReader
+				const prependReader = {
+					_firstChunk: firstResult.value,
+					_firstDone: false,
+					_reader: streamReader,
+					async read() {
+						if (!this._firstDone) {
+							this._firstDone = true;
+							return { value: this._firstChunk, done: false };
+						}
+						return this._reader.read();
 					},
-					cancel() { try { streamReader.cancel(); } catch (e) { console.error('wrappedStream cancel error:', e?.message || e); } }
+					cancel(reason) {
+						try { this._reader.cancel(reason); } catch (_) {}
+					},
+					releaseLock() {
+						try { this._reader.releaseLock(); } catch (_) {}
+					},
+				};
+
+				// 保存当前账号信息，供重连时使用
+				const retryAccount = account;
+				const retryPayload = cfPayload;
+				const retryHeaders = incomingHeaders;
+
+				const resumableStream = createResumableStream(prependReader, {
+					createRetryFetch: async (emittedEvents, reconnectAttempt) => {
+						// 重连前等待，间隔递增（1s, 2s, 3s, 4s, 5s）
+						await new Promise(r => setTimeout(r, Math.min(1000 * reconnectAttempt, 5000)));
+						console.warn(`[ResumableStream] Re-fetching request (attempt ${reconnectAttempt}) at event ${emittedEvents}...`);
+						const retryResponse = await fetch(
+							`https://api.cloudflare.com/client/v4/accounts/${retryAccount.accountId}/ai/v1/chat/completions`,
+							{
+								method: 'POST',
+								headers: {
+									'Authorization': `Bearer ${retryAccount.apiToken}`,
+									'Content-Type': 'application/json',
+									'User-Agent': randomUA(),
+									...pickCfAigHeaders(retryHeaders),
+								},
+								body: JSON.stringify(retryPayload),
+								signal: AbortSignal.timeout(300000),
+							}
+						);
+						if (!retryResponse.ok || !retryResponse.body) {
+							console.error(`[ResumableStream] Retry fetch failed (status ${retryResponse.status})`);
+							return null;
+						}
+						return retryResponse.body;
+					},
+					maxReconnects: 5,
+					onResumeExpired: 'accept-partial',
+					onProgress: (eventOffset) => {
+						// 可选的进度回调，供日志或监控使用
+					},
 				});
-				return { success: true, status: cfResponse.status, stream: wrappedStream };
+				return { success: true, status: cfResponse.status, stream: resumableStream, aigResponseHeaders: aigRespHeaders };
 			}
 				const cfJson = await cfResponse.json();
-				return { success: true, status: cfResponse.status, data: cfJson };
+				return { success: true, status: cfResponse.status, data: cfJson, aigResponseHeaders: aigRespHeaders };
 			}
 
 			const errorText = await cfResponse.text();
@@ -986,8 +1531,8 @@ async function resolveModelName(model, env) {
 
 // 通用的 CF /ai/run/{model} failover 调用函数
 // 用于 embeddings、images、audio 等非 chat 端点，统一多账号 failover 逻辑
-// timeout 参数传递给 buildPayload 回调使用（各端点在 cfPayload 中设置 AbortSignal.timeout）
-async function callCFRunAPI(cfModel, buildPayload, processResult, env) {
+// 最后一个参数 incomingHeaders 可选，用于透传 cf-aig-* 请求头
+async function callCFRunAPI(cfModel, buildPayload, processResult, env, incomingHeaders) {
 	const accounts = await getAccounts(env);
 	const activeAccounts = accounts.filter(a => a.status === 'active');
 	if (activeAccounts.length === 0) {
@@ -995,9 +1540,22 @@ async function callCFRunAPI(cfModel, buildPayload, processResult, env) {
 	}
 
 	let lastError = null;
+	let accountIndex = 0;
 	for (const account of activeAccounts) {
+		// 非第一个账号时，添加随机延迟后再切换
+		if (accountIndex > 0) {
+			await randomDelay(300, 2000);
+		}
+		accountIndex++;
 		try {
 			const cfPayload = buildPayload(account);
+			// 注入随机 User-Agent 和 cf-aig-* 头
+			cfPayload.headers = cfPayload.headers || {};
+			cfPayload.headers['User-Agent'] = randomUA();
+			if (incomingHeaders) {
+				const aigHeaders = pickCfAigHeaders(incomingHeaders);
+				Object.assign(cfPayload.headers, aigHeaders);
+			}
 			const cfResponse = await fetch(
 				`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/run/${cfModel}`,
 				cfPayload
@@ -1061,6 +1619,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 		'logprobs', 'top_logprobs', 'seed', 'user',
 		'tools', 'tool_choice', 'parallel_tool_calls',
 		'response_format', 'stream_options',
+		'reasoning_effort', 'chat_template_kwargs',
 	];
 	for (const field of passthroughFields) {
 		if (body[field] !== undefined) cfPayload[field] = body[field];
@@ -1070,7 +1629,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 		cfPayload.stream_options = { include_usage: true };
 	}
 
-	const result = await callOpenAICompatibleAPI(cfPayload, env, stream);
+	const result = await callOpenAICompatibleAPI(cfPayload, env, stream, request.headers);
 
 	if (!result.success) {
 		return jsonError(result.error, result.status || 502, "server_error");
@@ -1083,17 +1642,26 @@ async function handleCompletions(request, env, ctx, pathname) {
 			'Cache-Control': 'no-cache',
 		};
 		if (fallbackWarning) streamHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		// 透传上游 cf-aig-* 响应头
+		if (result.aigResponseHeaders) Object.assign(streamHeaders, result.aigResponseHeaders);
 		return new Response(transformedStream, { headers: streamHeaders });
 	} else {
 		const cfJson = result.data;
 		if (cfJson.model !== undefined) cfJson.model = model;
 		const responseHeaders = { 'Content-Type': 'application/json' };
 		if (fallbackWarning) responseHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		// 透传上游 cf-aig-* 响应头
+		if (result.aigResponseHeaders) Object.assign(responseHeaders, result.aigResponseHeaders);
 		if (cfJson.usage) {
 			const durationSec = (Date.now() - requestStartTime) / 1000;
+			const usage = cfJson.usage;
+			const promptDetails = usage.prompt_tokens_details || {};
 			accumulateTokens(env, ctx, {
-				input: cfJson.usage.prompt_tokens || 0,
-				output: cfJson.usage.completion_tokens || 0,
+				input: usage.prompt_tokens || 0,
+				output: usage.completion_tokens || 0,
+				reasoning: usage.reasoning_tokens || 0,
+				cacheRead: promptDetails.cached_tokens || usage.cache_read_tokens || 0,
+				cacheWrite: usage.cache_write_tokens || 0,
 				durationSec,
 			});
 		}
@@ -1129,6 +1697,8 @@ function convertAnthropicToOpenAI(anthropicBody) {
 	if (anthropicBody.top_p !== undefined) openaiBody.top_p = anthropicBody.top_p;
 	if (anthropicBody.stop_sequences !== undefined) openaiBody.stop = anthropicBody.stop_sequences;
 	// top_k：OpenAI Chat Completions 不支持，丢弃
+	// thinking → reasoning_effort：Anthropic 扩展思考 → CF 推理模型
+	if (anthropicBody.thinking?.type === 'enabled') openaiBody.reasoning_effort = 'high';
 	if (anthropicBody.metadata && anthropicBody.metadata.user_id) openaiBody.user = anthropicBody.metadata.user_id;
 
 	const openaiMessages = [];
@@ -1314,7 +1884,9 @@ function convertOpenAIToAnthropic(openaiResponse, originalModel) {
 		stop_sequence: null,
 		usage: {
 			input_tokens: openaiResponse.usage?.prompt_tokens || 0,
-			output_tokens: openaiResponse.usage?.completion_tokens || 0
+			output_tokens: openaiResponse.usage?.completion_tokens || 0,
+			cache_creation_input_tokens: openaiResponse.usage?.cache_creation_input_tokens || 0,
+			cache_read_input_tokens: (openaiResponse.usage?.prompt_tokens_details?.cached_tokens || openaiResponse.usage?.cache_read_input_tokens || 0)
 		}
 	};
 
@@ -1410,7 +1982,7 @@ async function handleMessages(request, env, ctx) {
 		openaiBody.stream_options = { include_usage: true };
 	}
 
-	const result = await callOpenAICompatibleAPI(openaiBody, env, stream);
+	const result = await callOpenAICompatibleAPI(openaiBody, env, stream, request.headers);
 
 	if (!result.success) {
 		let errorDetail;
@@ -1439,18 +2011,27 @@ async function handleMessages(request, env, ctx) {
 			'Cache-Control': 'no-cache',
 		};
 		if (fallbackWarning) streamHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		// 透传上游 cf-aig-* 响应头
+		if (result.aigResponseHeaders) Object.assign(streamHeaders, result.aigResponseHeaders);
 		return new Response(transformedStream, { headers: streamHeaders });
 	} else {
 		const openaiResponse = result.data;
 		const anthropicResponse = convertOpenAIToAnthropic(openaiResponse, model);
 		const responseHeaders = { 'Content-Type': 'application/json' };
 		if (fallbackWarning) responseHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		// 透传上游 cf-aig-* 响应头
+		if (result.aigResponseHeaders) Object.assign(responseHeaders, result.aigResponseHeaders);
 		// 累加 token 统计（非流式）
 		if (ctx && openaiResponse.usage) {
 			const durationSec = (Date.now() - requestStartTime) / 1000;
+			const usage = openaiResponse.usage;
+			const promptDetails = usage.prompt_tokens_details || {};
 			accumulateTokens(env, ctx, {
-				input: openaiResponse.usage.prompt_tokens || 0,
-				output: openaiResponse.usage.completion_tokens || 0,
+				input: usage.prompt_tokens || 0,
+				output: usage.completion_tokens || 0,
+				reasoning: usage.reasoning_tokens || 0,
+				cacheRead: promptDetails.cached_tokens || usage.cache_read_tokens || 0,
+				cacheWrite: usage.cache_write_tokens || 0,
 				durationSec,
 			});
 		}
@@ -1475,6 +2056,9 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 	let thinkingBlockActive = false;  // 跟踪 thinking block 是否正在进行
 	let inputTokens = 0;
 	let outputTokens = 0;
+	let reasoningTokens = 0;
+	let cacheReadTokens = 0;
+	let cacheWriteTokens = 0;
 
 	let enqueuedAny = false;
 
@@ -1490,11 +2074,25 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				enqueuedAny = true;
 				originalEnqueue(chunk);
 			};
+			let timeoutRetries = 0;
+			const MAX_TIMEOUT_RETRIES = 5;
 
 			try {
 				while (true) {
-					const { value, done } = await readWithTimeout(reader, 60000);
-					if (done) {
+					let result;
+					try {
+						result = await readStreamWithTimeout(reader, 120000);
+					} catch (e) {
+						// 流读取超时：模型可能正在思考，重试
+						if (e.message === 'Stream read timed out' && timeoutRetries < MAX_TIMEOUT_RETRIES) {
+							timeoutRetries++;
+							await new Promise(r => setTimeout(r, Math.min(1000 * timeoutRetries, 5000)));
+							continue;
+						}
+						throw e;
+					}
+					timeoutRetries = 0;
+					if (result.done) {
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
 						}
@@ -1505,7 +2103,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 						break;
 					}
 
-					buffer += decoder.decode(value, { stream: true });
+					buffer += decoder.decode(result.value, { stream: true });
 					buffer = processLines(buffer, controller);
 
 					if (buffer.indexOf('\n') === -1) {
@@ -1559,6 +2157,9 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 					if (chunk.usage) {
 						inputTokens = chunk.usage.prompt_tokens || 0;
 						outputTokens = chunk.usage.completion_tokens || 0;
+						reasoningTokens = chunk.usage.reasoning_tokens || 0;
+						cacheReadTokens = (chunk.usage.prompt_tokens_details?.cached_tokens || chunk.usage.cache_read_tokens || 0);
+						cacheWriteTokens = chunk.usage.cache_write_tokens || 0;
 					}
 
 					if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
@@ -1768,6 +2369,9 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 			accumulateTokens(env, ctx, {
 				input: inputTokens,
 				output: outputTokens,
+				reasoning: reasoningTokens,
+				cacheRead: cacheReadTokens,
+				cacheWrite: cacheWriteTokens,
 				durationSec,
 			});
 		}
@@ -1812,7 +2416,8 @@ async function handleEmbeddings(request, env, ctx) {
 				}
 			};
 		},
-		env
+		env,
+		request.headers
 	);
 
 	if (!result.success) {
@@ -1824,6 +2429,9 @@ async function handleEmbeddings(request, env, ctx) {
 		accumulateTokens(env, ctx, {
 			input: result.data.usage.prompt_tokens,
 			output: 0,
+			reasoning: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
 			durationSec: (Date.now() - requestStartTime) / 1000,
 		});
 	}
@@ -1834,7 +2442,8 @@ async function handleEmbeddings(request, env, ctx) {
 }
 
 // 图片生成 /v1/images/generations
-async function handleImageGenerations(request, env) {
+async function handleImageGenerations(request, env, ctx) {
+	const requestStartTime = Date.now();
 	const body = await safeJsonBody(request);
 	if (!body) {
 		return jsonError("Invalid JSON body", 400, "invalid_request_error");
@@ -1893,7 +2502,8 @@ async function handleImageGenerations(request, env) {
 				}],
 			};
 		},
-		env
+		env,
+		request.headers
 	);
 
 	if (!result.success) {
@@ -1902,11 +2512,23 @@ async function handleImageGenerations(request, env) {
 
 	const imgHeaders = { 'Content-Type': 'application/json' };
 	if (fallbackWarning) imgHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+	// 估算图片生成 token 数（按 prompt 字符数/3 粗略估算）
+	if (ctx && prompt) {
+		accumulateTokens(env, ctx, {
+			input: Math.ceil(prompt.length / 3),
+			output: 0,
+			reasoning: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			durationSec: (Date.now() - requestStartTime) / 1000,
+		});
+	}
 	return new Response(JSON.stringify(result.data), { headers: imgHeaders });
 }
 
 // 音频转录 /v1/audio/transcriptions
-async function handleAudioTranscriptions(request, env) {
+async function handleAudioTranscriptions(request, env, ctx) {
+	const requestStartTime = Date.now();
 	const contentType = request.headers.get('Content-Type') || '';
 	if (!contentType.includes('multipart/form-data')) {
 		return jsonError("Content-Type must be multipart/form-data", 400, "invalid_request_error");
@@ -1938,6 +2560,11 @@ async function handleAudioTranscriptions(request, env) {
 			(account) => {
 				const cfFormData = new FormData();
 				cfFormData.append('audio', audioFile, audioFile.name || 'audio.wav');
+				// 透传 OpenAI 标准参数：language/prompt/response_format/temperature
+				for (const field of ['language', 'prompt', 'response_format', 'temperature']) {
+					const val = formData.get(field);
+					if (val !== null) cfFormData.append(field, val);
+				}
 				return {
 					method: 'POST',
 					headers: { 'Authorization': `Bearer ${account.apiToken}` },
@@ -1946,11 +2573,24 @@ async function handleAudioTranscriptions(request, env) {
 				};
 			},
 			(cfResult) => ({ text: cfResult.text || '' }),
-		env
+		env,
+		request.headers
 	);
 
 		if (!result.success) {
 			return jsonError(result.error, result.status, "server_error");
+		}
+
+		// 估算音频转录 token 数（按输出文本长度/3 粗略估算）
+		if (ctx && result.data?.text) {
+			accumulateTokens(env, ctx, {
+				input: 0,
+				output: Math.ceil(result.data.text.length / 3),
+				reasoning: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				durationSec: (Date.now() - requestStartTime) / 1000,
+			});
 		}
 
 		const audioHeaders = { 'Content-Type': 'application/json' };
@@ -1962,11 +2602,13 @@ async function handleAudioTranscriptions(request, env) {
 }
 
 // 文本转语音 /v1/audio/speech
-async function handleAudioSpeech(request, env) {
+async function handleAudioSpeech(request, env, ctx) {
 	const body = await safeJsonBody(request);
 	if (!body) {
 		return jsonError("Invalid JSON body", 400, "invalid_request_error");
 	}
+
+	const requestStartTime = Date.now();
 
 	const { model, input, voice } = body;
 	if (!input) {
@@ -1984,11 +2626,19 @@ async function handleAudioSpeech(request, env) {
 
 	const cfPayload = { prompt: input };
 	if (voice) cfPayload.voice = voice;
+	// 透传 OpenAI 标准参数
+	if (body.response_format) cfPayload.response_format = body.response_format;
+	if (body.speed !== undefined) cfPayload.speed = body.speed;
 
 	let lastError = null;
 	let lastStatus = 502;
+	let accountIndex = 0;
 
 	for (const account of activeAccounts) {
+		if (accountIndex > 0) {
+			await randomDelay(300, 2000);
+		}
+		accountIndex++;
 		try {
 			const cfResponse = await fetch(
 				`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/run/${cfModel}`,
@@ -1997,6 +2647,8 @@ async function handleAudioSpeech(request, env) {
 					headers: {
 						'Authorization': `Bearer ${account.apiToken}`,
 						'Content-Type': 'application/json',
+						'User-Agent': randomUA(),
+						...pickCfAigHeaders(request.headers),
 					},
 					body: JSON.stringify(cfPayload),
 					signal: AbortSignal.timeout(60000),
@@ -2009,12 +2661,24 @@ async function handleAudioSpeech(request, env) {
 				const contentType = cfResponse.headers.get('Content-Type') || 'audio/wav';
 				const speechHeaders = { 'Content-Type': contentType };
 				if (fallbackWarning) speechHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+				// 估算 TTS token 数（按字符数/4 粗略估算）
+				if (ctx) {
+					const inputTokens = Math.ceil(input.length / 4);
+					accumulateTokens(env, ctx, {
+						input: inputTokens,
+						output: 0,
+						reasoning: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						durationSec: (Date.now() - requestStartTime) / 1000,
+					});
+				}
 				return new Response(audioBuffer, { headers: speechHeaders });
 			}
 
 			const errorText = await cfResponse.text();
 			lastStatus = cfResponse.status;
-			lastError = `CF API status ${cfResponse.status}: ${errorText}`;
+			lastError = `CF API status ${cfResponse.status}: ${extractCleanCFError(errorText)}`;
 		} catch (e) {
 			lastStatus = 502;
 			lastError = `Connection error: ${e.message}`;
@@ -2059,6 +2723,14 @@ async function handleCountTokens(request, env) {
 			for (const block of msg.content) {
 				if (block.type === 'text' && block.text) {
 					totalChars += block.text.length;
+				} else if (block.type === 'thinking' && block.thinking) {
+					totalChars += block.thinking.length;
+				} else if (block.type === 'image') {
+					// 图片 base64 数据按 1.33 字符/token 估算（文本的 4 倍密度）
+					const source = block.source || {};
+					if (source.data) {
+						totalChars += Math.ceil(source.data.length / 4);
+					}
 				} else if (block.type === 'tool_use') {
 					totalChars += JSON.stringify(block.input || {}).length;
 				} else if (block.type === 'tool_result') {
@@ -2103,10 +2775,24 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 
 	return new ReadableStream({
 		async pull(controller) {
+			let timeoutRetries = 0;
+			const MAX_TIMEOUT_RETRIES = 5;
 			try {
 				while (true) {
-					const { value, done } = await readWithTimeout(reader, 60000);
-					if (done) {
+					let result;
+					try {
+						result = await readStreamWithTimeout(reader, 120000);
+					} catch (e) {
+						// 流读取超时：模型可能正在思考，重试
+						if (e.message === 'Stream read timed out' && timeoutRetries < MAX_TIMEOUT_RETRIES) {
+							timeoutRetries++;
+							await new Promise(r => setTimeout(r, Math.min(1000 * timeoutRetries, 5000)));
+							continue;
+						}
+						throw e;
+					}
+					timeoutRetries = 0; // 成功读取到数据，重置重试计数
+					if (result.done) {
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
 						}
@@ -2115,16 +2801,20 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 						// 流结束时累加 token 统计
 						if (streamUsage && env && ctx) {
 							const durationSec = requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0;
+							const promptDetails = streamUsage.prompt_tokens_details || {};
 							accumulateTokens(env, ctx, {
 								input: streamUsage.prompt_tokens || 0,
 								output: streamUsage.completion_tokens || 0,
+								reasoning: streamUsage.reasoning_tokens || 0,
+								cacheRead: promptDetails.cached_tokens || streamUsage.cache_read_tokens || 0,
+								cacheWrite: streamUsage.cache_write_tokens || 0,
 								durationSec,
 							});
 						}
 						break;
 					}
 
-					buffer += decoder.decode(value, { stream: true });
+					buffer += decoder.decode(result.value, { stream: true });
 					buffer = processLines(buffer, controller);
 
 					if (buffer.indexOf('\n') === -1) {
@@ -2395,7 +3085,8 @@ async function handleDashboardApi(request, env, ctx) {
 						method: 'GET',
 						headers: {
 							'Authorization': `Bearer ${targetApiToken}`,
-							'Content-Type': 'application/json'
+							'Content-Type': 'application/json',
+							'User-Agent': randomUA(),
 						},
 						signal: AbortSignal.timeout(10000),
 					});
@@ -2414,7 +3105,8 @@ async function handleDashboardApi(request, env, ctx) {
 						method: 'POST',
 						headers: {
 							'Authorization': `Bearer ${targetApiToken}`,
-							'Content-Type': 'application/json'
+							'Content-Type': 'application/json',
+							'User-Agent': randomUA(),
 						},
 						body: JSON.stringify({ text: ['test'] }),
 						signal: AbortSignal.timeout(15000),
@@ -2452,7 +3144,8 @@ async function handleDashboardApi(request, env, ctx) {
 						method: 'POST',
 						headers: {
 							'Authorization': `Bearer ${targetApiToken}`,
-							'Content-Type': 'application/json'
+							'Content-Type': 'application/json',
+							'User-Agent': randomUA(),
 						},
 						body: JSON.stringify({
 							query,
@@ -2654,11 +3347,15 @@ async function handleDashboardApi(request, env, ctx) {
 		return new Response(JSON.stringify({
 			input: stats.input,
 			output: stats.output,
+			reasoning: stats.reasoning,
+			cacheRead: stats.cacheRead,
+			cacheWrite: stats.cacheWrite,
 			total: stats.total,
 			requests: stats.requests,
 			avgTokPerSec: stats.avgTokPerSec,
 			inputFmt: fmtTok(stats.input),
 			outputFmt: fmtTok(stats.output),
+			reasoningFmt: fmtTok(stats.reasoning),
 			totalFmt: fmtTok(stats.total),
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
@@ -4527,6 +5224,7 @@ async function handleAdminPage(request, env, ctx) {
 									<div class="stat-value" id="stat-tokens-total">0</div>
 									<div class="stat-desc" id="stat-tokens-desc" style="margin-top: 2px;">入 0 / 出 0</div>
 									<div class="stat-desc" id="stat-tokens-speed" style="margin-top: 2px; font-size: 11px;">0 tok/s</div>
+									<div class="stat-desc" id="stat-tokens-reasoning" style="margin-top: 1px; font-size: 10px; opacity: 0.7;">推理 0 / 缓存读 0</div>
 								</div>
 							</div>
 							<div class="progress-container" style="margin-top: 2px;">
@@ -5010,6 +5708,8 @@ async function handleAdminPage(request, env, ctx) {
 				if (descEl) descEl.innerText = "入 " + (data.inputFmt || "0") + " / 出 " + (data.outputFmt || "0");
 				const speedEl = document.getElementById("stat-tokens-speed");
 				if (speedEl) speedEl.innerText = (data.avgTokPerSec || 0) + " tok/s";
+				const reasoningEl = document.getElementById("stat-tokens-reasoning");
+				if (reasoningEl) reasoningEl.innerText = "推理 " + (data.reasoningFmt || "0") + " / 缓存读 " + (data.cacheReadFmt || "0");
 			} catch (e) { console.error("Failed to load token stats:", e); }
 		}
 
