@@ -18,9 +18,9 @@ const MODEL_CREATED_TS = 1686935000;
 // Token 统计：从 CF 响应 usage 字段实时累加写入 KV
 function fmtTok(n) {
 	if (n < 1000) return String(n);
-	if (n < 10000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
-	if (n < 100000000) return (n / 10000).toFixed(1).replace(/\.0$/, '') + 'w';
-	return (n / 100000000).toFixed(2).replace(/\.?0+$/, '') + '亿';
+	if (n < 1000000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
+	if (n < 1000000000) return (n / 1000000).toFixed(2).replace(/\.?0+$/, '') + 'M';
+	return (n / 1000000000).toFixed(2).replace(/\.?0+$/, '') + 'B';
 }
 
 const TOKEN_KV_TTL_SEC = 86400 * 2;    // KV 键保留 2 天
@@ -366,6 +366,37 @@ function jsonError(message, status = 500, type = 'server_error') {
 	return new Response(JSON.stringify({ error: { message, type } }), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
+// 从 CF API 错误响应中提取可读的错误消息
+function extractCleanCFError(errorText) {
+	try {
+		const errJson = JSON.parse(errorText);
+		let msg = errJson.errors?.[0]?.message || errorText;
+		const innerJsonMatch = msg.match(/\{.*\}/);
+		if (innerJsonMatch) {
+			const inner = JSON.parse(innerJsonMatch[0]);
+			if (inner.message) msg = inner.message;
+		}
+		return msg;
+	} catch (_) {
+		return errorText;
+	}
+}
+
+// 带超时的流读取：reader.read() 本身没有超时机制，
+// 如果上游 CF API 流式传输中途挂起，Worker 会一直等待直到 CPU 时间限制被强制终止。
+// 此函数通过 Promise.race 在规定时间内未读到数据则抛超时异常。
+function readWithTimeout(reader, timeoutMs) {
+	let timer;
+	const read = reader.read();
+	const timeout = new Promise((_, reject) => {
+		timer = setTimeout(() => {
+			try { reader.cancel(); } catch (_) {}
+			reject(new Error('Stream read timed out'));
+		}, timeoutMs);
+	});
+	return Promise.race([read, timeout]).finally(() => clearTimeout(timer));
+}
+
 // 环境变量读取（避免 falsy 陷阱）
 function getEnvInt(env, key, defaultVal) {
 	const raw = env[key];
@@ -574,7 +605,6 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) 
 			const historyGroups = await queryGraphQL(account.accountId, account.apiToken, startSevenDays);
 			const historyParsed = processAnalytics(historyGroups);
 
-			
 			const todayUsage = historyParsed.todayTotalNeurons;
 			const todayRequests = historyParsed.todayTotalRequests;
 			const todayModels = historyParsed.todayModels;
@@ -865,8 +895,8 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 
 	for (const account of activeAccounts) {
 		try {
-			// 流式超时 5min，非流式 30s
-			const timeoutMs = stream ? 300000 : 30000;
+			// 流式超时 5min，非流式 60s（大上下文处理需要更长时间）
+			const timeoutMs = stream ? 300000 : 60000;
 			const cfResponse = await fetch(
 				`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/v1/chat/completions`,
 				{
@@ -889,7 +919,7 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 				// 预读第一个 chunk 校验响应格式，
 				// 避免 CF 返回 HTTP 200 + {"success":false,...} 错误体被当作 SSE 流处理
 				const streamReader = cfResponse.body.getReader();
-				const firstResult = await streamReader.read();
+				const firstResult = await readWithTimeout(streamReader, 60000);
 				if (firstResult.done) {
 					lastError = `CF API returned empty stream`;
 					continue;
@@ -900,12 +930,12 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 				if (firstText.trimStart().startsWith('{') && (firstText.includes('"success":false') || firstText.includes('"success": false'))) {
 					let errBody = firstText;
 					while (true) {
-						const { value, done } = await streamReader.read();
+						const { value, done } = await readWithTimeout(streamReader, 15000);
 						if (done) break;
 						errBody += decoder.decode(value, { stream: true });
 					}
 					lastStatus = cfResponse.status;
-					lastError = `CF API error: ${errBody}`;
+					lastError = `CF API error: ${extractCleanCFError(errBody)}`;
 					continue;
 				}
 				// 是有效的 SSE 流，重新包装流（把预读的 chunk 放回去）
@@ -913,7 +943,7 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 					start(controller) { controller.enqueue(firstResult.value); },
 					async pull(controller) {
 						try {
-							const { value, done } = await streamReader.read();
+							const { value, done } = await readWithTimeout(streamReader, 60000);
 							if (done) controller.close();
 							else controller.enqueue(value);
 						} catch (e) { console.error('wrappedStream pull error:', e?.message || e); try { controller.close(); } catch (_) {} }
@@ -928,7 +958,7 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 
 			const errorText = await cfResponse.text();
 			lastStatus = cfResponse.status;
-			lastError = `CF API returned ${cfResponse.status}: ${errorText}`;
+			lastError = `CF API returned ${cfResponse.status}: ${extractCleanCFError(errorText)}`;
 			// 4xx 客户端错误（除 429 限流外）切换账号也不会成功，直接返回
 			if (cfResponse.status >= 400 && cfResponse.status < 500 && cfResponse.status !== 429) {
 				return { success: false, status: lastStatus, error: lastError };
@@ -978,11 +1008,11 @@ async function callCFRunAPI(cfModel, buildPayload, processResult, env) {
 				if (cfJson.success && cfJson.result) {
 					return { success: true, data: processResult(cfJson.result) };
 				} else {
-					lastError = `CF Run failed: ${JSON.stringify(cfJson.errors || cfJson)}`;
+					lastError = `CF Run failed: ${cfJson.errors?.[0]?.message || JSON.stringify(cfJson.errors || cfJson)}`;
 				}
 			} else {
 				const errorText = await cfResponse.text();
-				lastError = `CF API status ${cfResponse.status}: ${errorText}`;
+				lastError = `CF API status ${cfResponse.status}: ${extractCleanCFError(errorText)}`;
 			}
 		} catch (e) {
 			lastError = `Connection error: ${e.message}`;
@@ -1463,12 +1493,11 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 
 			try {
 				while (true) {
-					const { value, done } = await reader.read();
+					const { value, done } = await readWithTimeout(reader, 60000);
 					if (done) {
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
 						}
-						// 上游流正常结束时发送终止事件
 						if (!finalEventSent) {
 							sendFinalEvent(controller);
 						}
@@ -1527,13 +1556,11 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 
 					const delta = choice.delta || {};
 
-					
 					if (chunk.usage) {
 						inputTokens = chunk.usage.prompt_tokens || 0;
 						outputTokens = chunk.usage.completion_tokens || 0;
 					}
 
-					
 					if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
 						// 首次发送任何数据前先发送 message_start（Bug #1）
 						if (!streamStarted) {
@@ -1560,7 +1587,6 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 
 							if (tc.function?.arguments) {
 								currentToolArgs += tc.function.arguments;
-								
 								sendToolUseDelta(controller, tc.function.arguments);
 							}
 						}
@@ -1614,7 +1640,6 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 						sendTextDelta(controller, delta.content);
 					}
 
-					
 					if (choice.finish_reason) {
 						if (thinkingBlockActive) {
 							sendContentBlockStop(controller);
@@ -1622,7 +1647,6 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 							thinkingBlockActive = false;
 						}
 						if (currentToolCallId && currentToolArgs) {
-							
 							sendToolUseFinalInput(controller);
 						}
 					}
@@ -1690,7 +1714,6 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 	}
 
 	function sendToolUseFinalInput(controller) {
-		
 		controller.enqueue(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({
 			type: 'content_block_stop',
 			index: contentBlockIndex
@@ -1706,7 +1729,6 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 	}
 
 	function sendFinalEvent(controller) {
-		
 		if (finalEventSent) return; // 已发送过终止事件则直接返回
 		// 如果 finish_reason 触发时已发送过 content_block_stop，跳过重复发送（Bug #2）
 		if (!streamStarted) {
@@ -2016,7 +2038,6 @@ async function handleCountTokens(request, env) {
 		}), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	
 	let totalChars = 0;
 
 	// system 字段
@@ -2084,9 +2105,8 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 		async pull(controller) {
 			try {
 				while (true) {
-					const { value, done } = await reader.read();
+					const { value, done } = await readWithTimeout(reader, 60000);
 					if (done) {
-						
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
 						}
@@ -2164,11 +2184,9 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 					}
 					controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
 				} catch (_) {
-					
 					controller.enqueue(encoder.encode(`${line}\n`));
 				}
 			} else {
-				
 				controller.enqueue(encoder.encode(`${line}\n`));
 			}
 		}
@@ -2203,7 +2221,6 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
-	
 	if (url.pathname === '/api/auth/logout' && method === 'POST') {
 		return new Response(JSON.stringify({ success: true }), {
 			headers: {
@@ -2279,7 +2296,6 @@ async function handleDashboardApi(request, env, ctx) {
 	}
 
 	// --------------------------------------------------
-	
 	// --------------------------------------------------
 	const isAuthorized = await checkAdminAuth(request, env);
 	if (!isAuthorized) {
@@ -2352,7 +2368,6 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
-	
 	if (url.pathname === '/api/accounts/test' && method === 'POST') {
 		const { id, accountId, apiToken } = await safeJsonBody(request) || {};
 		let targetAccountId = accountId;
@@ -2492,14 +2507,11 @@ async function handleDashboardApi(request, env, ctx) {
 			}), { headers: { 'Content-Type': 'application/json' } });
 		}
 
-		
 		const cacheMap = await refreshAccountsUsage(env, accounts);
 
-		
 		const todayStr = new Date().toISOString().split('T')[0];
 		const results = accounts.map(account => {
 			const cached = cacheMap[account.id];
-			
 			let usageToday = 0;
 			let usageTodayRequests = 0;
 			if (cached) {
@@ -2570,7 +2582,6 @@ async function handleDashboardApi(request, env, ctx) {
 
 	}
 
-	
 	if (url.pathname.startsWith('/api/keys/') && method === 'DELETE') {
 		const id = decodeURIComponent(url.pathname.slice('/api/keys/'.length));
 		const keys = await getApiKeys(env);
@@ -2579,7 +2590,6 @@ async function handleDashboardApi(request, env, ctx) {
 		return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
 	}
 
-	
 	if (url.pathname === '/api/settings') {
 		if (method === 'GET') {
 			const customMap = await getCustomModelMap(env);
@@ -2596,7 +2606,6 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
-	
 	if (url.pathname === '/api/limits') {
 		if (method === 'GET') {
 			const limits = await getUsageLimits(env);
@@ -2648,7 +2657,6 @@ async function handleDashboardApi(request, env, ctx) {
 			total: stats.total,
 			requests: stats.requests,
 			avgTokPerSec: stats.avgTokPerSec,
-			
 			inputFmt: fmtTok(stats.input),
 			outputFmt: fmtTok(stats.output),
 			totalFmt: fmtTok(stats.total),
@@ -4087,6 +4095,23 @@ async function handleAdminPage(request, env, ctx) {
 			background: var(--warning-color);
 		}
 
+		.stat-metrics-row {
+			display: flex;
+			gap: 24px;
+			align-items: flex-start;
+		}
+
+		.stat-metric {
+			flex: 1;
+			min-width: 0;
+		}
+
+		.stat-metric-divider {
+			width: 1px;
+			background: var(--border-color);
+			align-self: stretch;
+		}
+
 		/* Section Cards */
 		.section-card {
 			background-color: var(--card-bg);
@@ -4491,36 +4516,23 @@ async function handleAdminPage(request, env, ctx) {
 				<div id="tab-overview" class="tab-content active">
 					<div class="card-grid">
 						<div class="stat-card">
-							<div style="display: flex; justify-content: space-between; align-items: center;">
-								<div class="stat-title">今日总消耗量</div>
-								<span id="stat-total-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">0次</span>
+							<div class="stat-title">今日用量</div>
+							<div class="stat-metrics-row">
+								<div class="stat-metric">
+									<div class="stat-value" id="stat-total-neurons">0</div>
+									<div class="stat-desc" style="margin-top: 2px;"><span id="stat-total-requests">0</span> 次请求</div>
+								</div>
+								<div class="stat-metric-divider"></div>
+								<div class="stat-metric">
+									<div class="stat-value" id="stat-tokens-total">0</div>
+									<div class="stat-desc" id="stat-tokens-desc" style="margin-top: 2px;">入 0 / 出 0</div>
+									<div class="stat-desc" id="stat-tokens-speed" style="margin-top: 2px; font-size: 11px;">0 tok/s</div>
+								</div>
 							</div>
-							<div class="stat-value" id="stat-total-neurons">0</div>
-							<div class="progress-container">
+							<div class="progress-container" style="margin-top: 2px;">
 								<div class="progress-bar" id="stat-neurons-progress" style="width: 0%;"></div>
 							</div>
-							<div class="stat-desc" id="stat-neurons-desc" style="margin-top: 4px;">0 / 0 Neurons (0.00%)</div>
-						</div>
-						<div class="stat-card">
-							<div style="display: flex; justify-content: space-between; align-items: center;">
-								<div class="stat-title">今日 Tokens</div>
-								<span id="stat-tokens-reqs" style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">0次</span>
-							</div>
-							<div class="stat-value" id="stat-tokens-total">0</div>
-							<div class="stat-desc" id="stat-tokens-desc" style="margin-top: 4px;">入 0 / 出 0</div>
-							<div class="stat-desc" id="stat-tokens-speed" style="margin-top: 2px; font-size: 11px;">0 tok/s</div>
-						</div>
-					<div class="stat-card">
-						<div style="display: flex; justify-content: space-between; align-items: center;">
-							<div class="stat-title">今日用量限额</div>
-							<span id="stat-daily-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">0次</span>
-						</div>
-						<div class="stat-value" id="stat-daily-usage">0</div>
-						<div class="progress-container" style="position: relative;">
-							<div class="progress-bar" id="stat-daily-progress" style="width: 0%;"></div>
-							<div class="progress-threshold" id="stat-daily-threshold" style="position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warning-color); left: 90%;"></div>
-						</div>
-						<div class="stat-desc" id="stat-daily-desc" style="margin-top: 4px;">0 / 10,000 Neurons (0%)</div>
+							<div class="stat-desc" id="stat-neurons-desc" style="margin-top: 4px;">0 / 0 Neurons (0%)</div>
 						</div>
 					<div class="stat-card">
 						<div style="display: flex; justify-content: space-between; align-items: center;">
@@ -4535,25 +4547,19 @@ async function handleAdminPage(request, env, ctx) {
 						<div class="stat-desc" id="stat-monthly-desc" style="margin-top: 4px;">0 / 100,000 Neurons (0%)</div>
 					</div>
 					<div class="stat-card">
-						<div style="display: flex; justify-content: space-between; align-items: flex-start;">
-							<div class="stat-title">已绑定账号</div>
-							<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
-								<path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-							</svg>
-						</div>
-						<div class="stat-value" id="stat-accounts-count">0</div>
-						<div class="stat-desc">活跃中的 Cloudflare 账号数</div>
-						</div>
-						<div class="stat-card">
-							<div style="display: flex; justify-content: space-between; align-items: flex-start;">
-								<div class="stat-title">代理 API 密钥</div>
-								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
-									<path stroke-linecap="round" stroke-linejoin="round" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
-								</svg>
+						<div class="stat-title">资源</div>
+						<div class="stat-metrics-row">
+							<div class="stat-metric">
+								<div class="stat-value" id="stat-accounts-count">0</div>
+								<div class="stat-desc">账号</div>
 							</div>
-							<div class="stat-value" id="stat-keys-count">0</div>
-							<div class="stat-desc">已配额调用 Key数</div>
+							<div class="stat-metric-divider"></div>
+							<div class="stat-metric">
+								<div class="stat-value" id="stat-keys-count">0</div>
+								<div class="stat-desc">密钥</div>
+							</div>
 						</div>
+					</div>
 						<div class="stat-card">
 							<div style="display: flex; justify-content: space-between; align-items: flex-start;">
 								<div class="stat-title">节省成本 (估算)</div>
@@ -4849,6 +4855,13 @@ async function handleAdminPage(request, env, ctx) {
 	<script>
 		${SHARED_JS}
 
+		function fmtTok(n) {
+			if (n < 1000) return String(n);
+			if (n < 1000000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
+			if (n < 1000000000) return (n / 1000000).toFixed(2).replace(/\.?0+$/, '') + 'M';
+			return (n / 1000000000).toFixed(2).replace(/\.?0+$/, '') + 'B';
+		}
+
 		let currentTab = 'overview';
 		let historyChart = null;
 		let modelsChart = null;
@@ -4938,9 +4951,9 @@ async function handleAdminPage(request, env, ctx) {
 				}
 			});
 
-			// Top stats formatting (Usage rounded up, Percentage 2 decimals)
+			// Top stats formatting
 			const roundedTotalUsageToday = Math.ceil(totalUsageToday);
-			document.getElementById('stat-total-neurons').innerText = roundedTotalUsageToday.toLocaleString();
+			document.getElementById('stat-total-neurons').innerText = fmtTok(roundedTotalUsageToday);
 			document.getElementById('stat-accounts-count').innerText = accounts.length;
 			document.getElementById('stat-total-requests').innerText = totalRequestsToday.toLocaleString() + '次';
 			
@@ -4951,7 +4964,6 @@ async function handleAdminPage(request, env, ctx) {
 			const costSaved = (totalUsageToday / 1000) * 0.011;
 			document.getElementById('stat-cost-saving').innerText = '$' + costSaved.toFixed(2);
 
-			// 更新日/月限额卡片
 			updateLimitCards(limits);
 
 			const dates = Object.keys(historyData).sort();
@@ -4964,38 +4976,17 @@ async function handleAdminPage(request, env, ctx) {
 		}
 
 		function updateLimitCards(limits) {
-			const { dailyUsage = 0, dailyRequests = 0, dailyLimit = 10000, monthlyUsage = 0, monthlyRequests = 0, monthlyLimit = 100000, threshold = 0.9 } = limits || {};
-			// threshold <= 0 表示已关闭限额拦截：仅统计用量，不再对请求做限制
+			const { monthlyUsage = 0, monthlyRequests = 0, monthlyLimit = 100000, threshold = 0.9 } = limits || {};
 			const limitDisabled = threshold <= 0;
-
-			// 今日限额
-		const dailyPct = dailyLimit > 0 ? Number(((dailyUsage / dailyLimit) * 100).toFixed(2)) : 0;
-		document.getElementById('stat-daily-usage').innerText = Math.ceil(dailyUsage).toLocaleString();
-		document.getElementById('stat-daily-progress').style.width = Math.min(100, dailyPct) + '%';
-			document.getElementById('stat-daily-desc').innerText = limitDisabled
-				? Math.ceil(dailyUsage).toLocaleString() + ' Neurons · 限额关闭'
-				: Math.ceil(dailyUsage).toLocaleString() + ' / ' + dailyLimit.toLocaleString() + ' Neurons (' + dailyPct.toFixed(1) + '%)';
-			document.getElementById('stat-daily-requests').innerText = dailyRequests.toLocaleString() + '次';
-			// 阈值线位置（threshold <= 0 表示已关闭限额拦截，隐藏阈值线）
-			const dailyThresholdEl = document.getElementById('stat-daily-threshold');
-			if (dailyThresholdEl) {
-				if (threshold > 0) {
-					dailyThresholdEl.style.left = Math.round(threshold * 100) + '%';
-					dailyThresholdEl.style.display = '';
-				} else {
-					dailyThresholdEl.style.display = 'none';
-				}
-			}
 
 			// 本月限额
 		const monthlyPct = monthlyLimit > 0 ? Number(((monthlyUsage / monthlyLimit) * 100).toFixed(2)) : 0;
-		document.getElementById('stat-monthly-usage').innerText = Math.ceil(monthlyUsage).toLocaleString();
+		document.getElementById('stat-monthly-usage').innerText = fmtTok(Math.ceil(monthlyUsage));
 		document.getElementById('stat-monthly-progress').style.width = Math.min(100, monthlyPct) + '%';
 		document.getElementById('stat-monthly-desc').innerText = limitDisabled
 			? Math.ceil(monthlyUsage).toLocaleString() + ' Neurons · 限额关闭'
 			: Math.ceil(monthlyUsage).toLocaleString() + ' / ' + monthlyLimit.toLocaleString() + ' Neurons (' + monthlyPct.toFixed(1) + '%)';
 			document.getElementById('stat-monthly-requests').innerText = monthlyRequests.toLocaleString() + '次';
-			// 阈值线位置（threshold <= 0 表示已关闭限额拦截，隐藏阈值线）
 			const monthlyThresholdEl = document.getElementById('stat-monthly-threshold');
 			if (monthlyThresholdEl) {
 				if (threshold > 0) {
@@ -5019,8 +5010,6 @@ async function handleAdminPage(request, env, ctx) {
 				if (descEl) descEl.innerText = "入 " + (data.inputFmt || "0") + " / 出 " + (data.outputFmt || "0");
 				const speedEl = document.getElementById("stat-tokens-speed");
 				if (speedEl) speedEl.innerText = (data.avgTokPerSec || 0) + " tok/s";
-				const reqsEl = document.getElementById("stat-tokens-reqs");
-				if (reqsEl) reqsEl.innerText = (data.requests || 0) + "次";
 			} catch (e) { console.error("Failed to load token stats:", e); }
 		}
 
