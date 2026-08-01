@@ -4,23 +4,18 @@
  * 支持多账号负载均衡、故障自动切换重试，还自带一个可视化管理面板。
  */
 
-// 用量限额配置（均可通过环境变量覆盖，未设置则使用默认值）
-const DEFAULT_DAILY_LIMIT = 10000;     // 默认每日限额 10,000 Neurons
-const DEFAULT_MONTHLY_LIMIT = 100000;  // 默认每月限额 100,000 Neurons（$5/月套餐）
-const DEFAULT_USAGE_THRESHOLD = 0;     // 默认触发拦截的用量阈值；设为 0 表示关闭限额拦截（仅统计不拦截）
+// 用量限额配置（环境变量覆盖，未设置则用默认值）
+const DEFAULT_DAILY_LIMIT = 10000;
+const DEFAULT_MONTHLY_LIMIT = 100000;
+const DEFAULT_USAGE_THRESHOLD = 0; // 0 表示关闭限额拦截（仅统计不拦截）
 
-// 缓存与刷新相关常量
-const USAGE_CACHE_TTL_MS = 300000;     // 用量汇总缓存有效期 5 分钟（毫秒）
-const USAGE_REFRESH_LIMIT = 20;        // 每次刷新最多更新的账号数
-const MONTHLY_USAGE_TTL_SEC = 38 * 24 * 60 * 60; // 月度用量 KV 键 TTL 38 天（秒）
-const MODEL_CREATED_TS = 1686935000;   // 模型列表中的 created 时间戳（2023-06-16）
+// 缓存与刷新常量
+const USAGE_CACHE_TTL_MS = 300000;
+const USAGE_REFRESH_LIMIT = 20;
+const MONTHLY_USAGE_TTL_SEC = 38 * 24 * 60 * 60;
+const MODEL_CREATED_TS = 1686935000;
 
-// ----------------------------------------------------
-// Token 统计：从 CF 响应 usage 字段实时累加，批量写入 KV
-// 格式化用 k/w/亿，显示 tok/s 生成速度
-// ----------------------------------------------------
-
-// 数字格式化：<1k 原样，1k-1w 用 k，1w-1亿 用 w，1亿+ 用亿
+// Token 统计：从 CF 响应 usage 字段实时累加写入 KV
 function fmtTok(n) {
 	if (n < 1000) return String(n);
 	if (n < 10000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
@@ -28,10 +23,6 @@ function fmtTok(n) {
 	return (n / 100000000).toFixed(2).replace(/\.?0+$/, '') + '亿';
 }
 
-// Worker 实例内存缓冲：批量累加，定时 flush 到 KV，减少写入次数
-let _tokenBuffer = { input: 0, output: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0 };
-let _tokenBufferFlushAt = 0;
-const TOKEN_FLUSH_INTERVAL_MS = 30000; // 30 秒 flush 一次
 const TOKEN_KV_TTL_SEC = 86400 * 2;    // KV 键保留 2 天
 
 // 获取今日 token 统计的 KV 键名（按 UTC 日期）
@@ -39,65 +30,44 @@ function getTokenDailyKey() {
 	return `tokens_daily_${new Date().toISOString().split('T')[0]}`;
 }
 
-// 累加 token 到内存缓冲，达到阈值或超时后批量写入 KV
+// 累加 token 直接写入 KV（无内存缓冲，避免冷启动丢失）
 // 用 ctx.waitUntil() 后台执行，不阻塞响应
 async function accumulateTokens(env, ctx, { input = 0, output = 0, durationSec = 0 }) {
-	_tokenBuffer.input += input;
-	_tokenBuffer.output += output;
-	_tokenBuffer.requests += 1;
-	if (durationSec > 0 && output > 0) {
-		_tokenBuffer.tokPerSecSum += Math.round(output / durationSec);
-		_tokenBuffer.tokPerSecCount += 1;
-	}
-
-	const now = Date.now();
-	if (now - _tokenBufferFlushAt < TOKEN_FLUSH_INTERVAL_MS && _tokenBuffer.requests < 100) return;
-	if (_tokenBufferFlushAt === 0) { _tokenBufferFlushAt = now; return; }
-
-	// flush 到 KV：读取现有值 + 累加 + 写回
-	const batch = { ..._tokenBuffer };
-	_tokenBuffer = { input: 0, output: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0 };
-	_tokenBufferFlushAt = now;
-
 	ctx.waitUntil((async () => {
 		try {
 			const key = getTokenDailyKey();
 			const raw = await env.KV.get(key);
 			const cur = raw ? JSON.parse(raw) : { input: 0, output: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0 };
-			cur.input += batch.input;
-			cur.output += batch.output;
-			cur.requests += batch.requests;
-			cur.tokPerSecSum = (cur.tokPerSecSum || 0) + batch.tokPerSecSum;
-			cur.tokPerSecCount = (cur.tokPerSecCount || 0) + batch.tokPerSecCount;
+			cur.input += input;
+			cur.output += output;
+			cur.requests += 1;
+			if (durationSec > 0 && output > 0) {
+				cur.tokPerSecSum = (cur.tokPerSecSum || 0) + Math.round(output / durationSec);
+				cur.tokPerSecCount = (cur.tokPerSecCount || 0) + 1;
+			}
 			await env.KV.put(key, JSON.stringify(cur), { expirationTtl: TOKEN_KV_TTL_SEC });
 		} catch (e) {
-			console.error('Failed to flush token stats to KV:', e?.message || e);
+			console.error('Failed to accumulate tokens:', e?.message || e);
 		}
 	})());
 }
 
-// 从 KV 读取今日 token 统计（含内存缓冲中未 flush 的部分）
+// 从 KV 读取今日 token 统计
 async function getTodayTokenStats(env) {
 	const key = getTokenDailyKey();
 	let kvData = { input: 0, output: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0 };
 	try {
 		const raw = await env.KV.get(key);
 		if (raw) kvData = JSON.parse(raw);
-	} catch (e) { /* KV 未初始化或解析失败，用默认值 */ }
+	} catch (e) { console.error('Failed to read token stats:', e?.message || e); }
 
-	// 加上内存缓冲中尚未 flush 的部分
-	const totalInput = (kvData.input || 0) + _tokenBuffer.input;
-	const totalOutput = (kvData.output || 0) + _tokenBuffer.output;
-	const totalRequests = (kvData.requests || 0) + _tokenBuffer.requests;
-	const totalTokPerSecSum = (kvData.tokPerSecSum || 0) + _tokenBuffer.tokPerSecSum;
-	const totalTokPerSecCount = (kvData.tokPerSecCount || 0) + _tokenBuffer.tokPerSecCount;
-	const avgTokPerSec = totalTokPerSecCount > 0 ? Math.round(totalTokPerSecSum / totalTokPerSecCount) : 0;
+	const avgTokPerSec = (kvData.tokPerSecCount || 0) > 0 ? Math.round((kvData.tokPerSecSum || 0) / (kvData.tokPerSecCount || 0)) : 0;
 
 	return {
-		input: totalInput,
-		output: totalOutput,
-		total: totalInput + totalOutput,
-		requests: totalRequests,
+		input: kvData.input || 0,
+		output: kvData.output || 0,
+		total: (kvData.input || 0) + (kvData.output || 0),
+		requests: kvData.requests || 0,
 		avgTokPerSec,
 	};
 }
@@ -170,10 +140,7 @@ export default {
 			if (!env.KV) {
 				const url = new URL(request.url);
 				if (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/api/')) {
-					return new Response(JSON.stringify({ error: { message: 'KV storage not configured. Please bind a KV namespace named \'KV\' in your Pages project settings.', type: 'server_error' } }), {
-						status: 503,
-						headers: { 'Content-Type': 'application/json' }
-					});
+					return jsonError('KV storage not configured. Please bind a KV namespace named \'KV\' in your Pages project settings.', 503, 'server_error');
 				}
 				return new Response('KV storage not configured. Please bind a KV namespace named \'KV\' in your Pages project settings.', {
 					status: 503,
@@ -185,10 +152,7 @@ export default {
 			if (!env.ADMIN_PASSWORD) {
 				const url = new URL(request.url);
 				if (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/api/')) {
-					return new Response(JSON.stringify({ error: { message: 'ADMIN_PASSWORD not configured. Please set this environment variable in your Pages project settings.', type: 'server_error' } }), {
-						status: 503,
-						headers: { 'Content-Type': 'application/json' }
-					});
+					return jsonError('ADMIN_PASSWORD not configured. Please set this environment variable in your Pages project settings.', 503, 'server_error');
 				}
 				return new Response('ADMIN_PASSWORD not configured. Please set this environment variable in your Pages project settings.', {
 					status: 503,
@@ -260,10 +224,7 @@ export default {
 			// 顶层兜底：仅记录安全信息，不打印异常对象本身，
 			// 避免异常可能携带的 Authorization 请求头被 Cloudflare tail workers 捕获
 			console.error(`Unhandled error: ${e?.message || e}`);
-			return new Response(JSON.stringify({ error: { message: 'Internal Server Error', type: 'server_error' } }), {
-				status: 500,
-				headers: { 'Content-Type': 'application/json' }
-			});
+			return jsonError('Internal Server Error', 500, 'server_error');
 		}
 	}
 };
@@ -300,15 +261,7 @@ async function sha256(message) {
 	return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// ----------------------------------------------------
-// KV 读写相关工具函数
-// 配置拆分为独立 KV 键，避免单键读写放大和并发覆盖风险：
-//   'cfg_accounts'   → 账号列表
-//   'cfg_api_keys'   → 代理 API Key 列表
-//   'cfg_model_map'  → 自定义模型映射
-//   'cfg_limits'     → 用量限额配置
-// ----------------------------------------------------
-
+// KV 工具函数：配置拆分为独立键，避免单键放大
 async function getAccounts(env) {
 	const raw = await env.KV.get('cfg_accounts', { cacheTtl: 60 });
 	if (!raw) return [];
@@ -351,14 +304,20 @@ async function saveUsageLimitsConfig(env, limits) {
 	await env.KV.put('cfg_limits', JSON.stringify({ ...existing, ...limits }));
 }
 
-// 缓存的正则表达式（模块顶层，避免每次请求重新编译）
 const COOKIE_TOKEN_RE = /admin_token=([^;]+)/;
 
-// ----------------------------------------------------
-// 管理员身份验证（同时支持 Cookie 和 Authorization 请求头）
-// ----------------------------------------------------
+// 恒定时间字符串比较，防止时序攻击
+function timingSafeEqual(a, b) {
+	if (a.length !== b.length) return false;
+	let result = 0;
+	for (let i = 0; i < a.length; i++) {
+		result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+	}
+	return result === 0;
+}
+
+// 管理员身份验证（Cookie + Authorization 头）
 async function checkAdminAuth(request, env) {
-	// 1. 先从 Cookie 里取登录令牌（浏览器访问时走这里）
 	const cookies = request.headers.get('Cookie') || '';
 	const cookieMatch = cookies.match(COOKIE_TOKEN_RE);
 	let token = cookieMatch ? cookieMatch[1] : null;
@@ -378,37 +337,36 @@ async function checkAdminAuth(request, env) {
 	if (!expectedPassword) return false; // 还没配置管理员密码
 
 	const expectedHash = await sha256(expectedPassword);
-	return token === expectedHash;
+	return timingSafeEqual(token, expectedHash);
 }
 
-// ----------------------------------------------------
-// 代理接口的鉴权工具函数
-// ----------------------------------------------------
+// 代理接口鉴权
 async function checkProxyAuth(request, env) {
 	const apiKeys = await getApiKeys(env);
 	if (apiKeys.length === 0) {
-		return true; // 没配置任何密钥 = 不校验，谁都能用
-	}
-
-	// 先检查 x-api-key 头
-	const xApiKey = request.headers.get('x-api-key');
-	if (xApiKey && apiKeys.some(k => k.key === xApiKey)) {
 		return true;
 	}
 
-	// 再检查 Authorization: Bearer 头
+	const xApiKey = request.headers.get('x-api-key');
+	if (xApiKey && apiKeys.some(k => timingSafeEqual(k.key, xApiKey))) {
+		return true;
+	}
+
 	const authHeader = request.headers.get('Authorization');
 	if (authHeader && authHeader.startsWith('Bearer ')) {
 		const token = authHeader.substring(7);
-		return apiKeys.some(k => k.key === token);
+		return apiKeys.some(k => timingSafeEqual(k.key, token));
 	}
 
 	return false;
 }
 
-// ----------------------------------------------------
-// 环境变量读取工具函数（避免 falsy 陷阱：parseInt("0") || 10000 → 10000）
-// ----------------------------------------------------
+// 通用 JSON 错误响应
+function jsonError(message, status = 500, type = 'server_error') {
+	return new Response(JSON.stringify({ error: { message, type } }), { status, headers: { 'Content-Type': 'application/json' } });
+}
+
+// 环境变量读取（避免 falsy 陷阱）
 function getEnvInt(env, key, defaultVal) {
 	const raw = env[key];
 	if (raw === undefined || raw === null || raw === '') return defaultVal;
@@ -423,15 +381,11 @@ function getEnvFloat(env, key, defaultVal) {
 	return isNaN(val) ? defaultVal : val;
 }
 
-// 统一读取日/月限额和阈值配置
-// 优先级：环境变量 > KV 中保存的配置 > 默认值
-// threshold <= 0 表示关闭限额拦截：用量照常统计，但不会拦截请求。
+// 读取日/月限额和阈值配置（优先级：环境变量 > KV > 默认值）
 async function getUsageLimits(env) {
-	// 先从 KV 读取用户保存的配置
 	const kvLimits = await getUsageLimitsConfig(env);
 
 	return {
-		// env var 未设置时用 KV 值，KV 也未设置时用默认值
 		dailyLimit: getEnvInt(env, 'DAILY_LIMIT', kvLimits.dailyLimit ?? DEFAULT_DAILY_LIMIT),
 		monthlyLimit: getEnvInt(env, 'MONTHLY_LIMIT', kvLimits.monthlyLimit ?? DEFAULT_MONTHLY_LIMIT),
 		threshold: getEnvFloat(env, 'USAGE_THRESHOLD', kvLimits.threshold ?? DEFAULT_USAGE_THRESHOLD)
@@ -444,26 +398,22 @@ function getMonthlyUsageKey() {
 	return `usage_monthly_${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
-// 从 KV 读取当月用量（由 refreshAccountsUsage 定期更新）
+// 读取当月用量
 async function getMonthlyUsage(env) {
 	const raw = await env.KV.get(getMonthlyUsageKey());
 	return raw ? parseInt(raw, 10) : 0;
 }
 
-// ----------------------------------------------------
-// 用量限额检查：读取日/月用量，超过阈值则返回 blocked
-// ----------------------------------------------------
+// 用量限额检查
 async function checkUsageLimit(env) {
-	// 1. 读取环境变量，未设置则使用默认值
 	const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
 
-	// 2. 获取当日用量（优先读缓存汇总，过期则从明细汇总）
+	// 当日用量（优先读缓存汇总）
 	let dailyUsage = 0;
 	const cached = await getCachedSummary(env);
 	if (cached) {
 		dailyUsage = cached.totalNeuronsToday || 0;
 	} else {
-		// 汇总 cache_usage_details 中所有账号的今日用量
 		const detailsRaw = await env.KV.get('cache_usage_details');
 		if (detailsRaw) {
 			try {
@@ -471,16 +421,14 @@ async function checkUsageLimit(env) {
 				for (const [, data] of Object.entries(cacheMap)) {
 					dailyUsage += data.usageToday || 0;
 				}
-			} catch (_) { }
+			} catch (_) { console.error('Failed to parse cache_usage_details:', _?.message || _); }
 		}
 	}
 
-	// 3. 获取当月用量（从独立 KV 键读取，由 refreshAccountsUsage 定期更新）
 	const monthlyUsage = await getMonthlyUsage(env);
 
-	// 4. 判断是否触发拦截（threshold <= 0 表示关闭限额：仅统计不拦截）
 	let result;
-	if (threshold <= 0) {
+	if (threshold <= 0) { // threshold <= 0 表示关闭限额拦截
 		result = { allowed: true, dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold };
 	} else {
 		const dailyExceeded = dailyUsage >= dailyLimit * threshold;
@@ -499,9 +447,7 @@ async function checkUsageLimit(env) {
 	return result;
 }
 
-// ----------------------------------------------------
-// 用量统计的缓存工具函数
-// ----------------------------------------------------
+// 用量缓存工具
 async function getCachedSummary(env) {
 	const cached = await env.KV.get('cache_usage_summary');
 	if (cached) {
@@ -591,16 +537,7 @@ async function buildUsageSummary(env, accounts, cacheMap) {
 	};
 }
 
-// 并发锁：防止多个请求同时刷新用量导致数据覆盖
-let _usageRefreshLock = null;
-
 async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) {
-	// 如果已有刷新任务在进行中，等待其完成后返回结果
-	if (_usageRefreshLock) {
-		try { return await _usageRefreshLock; } catch (_) { /* 忽略前一次错误，重新刷新 */ }
-	}
-
-	const _doRefresh = async () => {
 	const cachedDetailsRaw = await env.KV.get('cache_usage_details');
 	let cacheMap = {};
 	if (cachedDetailsRaw) {
@@ -611,7 +548,7 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) 
 		}
 	}
 
-	// 按最后更新的时间戳升序排序（时间戳为 0 或不存在的最先更新）
+	// 按最后更新时间升序，优先更新最旧数据
 	const sortedAccounts = [...accounts].sort((a, b) => {
 		const tA = cacheMap[a.id]?.timestamp || 0;
 		const tB = cacheMap[b.id]?.timestamp || 0;
@@ -627,29 +564,28 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) 
 	const todayUTC = new Date();
 	todayUTC.setUTCHours(0, 0, 0, 0);
 
-	// 月初日期（用于月度用量汇总）
+	// 月初日期
 	const monthStart = new Date(Date.UTC(todayUTC.getUTCFullYear(), todayUTC.getUTCMonth(), 1));
 	const startMonth = monthStart.toISOString().split('.')[0] + 'Z';
 
 	const promises = accountsToUpdate.map(async (account) => {
 		try {
-			// 只发 1 次 GraphQL 查询（7 天窗口），从中提取今日数据和历史数据
-			// 月度数据：月初在 7 天内则从同一结果提取，否则独立查询
+			// 7 天窗口单次查询，提取今日+历史数据
 			const historyGroups = await queryGraphQL(account.accountId, account.apiToken, startSevenDays);
 			const historyParsed = processAnalytics(historyGroups);
 
-			// 复用 processAnalytics 已计算好的今日用量和模型明细
+			
 			const todayUsage = historyParsed.todayTotalNeurons;
 			const todayRequests = historyParsed.todayTotalRequests;
 			const todayModels = historyParsed.todayModels;
 			const todayDateStr = new Date().toISOString().split('T')[0];
 
-			// 月度查询：月初在 7 天窗口内时从 historyGroups 提取，否则独立查询
+			// 月初在窗口内则从同一查询提取，否则独立查
 			let monthlyTotal;
 			let monthlyRequests = 0;
 			const monthStartStr = monthStart.toISOString().split('T')[0];
 			if (historyParsed.history.some(h => h.date === monthStartStr)) {
-				// 月初在 7 天窗口内，只汇总本月的数据（过滤掉上月的记录）
+				// 汇总本月数据
 				monthlyTotal = historyGroups.reduce((sum, g) => {
 					if (g.dimensions.date >= monthStartStr) return sum + (g.sum?.totalNeurons || 0);
 					return sum;
@@ -659,7 +595,7 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) 
 					return sum;
 				}, 0);
 			} else {
-				// 月初不在 7 天窗口内，独立查询（失败不连坐其他数据）
+				// 月初不在窗口内，独立查询
 				const monthGroups = await queryGraphQL(account.accountId, account.apiToken, startMonth)
 				.catch(e => {
 					// 仅记录账号名与错误消息，避免异常对象可能携带请求头/ token 被 tail workers 捕获
@@ -708,7 +644,7 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) 
 	await Promise.all(promises);
 	await env.KV.put('cache_usage_details', JSON.stringify(cacheMap));
 
-	// 汇总所有账号的月度用量并写入独立 KV 键（供 checkUsageLimit 快速读取）
+	// 汇总月度用量写入 KV
 	let totalMonthly = 0;
 	for (const [, data] of Object.entries(cacheMap)) {
 		totalMonthly += data.usageThisMonth || 0;
@@ -716,19 +652,9 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) 
 	await env.KV.put(getMonthlyUsageKey(), String(totalMonthly), { expirationTtl: MONTHLY_USAGE_TTL_SEC });
 
 	return cacheMap;
-	}; // end _doRefresh
-
-	_usageRefreshLock = _doRefresh();
-	try {
-		return await _usageRefreshLock;
-	} finally {
-		_usageRefreshLock = null;
-	}
 }
 
-// ----------------------------------------------------
-// Cloudflare GraphQL 用量分析查询
-// ----------------------------------------------------
+// GraphQL 用量分析
 async function queryGraphQL(accountId, apiToken, startDateTime) {
 	const query = `
 		query GetAIUsage($accountId: String!, $start: String!) {
@@ -831,15 +757,11 @@ function processAnalytics(groups) {
 	};
 }
 
-// ----------------------------------------------------
-// OpenAI 兼容代理接口（/v1/）的处理函数
-// ----------------------------------------------------
+// OpenAI 兼容代理接口（/v1/）
 async function handleV1Proxy(request, env, ctx) {
 	const url = new URL(request.url);
 
-	// 1. 校验调用密钥（API Key）
 	if (!await checkProxyAuth(request, env)) {
-		// /v1/messages 返回 Anthropic 格式错误，其他路径返回 OpenAI 格式
 		if (url.pathname === '/v1/messages') {
 			return new Response(JSON.stringify({
 				type: 'error',
@@ -859,25 +781,21 @@ async function handleV1Proxy(request, env, ctx) {
 		}), { status: 401, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 2. 用量限额检查（超过阈值则拒绝请求）
 	const limitCheck = await checkUsageLimit(env);
 	if (!limitCheck.allowed) {
 		const msg = `Request blocked: ${limitCheck.reason}. Please check your usage dashboard.`;
 
-		// Anthropic 格式错误
 		if (url.pathname === '/v1/messages') {
 			return new Response(JSON.stringify({
 				type: 'error',
 				error: { type: 'quota_exceeded', message: msg }
 			}), { status: 429, headers: { 'Content-Type': 'application/json' } });
 		}
-		// OpenAI 格式错误
 		return new Response(JSON.stringify({
 			error: { message: msg, type: 'quota_exceeded' }
 		}), { status: 429, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 3. 获取模型列表接口（/v1/models）
 	if (url.pathname === '/v1/models' && request.method === 'GET') {
 		const customMap = await getCustomModelMap(env);
 		const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
@@ -897,60 +815,44 @@ async function handleV1Proxy(request, env, ctx) {
 			};
 		});
 
-
 		return new Response(JSON.stringify({
 			object: 'list',
 			data: modelsData
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 4. 对话补全 / 文本补全 接口
 	if ((url.pathname === '/v1/chat/completions' || url.pathname === '/v1/completions') && request.method === 'POST') {
 		return handleCompletions(request, env, ctx, url.pathname);
 	}
 
-	// 5. Anthropic Messages API 接口（/v1/messages）
 	if (url.pathname === '/v1/messages' && request.method === 'POST') {
-		return handleMessages(request, env);
+		return handleMessages(request, env, ctx);
 	}
 
-	// 向量嵌入接口
 	if (url.pathname === '/v1/embeddings' && request.method === 'POST') {
 		return handleEmbeddings(request, env, ctx);
 	}
 
-	// 图片生成接口
 	if (url.pathname === '/v1/images/generations' && request.method === 'POST') {
 		return handleImageGenerations(request, env);
 	}
 
-	// 音频转录接口
 	if (url.pathname === '/v1/audio/transcriptions' && request.method === 'POST') {
 		return handleAudioTranscriptions(request, env);
 	}
 
-	// 文本转语音接口（TTS）
 	if (url.pathname === '/v1/audio/speech' && request.method === 'POST') {
 		return handleAudioSpeech(request, env);
 	}
 
-	// Anthropic token 计数接口
 	if (url.pathname === '/v1/messages/count_tokens' && request.method === 'POST') {
 		return handleCountTokens(request, env);
 	}
 
-	return new Response(JSON.stringify({
-		error: { message: `Path not found: ${url.pathname}`, type: "invalid_request_error" }
-	}), { status: 404, headers: { 'Content-Type': 'application/json' } });
+	return jsonError(`Path not found: ${url.pathname}`, 404, "invalid_request_error");
 }
 
-// ----------------------------------------------------
-// 可复用的核心 API 调用函数
-// 将 OpenAI Chat Completions 格式的请求发送到 Cloudflare AI 网关，
-// 支持多账号故障自动切换（failover）：按顺序遍历活跃账号，遇到 5xx/429/网络错误时自动切到下一个。
-// 注：单用户场景通常只有 1 个账号，此循环仅在多账号时生效。
-// 返回格式：{ success: true, data: cfJson } 或 { success: false, error: "..." }
-// ----------------------------------------------------
+// 可复用的核心 API 调用：OpenAI Chat Completions → CF AI 网关，支持多账号 failover
 async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 	const accounts = await getAccounts(env);
 	const activeAccounts = accounts.filter(a => a.status === 'active');
@@ -963,8 +865,7 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 
 	for (const account of activeAccounts) {
 		try {
-			// 流式请求使用更长的超时（5 分钟），避免推理模型的长时间流式输出被截断
-			// 非流式请求保持 30 秒超时，快速失败以便 failover
+			// 流式超时 5min，非流式 30s
 			const timeoutMs = stream ? 300000 : 30000;
 			const cfResponse = await fetch(
 				`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/v1/chat/completions`,
@@ -980,24 +881,58 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 			);
 
 			if (cfResponse.ok) {
-				if (stream) {
-					if (!cfResponse.body) {
-						lastError = `CF API returned empty response body`;
-						continue;
-					}
-					// 流式响应：一旦拿到 HTTP 200 + body 就立即返回，不预读首字节。
-					// 这意味着如果上游在流式传输中途断开，客户端会收到截断的流而不会触发 failover。
-					// 这是刻意的设计权衡：预读会破坏 SSE 的实时性。
-					return { success: true, status: cfResponse.status, stream: cfResponse.body };
+			if (stream) {
+				if (!cfResponse.body) {
+					lastError = `CF API returned empty response body`;
+					continue;
 				}
+				// 预读第一个 chunk 校验响应格式，
+				// 避免 CF 返回 HTTP 200 + {"success":false,...} 错误体被当作 SSE 流处理
+				const streamReader = cfResponse.body.getReader();
+				const firstResult = await streamReader.read();
+				if (firstResult.done) {
+					lastError = `CF API returned empty stream`;
+					continue;
+				}
+				const decoder = new TextDecoder();
+				const firstText = decoder.decode(firstResult.value, { stream: true });
+				// 以 { 开头且包含 success:false → JSON 错误体，非 SSE
+				if (firstText.trimStart().startsWith('{') && (firstText.includes('"success":false') || firstText.includes('"success": false'))) {
+					let errBody = firstText;
+					while (true) {
+						const { value, done } = await streamReader.read();
+						if (done) break;
+						errBody += decoder.decode(value, { stream: true });
+					}
+					lastStatus = cfResponse.status;
+					lastError = `CF API error: ${errBody}`;
+					continue;
+				}
+				// 是有效的 SSE 流，重新包装流（把预读的 chunk 放回去）
+				const wrappedStream = new ReadableStream({
+					start(controller) { controller.enqueue(firstResult.value); },
+					async pull(controller) {
+						try {
+							const { value, done } = await streamReader.read();
+							if (done) controller.close();
+							else controller.enqueue(value);
+						} catch (e) { console.error('wrappedStream pull error:', e?.message || e); try { controller.close(); } catch (_) {} }
+					},
+					cancel() { try { streamReader.cancel(); } catch (e) { console.error('wrappedStream cancel error:', e?.message || e); } }
+				});
+				return { success: true, status: cfResponse.status, stream: wrappedStream };
+			}
 				const cfJson = await cfResponse.json();
 				return { success: true, status: cfResponse.status, data: cfJson };
 			}
 
-			// 非 2xx：记录错误与状态码后继续尝试下一个账号（failover）
 			const errorText = await cfResponse.text();
 			lastStatus = cfResponse.status;
 			lastError = `CF API returned ${cfResponse.status}: ${errorText}`;
+			// 4xx 客户端错误（除 429 限流外）切换账号也不会成功，直接返回
+			if (cfResponse.status >= 400 && cfResponse.status < 500 && cfResponse.status !== 429) {
+				return { success: false, status: lastStatus, error: lastError };
+			}
 		} catch (e) {
 			lastStatus = 502; // 网络异常归为 502
 			lastError = `Connection error: ${e.message}`;
@@ -1021,7 +956,8 @@ async function resolveModelName(model, env) {
 
 // 通用的 CF /ai/run/{model} failover 调用函数
 // 用于 embeddings、images、audio 等非 chat 端点，统一多账号 failover 逻辑
-async function callCFRunAPI(cfModel, buildPayload, processResult, env, timeout = 30000) {
+// timeout 参数传递给 buildPayload 回调使用（各端点在 cfPayload 中设置 AbortSignal.timeout）
+async function callCFRunAPI(cfModel, buildPayload, processResult, env) {
 	const accounts = await getAccounts(env);
 	const activeAccounts = accounts.filter(a => a.status === 'active');
 	if (activeAccounts.length === 0) {
@@ -1063,11 +999,11 @@ async function resolveModelWithFallback(model, env) {
 	return { cfModel, isFallback, fallbackWarning };
 }
 
-// 对话补全 / 文本补全 的代理处理函数
+// 对话补全 / 文本补全
 async function handleCompletions(request, env, ctx, pathname) {
 	const body = await safeJsonBody(request);
 	if (!body) {
-		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		return jsonError("Invalid JSON body", 400, "invalid_request_error");
 	}
 
 	const requestStartTime = Date.now();
@@ -1075,16 +1011,14 @@ async function handleCompletions(request, env, ctx, pathname) {
 	const { model, messages, prompt, stream } = body;
 
 	if (pathname === '/v1/chat/completions' && !messages) {
-		return new Response(JSON.stringify({ error: { message: "messages field is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		return jsonError("messages field is required", 400, "invalid_request_error");
 	}
 	if (pathname === '/v1/completions' && !prompt) {
-		return new Response(JSON.stringify({ error: { message: "prompt field is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		return jsonError("prompt field is required", 400, "invalid_request_error");
 	}
 
-	// 解析模型名映射（找不到映射时回退到默认模型并标记 isFallback）
 	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model, env);
 
-	// 构造发给 Cloudflare 的请求体
 	const cfPayload = {
 		model: cfModel,
 		messages: pathname === '/v1/chat/completions' ? messages : [{ role: 'user', content: prompt }],
@@ -1102,7 +1036,6 @@ async function handleCompletions(request, env, ctx, pathname) {
 		if (body[field] !== undefined) cfPayload[field] = body[field];
 	}
 
-	// 流式请求时，确保 CF 返回 usage 信息（用于 token 统计）
 	if (stream && !cfPayload.stream_options) {
 		cfPayload.stream_options = { include_usage: true };
 	}
@@ -1110,9 +1043,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 	const result = await callOpenAICompatibleAPI(cfPayload, env, stream);
 
 	if (!result.success) {
-		return new Response(JSON.stringify({
-			error: { message: result.error, type: "server_error" }
-		}), { status: result.status || 502, headers: { 'Content-Type': 'application/json' } });
+		return jsonError(result.error, result.status || 502, "server_error");
 	}
 
 	if (stream) {
@@ -1120,8 +1051,6 @@ async function handleCompletions(request, env, ctx, pathname) {
 		const streamHeaders = {
 			'Content-Type': 'text/event-stream',
 			'Cache-Control': 'no-cache',
-			'Connection': 'keep-alive',
-			'Transfer-Encoding': 'chunked',
 		};
 		if (fallbackWarning) streamHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
 		return new Response(transformedStream, { headers: streamHeaders });
@@ -1130,7 +1059,6 @@ async function handleCompletions(request, env, ctx, pathname) {
 		if (cfJson.model !== undefined) cfJson.model = model;
 		const responseHeaders = { 'Content-Type': 'application/json' };
 		if (fallbackWarning) responseHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
-		// 提取 CF 返回的真实 token 计数，累加到今日统计
 		if (cfJson.usage) {
 			const durationSec = (Date.now() - requestStartTime) / 1000;
 			accumulateTokens(env, ctx, {
@@ -1140,7 +1068,6 @@ async function handleCompletions(request, env, ctx, pathname) {
 			});
 		}
 		if (pathname === '/v1/completions') {
-			// /v1/completions 返回 text_completion 格式（choices[].text）而非 chat 格式（choices[].message）
 			const textChoices = (cfJson.choices || []).map(c => ({
 				text: c.message?.content || '',
 				index: c.index ?? 0,
@@ -1161,58 +1088,26 @@ async function handleCompletions(request, env, ctx, pathname) {
 	}
 }
 
-// ----------------------------------------------------
 // Anthropic Messages API → OpenAI Chat Completions 格式转换
-// ----------------------------------------------------
 function convertAnthropicToOpenAI(anthropicBody) {
 	const openaiBody = {};
 
-	// model 直接映射
 	openaiBody.model = anthropicBody.model;
+	if (anthropicBody.max_tokens !== undefined) openaiBody.max_tokens = anthropicBody.max_tokens;
+	if (anthropicBody.stream !== undefined) openaiBody.stream = anthropicBody.stream;
+	if (anthropicBody.temperature !== undefined) openaiBody.temperature = anthropicBody.temperature;
+	if (anthropicBody.top_p !== undefined) openaiBody.top_p = anthropicBody.top_p;
+	if (anthropicBody.stop_sequences !== undefined) openaiBody.stop = anthropicBody.stop_sequences;
+	// top_k：OpenAI Chat Completions 不支持，丢弃
+	if (anthropicBody.metadata && anthropicBody.metadata.user_id) openaiBody.user = anthropicBody.metadata.user_id;
 
-	// max_tokens 直接映射
-	if (anthropicBody.max_tokens !== undefined) {
-		openaiBody.max_tokens = anthropicBody.max_tokens;
-	}
-
-	// stream 直接映射
-	if (anthropicBody.stream !== undefined) {
-		openaiBody.stream = anthropicBody.stream;
-	}
-
-	// temperature 直接映射
-	if (anthropicBody.temperature !== undefined) {
-		openaiBody.temperature = anthropicBody.temperature;
-	}
-
-	// top_p 直接映射
-	if (anthropicBody.top_p !== undefined) {
-		openaiBody.top_p = anthropicBody.top_p;
-	}
-
-	// stop_sequences → stop
-	if (anthropicBody.stop_sequences !== undefined) {
-		openaiBody.stop = anthropicBody.stop_sequences;
-	}
-
-	// top_k：OpenAI chat completions API 不支持 top_k，丢弃此字段。
-	// 若未来上游支持，可取消注释：if (anthropicBody.top_k !== undefined) openaiBody.top_k = anthropicBody.top_k;
-
-	// metadata.user_id → user 字段
-	if (anthropicBody.metadata && anthropicBody.metadata.user_id) {
-		openaiBody.user = anthropicBody.metadata.user_id;
-	}
-
-	// 构建 OpenAI 格式的 messages 数组
 	const openaiMessages = [];
 
-	// Anthropic system 字段 → OpenAI system role message (插入到 messages 最前面)
 	if (anthropicBody.system) {
 		let systemContent = '';
 		if (typeof anthropicBody.system === 'string') {
 			systemContent = anthropicBody.system;
 		} else if (Array.isArray(anthropicBody.system)) {
-			// system 为数组格式：[{type: "text", text: "..."}, ...]
 			for (const block of anthropicBody.system) {
 				if (block.type === 'text' && block.text) {
 					systemContent += block.text + '\n';
@@ -1225,12 +1120,10 @@ function convertAnthropicToOpenAI(anthropicBody) {
 		}
 	}
 
-	// 转换 messages
 	for (const msg of anthropicBody.messages) {
 		const role = msg.role;
 		const content = msg.content;
 
-		// Anthropic 的 content 可能是字符串或数组
 		if (typeof content === 'string') {
 			openaiMessages.push({ role, content });
 		} else if (Array.isArray(content)) {
@@ -1376,9 +1269,7 @@ function convertAnthropicToOpenAI(anthropicBody) {
 	return openaiBody;
 }
 
-// ----------------------------------------------------
 // OpenAI Chat Completion 响应 → Anthropic Messages 格式转换
-// ----------------------------------------------------
 function convertOpenAIToAnthropic(openaiResponse, originalModel) {
 	const choice = openaiResponse.choices?.[0] || {};
 	const message = choice.message || {};
@@ -1460,13 +1351,9 @@ function convertOpenAIErrorToAnthropic(openaiError) {
 	};
 }
 
-// ----------------------------------------------------
-// Anthropic /v1/messages 路由处理函数
-// ----------------------------------------------------
-async function handleMessages(request, env) {
-	// 认证由 handleV1Proxy 的 checkProxyAuth 统一处理（支持 x-api-key + Bearer）
-
-	// 解析请求体
+// Anthropic /v1/messages 路由
+async function handleMessages(request, env, ctx) {
+	const requestStartTime = Date.now();
 	const anthropicBody = await safeJsonBody(request);
 	if (!anthropicBody) {
 		return new Response(JSON.stringify({
@@ -1475,25 +1362,20 @@ async function handleMessages(request, env) {
 		}), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 基本参数校验
 	if (!anthropicBody.messages || !Array.isArray(anthropicBody.messages)) {
 		return new Response(JSON.stringify({
 			type: 'error',
 			error: { type: 'invalid_request_error', message: 'messages field is required and must be an array.' }
 		}), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
-	// max_tokens 在较新的 Anthropic SDK 中为可选字段，此处不再强制要求。
-	// 若未提供，则不设置 max_tokens，让上游模型使用其默认值。
-	// 解析模型名映射
+
 	const model = anthropicBody.model;
 	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model, env);
 
-	// Anthropic → OpenAI 格式转换
 	const openaiBody = convertAnthropicToOpenAI(anthropicBody);
 	openaiBody.model = cfModel;
 
 	const stream = !!anthropicBody.stream;
-	// 流式模式下，请求上游返回 usage 信息
 	if (stream) {
 		openaiBody.stream_options = { include_usage: true };
 	}
@@ -1501,7 +1383,6 @@ async function handleMessages(request, env) {
 	const result = await callOpenAICompatibleAPI(openaiBody, env, stream);
 
 	if (!result.success) {
-		// 尝试解析 CF 错误详情
 		let errorDetail;
 		try {
 			if (result.error && result.error.includes('CF API returned')) {
@@ -1510,7 +1391,7 @@ async function handleMessages(request, env) {
 					errorDetail = JSON.parse(match[1]);
 				}
 			}
-		} catch (_) { }
+		} catch (_) { console.error('Failed to parse CF error detail:', _?.message || _); }
 
 		const anthropicError = convertOpenAIErrorToAnthropic(
 			errorDetail || { message: result.error }
@@ -1522,31 +1403,33 @@ async function handleMessages(request, env) {
 	}
 
 	if (stream) {
-		// 流式：转换流
-		const transformedStream = anthropicStreamTransform(result.stream, model, anthropicBody.messages);
+		const transformedStream = anthropicStreamTransform(result.stream, model, anthropicBody.messages, env, ctx, requestStartTime);
 		const streamHeaders = {
 			'Content-Type': 'text/event-stream',
 			'Cache-Control': 'no-cache',
-			'Connection': 'keep-alive',
-			'Transfer-Encoding': 'chunked',
 		};
 		if (fallbackWarning) streamHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
 		return new Response(transformedStream, { headers: streamHeaders });
 	} else {
-		// 非流式：转换响应
 		const openaiResponse = result.data;
 		const anthropicResponse = convertOpenAIToAnthropic(openaiResponse, model);
 		const responseHeaders = { 'Content-Type': 'application/json' };
 		if (fallbackWarning) responseHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		// 累加 token 统计（非流式）
+		if (ctx && openaiResponse.usage) {
+			const durationSec = (Date.now() - requestStartTime) / 1000;
+			accumulateTokens(env, ctx, {
+				input: openaiResponse.usage.prompt_tokens || 0,
+				output: openaiResponse.usage.completion_tokens || 0,
+				durationSec,
+			});
+		}
 		return new Response(JSON.stringify(anthropicResponse), { headers: responseHeaders });
 	}
 }
 
-// ----------------------------------------------------
-// Anthropic SSE 流式转换
-// 将 OpenAI SSE 格式实时转换为 Anthropic SSE 格式
-// ----------------------------------------------------
-function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
+// Anthropic SSE 流式转换：OpenAI SSE → Anthropic SSE
+function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env, ctx, requestStartTime) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
@@ -1567,7 +1450,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 
 	return new ReadableStream({
 		start(controller) {
-			// 发送初始 ping 事件，保持连接活跃（推理模型首 token 前可能有较长延迟）
+			// 初始 ping 保持连接（推理模型首 token 延迟可能较长）
 			controller.enqueue(encoder.encode(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`));
 		},
 		async pull(controller) {
@@ -1603,8 +1486,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 					}
 				}
 			} catch (e) {
-				// 上游流异常（超时、网络中断等）时兜底发送终止事件，
-				// 确保 Anthropic 客户端收到 message_stop 终止帧，避免 stream_truncated 错误
+				// 上游异常时兜底发送终止事件，避免 stream_truncated
 				console.error(`anthropicStreamTransform upstream error: ${e?.message || e}`);
 				try {
 					if (buffer.trim()) {
@@ -1613,7 +1495,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 					if (!finalEventSent) {
 						sendFinalEvent(controller);
 					}
-				} catch (_) { /* 尽力而为，忽略二次异常 */ }
+				} catch (e2) { console.error('anthropicStreamTransform secondary error:', e2?.message || e2); }
 				try { controller.close(); } catch (_) { }
 			}
 		},
@@ -1645,13 +1527,13 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 
 					const delta = choice.delta || {};
 
-					// 更新 usage
+					
 					if (chunk.usage) {
 						inputTokens = chunk.usage.prompt_tokens || 0;
 						outputTokens = chunk.usage.completion_tokens || 0;
 					}
 
-					// 处理 tool_calls delta
+					
 					if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
 						// 首次发送任何数据前先发送 message_start（Bug #1）
 						if (!streamStarted) {
@@ -1678,12 +1560,12 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 
 							if (tc.function?.arguments) {
 								currentToolArgs += tc.function.arguments;
-								// 发送 tool_use 的 input_json_delta
+								
 								sendToolUseDelta(controller, tc.function.arguments);
 							}
 						}
 					} else if (delta.reasoning_content) {
-						// 处理 thinking/reasoning 内容（对应 OpenAI 格式的 reasoning_content）
+						// 处理 reasoning_content（DeepSeek/R1 等推理模型）
 						if (!streamStarted) {
 							sendMessageStart(controller);
 							streamStarted = true;
@@ -1696,7 +1578,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 						}
 						sendThinkingDelta(controller, delta.reasoning_content);
 					} else if (delta.content) {
-						// 文本内容 delta
+						
 						if (!streamStarted) {
 							sendMessageStart(controller);
 							contentBlockIndex++;
@@ -1705,7 +1587,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 							blockStopSent = false;
 						}
 
-						// 如果之前有 thinking block 在进行中，先结束并开始 text block
+						// 结束 thinking block，开始 text block
 						if (thinkingBlockActive) {
 							sendContentBlockStop(controller);
 							blockStopSent = true;
@@ -1715,7 +1597,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 							blockStopSent = false;
 						}
 
-						// 如果之前有 tool_call 在进行中，先结束
+						// 结束 tool_call block
 						if (currentToolCallId) {
 							sendContentBlockStop(controller);
 							blockStopSent = true;
@@ -1732,7 +1614,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 						sendTextDelta(controller, delta.content);
 					}
 
-					// 检查 finish_reason
+					
 					if (choice.finish_reason) {
 						if (thinkingBlockActive) {
 							sendContentBlockStop(controller);
@@ -1740,13 +1622,11 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 							thinkingBlockActive = false;
 						}
 						if (currentToolCallId && currentToolArgs) {
-							// 发送最终的 tool_use input
+							
 							sendToolUseFinalInput(controller);
 						}
 					}
-				} catch (_) {
-					// 忽略解析错误
-				}
+				} catch (e) { console.error('Anthropic processLines error:', e?.message || e); }
 			}
 		}
 		return remaining;
@@ -1810,7 +1690,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 	}
 
 	function sendToolUseFinalInput(controller) {
-		// 发送最终的 content_block_stop
+		
 		controller.enqueue(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({
 			type: 'content_block_stop',
 			index: contentBlockIndex
@@ -1826,7 +1706,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 	}
 
 	function sendFinalEvent(controller) {
-		// 防止重复调用：[DONE] 和流结束都可能触发此函数，仅执行一次
+		
 		if (finalEventSent) return; // 已发送过终止事件则直接返回
 		// 如果 finish_reason 触发时已发送过 content_block_stop，跳过重复发送（Bug #2）
 		if (!streamStarted) {
@@ -1836,7 +1716,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 			sendContentBlockStart(controller, 'text');
 		}
 		if (!blockStopSent) {
-			sendContentBlockStop(controller);
+			try { sendContentBlockStop(controller); } catch (_) { /* 忽略 enqueue 异常 */ }
 		}
 		blockStopSent = true; // 确保 content_block_stop 不会重复发送
 
@@ -1853,27 +1733,37 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 			},
 			usage: { output_tokens: outputTokens || 0 }
 		};
-		controller.enqueue(encoder.encode(`event: message_delta\ndata: ${JSON.stringify(event)}\n\n`));
+		try { controller.enqueue(encoder.encode(`event: message_delta\ndata: ${JSON.stringify(event)}\n\n`)); } catch (_) { /* 忽略 enqueue 异常 */ }
 
-		controller.enqueue(encoder.encode(`event: message_stop\ndata: ${JSON.stringify({
+		try { controller.enqueue(encoder.encode(`event: message_stop\ndata: ${JSON.stringify({
 			type: 'message_stop'
-		})}\n\n`));
-		finalEventSent = true;  // 标记终止事件已发送，防止重复调用
+		})}\n\n`)); } catch (_) { /* 忽略 enqueue 异常 */ }
+		finalEventSent = true;
+
+		// 流结束时累加 token 统计
+		if (env && ctx && (inputTokens > 0 || outputTokens > 0)) {
+			const durationSec = requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0;
+			accumulateTokens(env, ctx, {
+				input: inputTokens,
+				output: outputTokens,
+				durationSec,
+			});
+		}
 	}
 }
 
-// 向量嵌入（Embeddings）的代理处理函数
+// 向量嵌入
 async function handleEmbeddings(request, env, ctx) {
 	const body = await safeJsonBody(request);
 	if (!body) {
-		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		return jsonError("Invalid JSON body", 400, "invalid_request_error");
 	}
 
 	const requestStartTime = Date.now();
 
 	const { model, input } = body;
 	if (!input) {
-		return new Response(JSON.stringify({ error: { message: "input is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		return jsonError("input is required", 400, "invalid_request_error");
 	}
 
 	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model, env);
@@ -1904,7 +1794,7 @@ async function handleEmbeddings(request, env, ctx) {
 	);
 
 	if (!result.success) {
-		return new Response(JSON.stringify({ error: { message: result.error, type: "server_error" } }), { status: result.status, headers: { 'Content-Type': 'application/json' } });
+		return jsonError(result.error, result.status, "server_error");
 	}
 
 	// 累加 embedding 的估算 token 数（无 output，只有 input）
@@ -1921,20 +1811,16 @@ async function handleEmbeddings(request, env, ctx) {
 	return new Response(JSON.stringify(result.data), { headers: embHeaders });
 }
 
-// ----------------------------------------------------
-// 图片生成接口 /v1/images/generations
-// 支持 Cloudflare Workers AI 的 flux-1-schnell 和 stable-diffusion-xl-base 模型
-// 调用 CF /ai/run/{model} 端点，返回 OpenAI Images 格式
-// ----------------------------------------------------
+// 图片生成 /v1/images/generations
 async function handleImageGenerations(request, env) {
 	const body = await safeJsonBody(request);
 	if (!body) {
-		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		return jsonError("Invalid JSON body", 400, "invalid_request_error");
 	}
 
 	const { model, prompt, response_format } = body;
 	if (!prompt) {
-		return new Response(JSON.stringify({ error: { message: "prompt is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		return jsonError("prompt is required", 400, "invalid_request_error");
 	}
 
 	// 模型映射：默认使用 flux-1-schnell
@@ -1964,9 +1850,19 @@ async function handleImageGenerations(request, env) {
 		},
 		(cfResult) => {
 			const rawImage = cfResult.image || cfResult;
-			const base64Str = typeof rawImage === 'string'
-				? rawImage
-				: btoa(String.fromCharCode(...new Uint8Array(rawImage)));
+			let base64Str;
+			if (typeof rawImage === 'string') {
+				base64Str = rawImage;
+			} else {
+				// 分块编码避免 String.fromCharCode 参数数量溢出（大图片 >64KB）
+				const bytes = new Uint8Array(rawImage);
+				let binary = '';
+				const chunkSize = 8192;
+				for (let i = 0; i < bytes.length; i += chunkSize) {
+					binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+				}
+				base64Str = btoa(binary);
+			}
 			return {
 				created: Math.floor(Date.now() / 1000),
 				data: [{
@@ -1975,12 +1871,11 @@ async function handleImageGenerations(request, env) {
 				}],
 			};
 		},
-		env,
-		60000
+		env
 	);
 
 	if (!result.success) {
-		return new Response(JSON.stringify({ error: { message: result.error, type: "server_error" } }), { status: result.status, headers: { 'Content-Type': 'application/json' } });
+		return jsonError(result.error, result.status, "server_error");
 	}
 
 	const imgHeaders = { 'Content-Type': 'application/json' };
@@ -1988,22 +1883,16 @@ async function handleImageGenerations(request, env) {
 	return new Response(JSON.stringify(result.data), { headers: imgHeaders });
 }
 
-// ----------------------------------------------------
-// 音频转录接口 /v1/audio/transcriptions
-// 支持 Cloudflare Workers AI 的 whisper 模型
-// 接受 multipart/form-data (audio file) 并转发给 CF
-// ----------------------------------------------------
+// 音频转录 /v1/audio/transcriptions
 async function handleAudioTranscriptions(request, env) {
-	// 检查是否为 multipart/form-data
 	const contentType = request.headers.get('Content-Type') || '';
 	if (!contentType.includes('multipart/form-data')) {
-		return new Response(JSON.stringify({ error: { message: "Content-Type must be multipart/form-data", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		return jsonError("Content-Type must be multipart/form-data", 400, "invalid_request_error");
 	}
 
-	// 检查文件大小（Cloudflare Workers 请求体限制 100MB）
 	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
 	if (contentLength > 100 * 1024 * 1024) {
-		return new Response(JSON.stringify({ error: { message: "File size exceeds 100MB limit", type: "invalid_request_error" } }), { status: 413, headers: { 'Content-Type': 'application/json' } });
+		return jsonError("File size exceeds 100MB limit", 413, "invalid_request_error");
 	}
 
 	try {
@@ -2012,13 +1901,12 @@ async function handleAudioTranscriptions(request, env) {
 		const model = formData.get('model') || 'whisper';
 
 		if (!audioFile) {
-			return new Response(JSON.stringify({ error: { message: "file is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+			return jsonError("file is required", 400, "invalid_request_error");
 		}
 
 		const { cfModel, fallbackWarning } = await resolveModelWithFallback(model, env);
 
-		// 安全保护：如果解析出的模型不是 whisper（语音转录模型），
-		// 强制使用默认 whisper 模型，避免音频文件被误发给文字聊天模型导致 "Invalid input" (code 8001)
+		// 非 whisper 模型强制回退，避免音频发给文字模型导致 "Invalid input"
 		const WHISPER_MODEL = '@cf/openai/whisper-large-v3-turbo';
 		const actualCfModel = cfModel.includes('whisper') ? cfModel : WHISPER_MODEL;
 		const actualFallbackWarning = cfModel.includes('whisper') ? fallbackWarning : `Model "${model}" is not a whisper model, forced to ${WHISPER_MODEL}`;
@@ -2036,52 +1924,42 @@ async function handleAudioTranscriptions(request, env) {
 				};
 			},
 			(cfResult) => ({ text: cfResult.text || '' }),
-			env,
-			120000
-		);
+		env
+	);
 
 		if (!result.success) {
-			return new Response(JSON.stringify({ error: { message: result.error, type: "server_error" } }), { status: result.status, headers: { 'Content-Type': 'application/json' } });
+			return jsonError(result.error, result.status, "server_error");
 		}
 
 		const audioHeaders = { 'Content-Type': 'application/json' };
 		if (actualFallbackWarning) audioHeaders['X-Model-Fallback-Warning'] = actualFallbackWarning;
 		return new Response(JSON.stringify(result.data), { headers: audioHeaders });
 	} catch (e) {
-		return new Response(JSON.stringify({ error: { message: `Failed to process audio: ${e.message}`, type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		return jsonError(`Failed to process audio: ${e.message}`, 400, "invalid_request_error");
 	}
 }
 
-// ----------------------------------------------------
-// 文本转语音接口 /v1/audio/speech
-// 支持 Cloudflare Workers AI 的 TTS 模型（如 @cf/myshell-ai/tts）
-// 接受 OpenAI TTS 格式请求，转发给 CF 并返回音频二进制数据
-// OpenAI 格式: { model, input, voice, response_format, speed }
-// CF TTS 格式: { prompt: "text to speak" }
-// CF TTS 返回: 二进制音频数据（audio/wav）
-// ----------------------------------------------------
+// 文本转语音 /v1/audio/speech
 async function handleAudioSpeech(request, env) {
 	const body = await safeJsonBody(request);
 	if (!body) {
-		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		return jsonError("Invalid JSON body", 400, "invalid_request_error");
 	}
 
 	const { model, input, voice } = body;
 	if (!input) {
-		return new Response(JSON.stringify({ error: { message: "input is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		return jsonError("input is required", 400, "invalid_request_error");
 	}
 
-	// 模型映射：默认使用 @cf/myshell-ai/tts
 	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model || 'tts', env);
 
-	// TTS 模型返回二进制音频数据（非 JSON），不能复用 callCFRunAPI
+	// TTS 返回二进制音频，不能复用 callCFRunAPI
 	const accounts = await getAccounts(env);
 	const activeAccounts = accounts.filter(a => a.status === 'active');
 	if (activeAccounts.length === 0) {
-		return new Response(JSON.stringify({ error: { message: "No active Cloudflare accounts configured", type: "server_error" } }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+		return jsonError("No active Cloudflare accounts configured", 503, "server_error");
 	}
 
-	// 构造 CF TTS 请求体：OpenAI input → CF prompt
 	const cfPayload = { prompt: input };
 	if (voice) cfPayload.voice = voice;
 
@@ -2112,7 +1990,6 @@ async function handleAudioSpeech(request, env) {
 				return new Response(audioBuffer, { headers: speechHeaders });
 			}
 
-			// 非 2xx：记录错误后继续尝试下一个账号（failover）
 			const errorText = await cfResponse.text();
 			lastStatus = cfResponse.status;
 			lastError = `CF API status ${cfResponse.status}: ${errorText}`;
@@ -2122,16 +1999,10 @@ async function handleAudioSpeech(request, env) {
 		}
 	}
 
-	return new Response(JSON.stringify({
-		error: { message: `All Cloudflare accounts failed. Last error: ${lastError}`, type: "server_error" }
-	}), { status: lastStatus, headers: { 'Content-Type': 'application/json' } });
+	return jsonError(`All Cloudflare accounts failed. Last error: ${lastError}`, lastStatus, "server_error");
 }
 
-// ----------------------------------------------------
-// Anthropic token 计数接口 /v1/messages/count_tokens
-// 由于 Workers AI REST API 不直接提供 token 计数端点，
-// 我们使用近似估算：英文约 4 字符/token，中文约 2 字符/token
-// ----------------------------------------------------
+// Token 计数 /v1/messages/count_tokens（近似估算）
 async function handleCountTokens(request, env) {
 	const body = await safeJsonBody(request);
 	if (!body) {
@@ -2145,7 +2016,7 @@ async function handleCountTokens(request, env) {
 		}), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 估算 token 数：遍历所有 messages 内容
+	
 	let totalChars = 0;
 
 	// system 字段
@@ -2215,13 +2086,13 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 				while (true) {
 					const { value, done } = await reader.read();
 					if (done) {
-						// 把缓冲区里剩下的内容输出掉
+						
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
 						}
 						controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 						controller.close();
-						// 流结束时，用捕获到的 usage 累加 token 统计
+						// 流结束时累加 token 统计
 						if (streamUsage && env && ctx) {
 							const durationSec = requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0;
 							accumulateTokens(env, ctx, {
@@ -2241,15 +2112,14 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 					}
 				}
 			} catch (e) {
-				// 上游流异常（超时、网络中断等）时兜底发送 [DONE] 终止帧，
-				// 避免 OpenAI 客户端收到截断的流
+				// 上游异常时兜底发送 [DONE]
 				console.error(`passthroughStream upstream error: ${e?.message || e}`);
 				try {
 					if (buffer.trim()) {
 						buffer = processLines(buffer, controller);
 					}
 					controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-				} catch (_) { /* 尽力而为，忽略二次异常 */ }
+				} catch (e2) { console.error('passthroughStream secondary error:', e2?.message || e2); }
 				try { controller.close(); } catch (_) { }
 			}
 		},
@@ -2260,7 +2130,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 
 	function processLines(data, controller) {
 		const lines = data.split('\n');
-		const remaining = lines.pop(); // 把最后可能不完整的一行留在缓冲区里
+		const remaining = lines.pop();
 
 		for (const line of lines) {
 			const trimmed = line.trim();
@@ -2272,10 +2142,9 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 
 				try {
 					const chunk = JSON.parse(dataStr);
-					// 只改模型名，其他字段全部原样透传
-					// 这样 tool_calls、finish_reason、usage、reasoning_content 都能保留下来
+					// 只改模型名，其余原样透传
 					if (chunk.model !== undefined) chunk.model = modelName;
-					// 捕获 usage（最后一个 chunk 才包含，用于 token 统计）
+					// 捕获 usage（最后一个 chunk 才有）
 					if (chunk.usage) streamUsage = chunk.usage;
 					// /v1/completions 需要将 chat completions 格式转换为 text completion 格式
 					if (isCompletion) {
@@ -2295,11 +2164,11 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 					}
 					controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
 				} catch (_) {
-					// 解析不了的行，按原样转发
+					
 					controller.enqueue(encoder.encode(`${line}\n`));
 				}
 			} else {
-				// 非 data 开头的 SSE 行（注释、事件等），原样转发
+				
 				controller.enqueue(encoder.encode(`${line}\n`));
 			}
 		}
@@ -2307,9 +2176,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 	}
 }
 
-// ----------------------------------------------------
-// 后台管理面板的 API 接口处理函数
-// ----------------------------------------------------
+// 管理面板 API 路由
 // 安全解析 JSON body，非法 JSON 返回 null 而非抛异常（避免冒泡到 Workers 运行时）
 async function safeJsonBody(request) {
 	try { return await request.json(); } catch { return null; }
@@ -2319,7 +2186,7 @@ async function handleDashboardApi(request, env, ctx) {
 	const url = new URL(request.url);
 	const method = request.method;
 
-	// 1. 登录（直接比对密码，不读写 KV，既快又省钱）
+	// 登录
 	if (url.pathname === '/api/auth/login' && method === 'POST') {
 		const { password } = await safeJsonBody(request) || {};
 		const expectedPassword = env.ADMIN_PASSWORD ? env.ADMIN_PASSWORD.trim() : '';
@@ -2336,7 +2203,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
-	// 2. 退出登录
+	
 	if (url.pathname === '/api/auth/logout' && method === 'POST') {
 		return new Response(JSON.stringify({ success: true }), {
 			headers: {
@@ -2346,7 +2213,7 @@ async function handleDashboardApi(request, env, ctx) {
 		});
 	}
 
-	// 3. 用量汇总（需要认证后才能访问，防止用量明细泄露）
+	// 用量汇总
 	if (url.pathname === '/api/usage/summary') {
 		// GET 和 POST 均需要登录认证
 		const isAuthorized = await checkAdminAuth(request, env);
@@ -2358,7 +2225,7 @@ async function handleDashboardApi(request, env, ctx) {
 			const cached = await getCachedSummary(env);
 			const todayStr = new Date().toISOString().split('T')[0];
 			if (cached && cached.summaryDate === todayStr) {
-				// 即使命中缓存，也补充最新的限额配置字段（环境变量可能已变更）
+				// 补充最新限额配置
 				// 月度用量从 KV 读取最新值（refreshAccountsUsage 会更新该键）
 				const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
 				const monthlyUsage = await getMonthlyUsage(env);
@@ -2412,14 +2279,14 @@ async function handleDashboardApi(request, env, ctx) {
 	}
 
 	// --------------------------------------------------
-	// 下面这些都是需要登录后才能访问的接口
+	
 	// --------------------------------------------------
 	const isAuthorized = await checkAdminAuth(request, env);
 	if (!isAuthorized) {
 		return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// CSRF 防护：POST/PUT/PATCH/DELETE 写操作必须携带有效的 X-CSRF-Token 头（与 cookie 中的 csrf_token 一致）
+	// CSRF 防护：写操作需校验 X-CSRF-Token
 	if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
 		const cookies = request.headers.get('Cookie') || '';
 		const csrfCookieMatch = cookies.match(/csrf_token=([^;]+)/);
@@ -2485,7 +2352,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
-	// 4. 测试账号是否能正常连接
+	
 	if (url.pathname === '/api/accounts/test' && method === 'POST') {
 		const { id, accountId, apiToken } = await safeJsonBody(request) || {};
 		let targetAccountId = accountId;
@@ -2613,7 +2480,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 5. 登录后看到的详细用量统计
+	
 	if (url.pathname === '/api/accounts/usage' && method === 'GET') {
 		const accounts = await getAccounts(env);
 		const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
@@ -2625,14 +2492,14 @@ async function handleDashboardApi(request, env, ctx) {
 			}), { headers: { 'Content-Type': 'application/json' } });
 		}
 
-		// 刷新最老数据的20个账号
+		
 		const cacheMap = await refreshAccountsUsage(env, accounts);
 
-		// 构建完整结果列表，若没有缓存数据则标为 pending
+		
 		const todayStr = new Date().toISOString().split('T')[0];
 		const results = accounts.map(account => {
 			const cached = cacheMap[account.id];
-			// 如果缓存日期与今日不一致，从 history 重新计算今日用量
+			
 			let usageToday = 0;
 			let usageTodayRequests = 0;
 			if (cached) {
@@ -2676,7 +2543,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 6. 代理接口用的自定义 API 密钥管理
+	
 	if (url.pathname === '/api/keys') {
 		if (method === 'GET') {
 			const keys = await getApiKeys(env);
@@ -2703,7 +2570,7 @@ async function handleDashboardApi(request, env, ctx) {
 
 	}
 
-	// /api/keys/:id — 删除指定 API 密钥
+	
 	if (url.pathname.startsWith('/api/keys/') && method === 'DELETE') {
 		const id = decodeURIComponent(url.pathname.slice('/api/keys/'.length));
 		const keys = await getApiKeys(env);
@@ -2712,7 +2579,7 @@ async function handleDashboardApi(request, env, ctx) {
 		return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 7. 模型设置和映射
+	
 	if (url.pathname === '/api/settings') {
 		if (method === 'GET') {
 			const customMap = await getCustomModelMap(env);
@@ -2729,7 +2596,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
-	// 8. 用量限额配置（阈值、日/月限额）
+	
 	if (url.pathname === '/api/limits') {
 		if (method === 'GET') {
 			const limits = await getUsageLimits(env);
@@ -2772,7 +2639,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
-	// 9. 今日 Token 统计（公开接口，不需要认证，用于首页看板展示）
+	// 今日 Token 统计（公开）
 	if (url.pathname === '/api/tokens/today' && method === 'GET') {
 		const stats = await getTodayTokenStats(env);
 		return new Response(JSON.stringify({
@@ -2781,7 +2648,7 @@ async function handleDashboardApi(request, env, ctx) {
 			total: stats.total,
 			requests: stats.requests,
 			avgTokPerSec: stats.avgTokPerSec,
-			// 格式化字符串，前端直接展示
+			
 			inputFmt: fmtTok(stats.input),
 			outputFmt: fmtTok(stats.output),
 			totalFmt: fmtTok(stats.total),
@@ -2791,11 +2658,9 @@ async function handleDashboardApi(request, env, ctx) {
 	return new Response(JSON.stringify({ error: 'Endpoint not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
 }
 
-// ----------------------------------------------------
-// 前端页面处理函数（按页面拆分）
-// ----------------------------------------------------
+// 前端页面
 
-// 两个页面共享的 JS 工具函数（toast / theme / escapeHtml / chart legend）
+// 共享 JS 工具函数（toast / theme / escapeHtml / chart legend）
 const SHARED_JS = `
 		function showToast(message, type = 'success') {
 			let container = document.querySelector('.toast-container');
@@ -2868,7 +2733,9 @@ const SHARED_JS = `
 		}
 
 		function attrEscape(str) {
-			return JSON.stringify(String(str)).replace(/"/g, '&quot;');
+			return JSON.stringify(String(str))
+				.replace(/&/g, '&amp;')
+				.replace(/"/g, '&quot;');
 		}
 
 		// 共享的 toggleTheme（通过回调参数在主题切换后触发页面特定的重渲染）
@@ -3577,13 +3444,13 @@ async function handleLandingPage(request, env, ctx) {
 </head>
 <body>
 
-	<!-- Dynamic Background Orbs -->
+	
 	<div class="bg-orbs-container">
 		<div class="bg-orb bg-orb-1"></div>
 		<div class="bg-orb bg-orb-2"></div>
 	</div>
 
-	<!-- Floating Action Buttons -->
+	
 	<div class="action-btn-group">
 		<button class="floating-btn" onclick="toggleTheme(onThemeChange)" title="切换日间/夜间模式">
 			<svg class="theme-icon-sun" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none; width: 20px; height: 20px;">
@@ -3619,7 +3486,7 @@ async function handleLandingPage(request, env, ctx) {
 		</div>
 
 		<div class="dashboard-grid">
-			<!-- Public stats widget -->
+			
 			<div class="stat-card animate-fade-in-up delay-1" style="justify-content: space-between;">
 				<div>
 					<div class="stat-title" style="margin-bottom: 10px;">今日用量汇总</div>
@@ -3639,21 +3506,21 @@ async function handleLandingPage(request, env, ctx) {
 					</div>
 				</div>
 			</div>
-			<!-- Public model chart widget -->
+			
 			<div class="stat-card animate-fade-in-up delay-2" id="public-models-card" style="padding: 24px; display: flex; flex-direction: column; justify-content: center;">
-				<!-- Chart and custom legend container -->
+				
 				<div class="public-chart-wrapper" id="public-chart-wrapper" style="display: none; height: 190px; width: 100%; flex-direction: row; align-items: center; justify-content: space-between; gap: 40px;">
-					<!-- Left column: Chart (takes full height of wrapper, i.e., 190px) -->
+					
 					<div style="position: relative; height: 190px; width: 190px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;">
 						<canvas id="publicModelsChart"></canvas>
 					</div>
-					<!-- Right column: Legend list -->
+					
 					<div style="flex: 1; display: flex; flex-direction: column; justify-content: center; min-width: 0; align-self: stretch; height: 190px;">
 						<div id="public-chart-legend" class="chart-legend" style="flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; max-height: 180px; overflow-y: auto; padding-right: 4px;"></div>
 					</div>
 				</div>
 				
-				<!-- Loading / Empty Placeholder -->
+				
 				<div id="public-chart-placeholder" style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 190px; width: 100%; color: var(--text-muted); font-size: 13px; gap: 12px;">
 					<span class="spinner" style="width: 24px; height: 24px; border-width: 2.5px;"></span>
 					<span>正在载入数据...</span>
@@ -4536,7 +4403,7 @@ async function handleAdminPage(request, env, ctx) {
 	</style>
 </head>
 <body>
-	<!-- Dynamic Background Orbs -->
+	
 	<div class="bg-orbs-container">
 		<div class="bg-orb bg-orb-1"></div>
 		<div class="bg-orb bg-orb-2"></div>
