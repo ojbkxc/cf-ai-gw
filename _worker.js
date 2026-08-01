@@ -963,6 +963,9 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 
 	for (const account of activeAccounts) {
 		try {
+			// 流式请求使用更长的超时（5 分钟），避免推理模型的长时间流式输出被截断
+			// 非流式请求保持 30 秒超时，快速失败以便 failover
+			const timeoutMs = stream ? 300000 : 30000;
 			const cfResponse = await fetch(
 				`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/v1/chat/completions`,
 				{
@@ -972,7 +975,7 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 						'Content-Type': 'application/json',
 					},
 					body: JSON.stringify(cfPayload),
-					signal: AbortSignal.timeout(30000),
+					signal: AbortSignal.timeout(timeoutMs),
 				}
 			);
 
@@ -1575,28 +1578,43 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 				originalEnqueue(chunk);
 			};
 
-			while (true) {
-				const { value, done } = await reader.read();
-				if (done) {
+			try {
+				while (true) {
+					const { value, done } = await reader.read();
+					if (done) {
+						if (buffer.trim()) {
+							buffer = processLines(buffer, controller);
+						}
+						// 上游流正常结束时发送终止事件
+						if (!finalEventSent) {
+							sendFinalEvent(controller);
+						}
+						controller.close();
+						break;
+					}
+
+					buffer += decoder.decode(value, { stream: true });
+					buffer = processLines(buffer, controller);
+
+					if (buffer.indexOf('\n') === -1) {
+						if (enqueuedAny) {
+							break;
+						}
+					}
+				}
+			} catch (e) {
+				// 上游流异常（超时、网络中断等）时兜底发送终止事件，
+				// 确保 Anthropic 客户端收到 message_stop 终止帧，避免 stream_truncated 错误
+				console.error(`anthropicStreamTransform upstream error: ${e?.message || e}`);
+				try {
 					if (buffer.trim()) {
 						buffer = processLines(buffer, controller);
 					}
-					// 上游流异常结束时兜底发送终止事件，避免 Anthropic 客户端收到不完整流
 					if (!finalEventSent) {
 						sendFinalEvent(controller);
 					}
-					controller.close();
-					break;
-				}
-
-				buffer += decoder.decode(value, { stream: true });
-				buffer = processLines(buffer, controller);
-
-				if (buffer.indexOf('\n') === -1) {
-					if (enqueuedAny) {
-						break;
-					}
-				}
+				} catch (_) { /* 尽力而为，忽略二次异常 */ }
+				try { controller.close(); } catch (_) { }
 			}
 		},
 		cancel() {
@@ -2193,33 +2211,46 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 
 	return new ReadableStream({
 		async pull(controller) {
-			while (true) {
-				const { value, done } = await reader.read();
-				if (done) {
-					// 把缓冲区里剩下的内容输出掉
+			try {
+				while (true) {
+					const { value, done } = await reader.read();
+					if (done) {
+						// 把缓冲区里剩下的内容输出掉
+						if (buffer.trim()) {
+							buffer = processLines(buffer, controller);
+						}
+						controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+						controller.close();
+						// 流结束时，用捕获到的 usage 累加 token 统计
+						if (streamUsage && env && ctx) {
+							const durationSec = requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0;
+							accumulateTokens(env, ctx, {
+								input: streamUsage.prompt_tokens || 0,
+								output: streamUsage.completion_tokens || 0,
+								durationSec,
+							});
+						}
+						break;
+					}
+
+					buffer += decoder.decode(value, { stream: true });
+					buffer = processLines(buffer, controller);
+
+					if (buffer.indexOf('\n') === -1) {
+						break;
+					}
+				}
+			} catch (e) {
+				// 上游流异常（超时、网络中断等）时兜底发送 [DONE] 终止帧，
+				// 避免 OpenAI 客户端收到截断的流
+				console.error(`passthroughStream upstream error: ${e?.message || e}`);
+				try {
 					if (buffer.trim()) {
 						buffer = processLines(buffer, controller);
 					}
 					controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-					controller.close();
-					// 流结束时，用捕获到的 usage 累加 token 统计
-					if (streamUsage && env && ctx) {
-						const durationSec = requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0;
-						accumulateTokens(env, ctx, {
-							input: streamUsage.prompt_tokens || 0,
-							output: streamUsage.completion_tokens || 0,
-							durationSec,
-						});
-					}
-					break;
-				}
-
-				buffer += decoder.decode(value, { stream: true });
-				buffer = processLines(buffer, controller);
-
-				if (buffer.indexOf('\n') === -1) {
-					break;
-				}
+				} catch (_) { /* 尽力而为，忽略二次异常 */ }
+				try { controller.close(); } catch (_) { }
 			}
 		},
 		cancel() {
@@ -4603,7 +4634,16 @@ async function handleAdminPage(request, env, ctx) {
 							</div>
 							<div class="stat-desc" id="stat-neurons-desc" style="margin-top: 4px;">0 / 0 Neurons (0.00%)</div>
 						</div>
-						<div class="stat-card">							<div style="display: flex; justify-content: space-between; align-items: center;">								<div class="stat-title">今日 Tokens</div>								<span id="stat-tokens-reqs" style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">0次</span>							</div>							<div class="stat-value" id="stat-tokens-total">0</div>							<div class="stat-desc" id="stat-tokens-desc" style="margin-top: 4px;">入 0 / 出 0</div>							<div class="stat-desc" id="stat-tokens-speed" style="margin-top: 2px; font-size: 11px;">0 tok/s</div>						</div>					<div class="stat-card">
+						<div class="stat-card">
+							<div style="display: flex; justify-content: space-between; align-items: center;">
+								<div class="stat-title">今日 Tokens</div>
+								<span id="stat-tokens-reqs" style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">0次</span>
+							</div>
+							<div class="stat-value" id="stat-tokens-total">0</div>
+							<div class="stat-desc" id="stat-tokens-desc" style="margin-top: 4px;">入 0 / 出 0</div>
+							<div class="stat-desc" id="stat-tokens-speed" style="margin-top: 2px; font-size: 11px;">0 tok/s</div>
+						</div>
+					<div class="stat-card">
 						<div style="display: flex; justify-content: space-between; align-items: center;">
 							<div class="stat-title">今日用量限额</div>
 							<span id="stat-daily-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">0次</span>
@@ -5101,7 +5141,23 @@ async function handleAdminPage(request, env, ctx) {
 		}
 
 		let isRefreshingUsage = false;
-		async function loadTokenStats() {			try {				const res = await fetch("/api/tokens/today");				if (!res.ok) return;				const data = await res.json();				const totalEl = document.getElementById("stat-tokens-total");				if (totalEl) totalEl.innerText = data.totalFmt || "0";				const descEl = document.getElementById("stat-tokens-desc");				if (descEl) descEl.innerText = "入 " + (data.inputFmt || "0") + " / 出 " + (data.outputFmt || "0");				const speedEl = document.getElementById("stat-tokens-speed");				if (speedEl) speedEl.innerText = (data.avgTokPerSec || 0) + " tok/s";				const reqsEl = document.getElementById("stat-tokens-reqs");				if (reqsEl) reqsEl.innerText = (data.requests || 0) + "次";			} catch (e) { console.error("Failed to load token stats:", e); }		}
+		async function loadTokenStats() {
+			try {
+				const res = await fetch("/api/tokens/today");
+				if (!res.ok) return;
+				const data = await res.json();
+				const totalEl = document.getElementById("stat-tokens-total");
+				if (totalEl) totalEl.innerText = data.totalFmt || "0";
+				const descEl = document.getElementById("stat-tokens-desc");
+				if (descEl) descEl.innerText = "入 " + (data.inputFmt || "0") + " / 出 " + (data.outputFmt || "0");
+				const speedEl = document.getElementById("stat-tokens-speed");
+				if (speedEl) speedEl.innerText = (data.avgTokPerSec || 0) + " tok/s";
+				const reqsEl = document.getElementById("stat-tokens-reqs");
+				if (reqsEl) reqsEl.innerText = (data.requests || 0) + "次";
+			} catch (e) { console.error("Failed to load token stats:", e); }
+		}
+
+
 		async function loadUsageDetails(isManual = false) {
 			// 如果已经在刷新中，则直接返回，避免并发请求
 			if (isRefreshingUsage) return;
