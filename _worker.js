@@ -15,6 +15,93 @@ const USAGE_REFRESH_LIMIT = 20;        // 每次刷新最多更新的账号数
 const MONTHLY_USAGE_TTL_SEC = 38 * 24 * 60 * 60; // 月度用量 KV 键 TTL 38 天（秒）
 const MODEL_CREATED_TS = 1686935000;   // 模型列表中的 created 时间戳（2023-06-16）
 
+// ----------------------------------------------------
+// Token 统计：从 CF 响应 usage 字段实时累加，批量写入 KV
+// 格式化用 k/w/亿，显示 tok/s 生成速度
+// ----------------------------------------------------
+
+// 数字格式化：<1k 原样，1k-1w 用 k，1w-1亿 用 w，1亿+ 用亿
+function fmtTok(n) {
+	if (n < 1000) return String(n);
+	if (n < 10000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+	if (n < 100000000) return (n / 10000).toFixed(1).replace(/\.0$/, '') + 'w';
+	return (n / 100000000).toFixed(2).replace(/\.?0+$/, '') + '亿';
+}
+
+// Worker 实例内存缓冲：批量累加，定时 flush 到 KV，减少写入次数
+let _tokenBuffer = { input: 0, output: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0 };
+let _tokenBufferFlushAt = 0;
+const TOKEN_FLUSH_INTERVAL_MS = 30000; // 30 秒 flush 一次
+const TOKEN_KV_TTL_SEC = 86400 * 2;    // KV 键保留 2 天
+
+// 获取今日 token 统计的 KV 键名（按 UTC 日期）
+function getTokenDailyKey() {
+	return `tokens_daily_${new Date().toISOString().split('T')[0]}`;
+}
+
+// 累加 token 到内存缓冲，达到阈值或超时后批量写入 KV
+// 用 ctx.waitUntil() 后台执行，不阻塞响应
+async function accumulateTokens(env, ctx, { input = 0, output = 0, durationSec = 0 }) {
+	_tokenBuffer.input += input;
+	_tokenBuffer.output += output;
+	_tokenBuffer.requests += 1;
+	if (durationSec > 0 && output > 0) {
+		_tokenBuffer.tokPerSecSum += Math.round(output / durationSec);
+		_tokenBuffer.tokPerSecCount += 1;
+	}
+
+	const now = Date.now();
+	if (now - _tokenBufferFlushAt < TOKEN_FLUSH_INTERVAL_MS && _tokenBuffer.requests < 100) return;
+	if (_tokenBufferFlushAt === 0) { _tokenBufferFlushAt = now; return; }
+
+	// flush 到 KV：读取现有值 + 累加 + 写回
+	const batch = { ..._tokenBuffer };
+	_tokenBuffer = { input: 0, output: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0 };
+	_tokenBufferFlushAt = now;
+
+	ctx.waitUntil((async () => {
+		try {
+			const key = getTokenDailyKey();
+			const raw = await env.KV.get(key);
+			const cur = raw ? JSON.parse(raw) : { input: 0, output: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0 };
+			cur.input += batch.input;
+			cur.output += batch.output;
+			cur.requests += batch.requests;
+			cur.tokPerSecSum = (cur.tokPerSecSum || 0) + batch.tokPerSecSum;
+			cur.tokPerSecCount = (cur.tokPerSecCount || 0) + batch.tokPerSecCount;
+			await env.KV.put(key, JSON.stringify(cur), { expirationTtl: TOKEN_KV_TTL_SEC });
+		} catch (e) {
+			console.error('Failed to flush token stats to KV:', e?.message || e);
+		}
+	})());
+}
+
+// 从 KV 读取今日 token 统计（含内存缓冲中未 flush 的部分）
+async function getTodayTokenStats(env) {
+	const key = getTokenDailyKey();
+	let kvData = { input: 0, output: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0 };
+	try {
+		const raw = await env.KV.get(key);
+		if (raw) kvData = JSON.parse(raw);
+	} catch (e) { /* KV 未初始化或解析失败，用默认值 */ }
+
+	// 加上内存缓冲中尚未 flush 的部分
+	const totalInput = (kvData.input || 0) + _tokenBuffer.input;
+	const totalOutput = (kvData.output || 0) + _tokenBuffer.output;
+	const totalRequests = (kvData.requests || 0) + _tokenBuffer.requests;
+	const totalTokPerSecSum = (kvData.tokPerSecSum || 0) + _tokenBuffer.tokPerSecSum;
+	const totalTokPerSecCount = (kvData.tokPerSecCount || 0) + _tokenBuffer.tokPerSecCount;
+	const avgTokPerSec = totalTokPerSecCount > 0 ? Math.round(totalTokPerSecSum / totalTokPerSecCount) : 0;
+
+	return {
+		input: totalInput,
+		output: totalOutput,
+		total: totalInput + totalOutput,
+		requests: totalRequests,
+		avgTokPerSec,
+	};
+}
+
 // 找不到模型映射时的兜底模型（resolveModelName 与 DEFAULT_MODEL_MAP 共用，改默认模型只改这里）
 const DEFAULT_FALLBACK_MODEL = '@cf/zai-org/glm-4.7-flash';
 
@@ -819,7 +906,7 @@ async function handleV1Proxy(request, env, ctx) {
 
 	// 4. 对话补全 / 文本补全 接口
 	if ((url.pathname === '/v1/chat/completions' || url.pathname === '/v1/completions') && request.method === 'POST') {
-		return handleCompletions(request, env, url.pathname);
+		return handleCompletions(request, env, ctx, url.pathname);
 	}
 
 	// 5. Anthropic Messages API 接口（/v1/messages）
@@ -829,7 +916,7 @@ async function handleV1Proxy(request, env, ctx) {
 
 	// 向量嵌入接口
 	if (url.pathname === '/v1/embeddings' && request.method === 'POST') {
-		return handleEmbeddings(request, env);
+		return handleEmbeddings(request, env, ctx);
 	}
 
 	// 图片生成接口
@@ -974,11 +1061,13 @@ async function resolveModelWithFallback(model, env) {
 }
 
 // 对话补全 / 文本补全 的代理处理函数
-async function handleCompletions(request, env, pathname) {
+async function handleCompletions(request, env, ctx, pathname) {
 	const body = await safeJsonBody(request);
 	if (!body) {
 		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
+
+	const requestStartTime = Date.now();
 
 	const { model, messages, prompt, stream } = body;
 
@@ -1010,6 +1099,11 @@ async function handleCompletions(request, env, pathname) {
 		if (body[field] !== undefined) cfPayload[field] = body[field];
 	}
 
+	// 流式请求时，确保 CF 返回 usage 信息（用于 token 统计）
+	if (stream && !cfPayload.stream_options) {
+		cfPayload.stream_options = { include_usage: true };
+	}
+
 	const result = await callOpenAICompatibleAPI(cfPayload, env, stream);
 
 	if (!result.success) {
@@ -1019,7 +1113,7 @@ async function handleCompletions(request, env, pathname) {
 	}
 
 	if (stream) {
-		const transformedStream = passthroughStream(result.stream, model, pathname === '/v1/completions');
+		const transformedStream = passthroughStream(result.stream, model, pathname === '/v1/completions', env, ctx, requestStartTime);
 		const streamHeaders = {
 			'Content-Type': 'text/event-stream',
 			'Cache-Control': 'no-cache',
@@ -1033,6 +1127,15 @@ async function handleCompletions(request, env, pathname) {
 		if (cfJson.model !== undefined) cfJson.model = model;
 		const responseHeaders = { 'Content-Type': 'application/json' };
 		if (fallbackWarning) responseHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		// 提取 CF 返回的真实 token 计数，累加到今日统计
+		if (cfJson.usage) {
+			const durationSec = (Date.now() - requestStartTime) / 1000;
+			accumulateTokens(env, ctx, {
+				input: cfJson.usage.prompt_tokens || 0,
+				output: cfJson.usage.completion_tokens || 0,
+				durationSec,
+			});
+		}
 		if (pathname === '/v1/completions') {
 			// /v1/completions 返回 text_completion 格式（choices[].text）而非 chat 格式（choices[].message）
 			const textChoices = (cfJson.choices || []).map(c => ({
@@ -1742,11 +1845,13 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 }
 
 // 向量嵌入（Embeddings）的代理处理函数
-async function handleEmbeddings(request, env) {
+async function handleEmbeddings(request, env, ctx) {
 	const body = await safeJsonBody(request);
 	if (!body) {
 		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
+
+	const requestStartTime = Date.now();
 
 	const { model, input } = body;
 	if (!input) {
@@ -1782,6 +1887,15 @@ async function handleEmbeddings(request, env) {
 
 	if (!result.success) {
 		return new Response(JSON.stringify({ error: { message: result.error, type: "server_error" } }), { status: result.status, headers: { 'Content-Type': 'application/json' } });
+	}
+
+	// 累加 embedding 的估算 token 数（无 output，只有 input）
+	if (result.data?.usage?.prompt_tokens) {
+		accumulateTokens(env, ctx, {
+			input: result.data.usage.prompt_tokens,
+			output: 0,
+			durationSec: (Date.now() - requestStartTime) / 1000,
+		});
 	}
 
 	const embHeaders = { 'Content-Type': 'application/json' };
@@ -2070,11 +2184,12 @@ async function handleCountTokens(request, env) {
 // 透传 CF /ai/v1/chat/completions 返回的 SSE 流
 // CF 返回的本来就是标准 OpenAI 的 SSE 格式，我们只把模型名改一下，
 // 这样 tool_calls、finish_reason、reasoning_content、usage 等字段都能原样保留。
-function passthroughStream(upstreamBody, modelName, isCompletion) {
+function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requestStartTime) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
 	let buffer = '';
+	let streamUsage = null; // 捕获流式响应中的 usage（最后一个 chunk 才有）
 
 	return new ReadableStream({
 		async pull(controller) {
@@ -2087,6 +2202,15 @@ function passthroughStream(upstreamBody, modelName, isCompletion) {
 					}
 					controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 					controller.close();
+					// 流结束时，用捕获到的 usage 累加 token 统计
+					if (streamUsage && env && ctx) {
+						const durationSec = requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0;
+						accumulateTokens(env, ctx, {
+							input: streamUsage.prompt_tokens || 0,
+							output: streamUsage.completion_tokens || 0,
+							durationSec,
+						});
+					}
 					break;
 				}
 
@@ -2120,6 +2244,8 @@ function passthroughStream(upstreamBody, modelName, isCompletion) {
 					// 只改模型名，其他字段全部原样透传
 					// 这样 tool_calls、finish_reason、usage、reasoning_content 都能保留下来
 					if (chunk.model !== undefined) chunk.model = modelName;
+					// 捕获 usage（最后一个 chunk 才包含，用于 token 统计）
+					if (chunk.usage) streamUsage = chunk.usage;
 					// /v1/completions 需要将 chat completions 格式转换为 text completion 格式
 					if (isCompletion) {
 						chunk.object = 'text_completion';
@@ -2613,6 +2739,22 @@ async function handleDashboardApi(request, env, ctx) {
 			const newLimits = await getUsageLimits(env);
 			return new Response(JSON.stringify({ success: true, limits: newLimits }), { headers: { 'Content-Type': 'application/json' } });
 		}
+	}
+
+	// 9. 今日 Token 统计（公开接口，不需要认证，用于首页看板展示）
+	if (url.pathname === '/api/tokens/today' && method === 'GET') {
+		const stats = await getTodayTokenStats(env);
+		return new Response(JSON.stringify({
+			input: stats.input,
+			output: stats.output,
+			total: stats.total,
+			requests: stats.requests,
+			avgTokPerSec: stats.avgTokPerSec,
+			// 格式化字符串，前端直接展示
+			inputFmt: fmtTok(stats.input),
+			outputFmt: fmtTok(stats.output),
+			totalFmt: fmtTok(stats.total),
+		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
 	return new Response(JSON.stringify({ error: 'Endpoint not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
@@ -4461,7 +4603,7 @@ async function handleAdminPage(request, env, ctx) {
 							</div>
 							<div class="stat-desc" id="stat-neurons-desc" style="margin-top: 4px;">0 / 0 Neurons (0.00%)</div>
 						</div>
-					<div class="stat-card">
+						<div class="stat-card">							<div style="display: flex; justify-content: space-between; align-items: center;">								<div class="stat-title">今日 Tokens</div>								<span id="stat-tokens-reqs" style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">0次</span>							</div>							<div class="stat-value" id="stat-tokens-total">0</div>							<div class="stat-desc" id="stat-tokens-desc" style="margin-top: 4px;">入 0 / 出 0</div>							<div class="stat-desc" id="stat-tokens-speed" style="margin-top: 2px; font-size: 11px;">0 tok/s</div>						</div>					<div class="stat-card">
 						<div style="display: flex; justify-content: space-between; align-items: center;">
 							<div class="stat-title">今日用量限额</div>
 							<span id="stat-daily-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">0次</span>
@@ -4959,7 +5101,7 @@ async function handleAdminPage(request, env, ctx) {
 		}
 
 		let isRefreshingUsage = false;
-
+		async function loadTokenStats() {			try {				const res = await fetch("/api/tokens/today");				if (!res.ok) return;				const data = await res.json();				const totalEl = document.getElementById("stat-tokens-total");				if (totalEl) totalEl.innerText = data.totalFmt || "0";				const descEl = document.getElementById("stat-tokens-desc");				if (descEl) descEl.innerText = "入 " + (data.inputFmt || "0") + " / 出 " + (data.outputFmt || "0");				const speedEl = document.getElementById("stat-tokens-speed");				if (speedEl) speedEl.innerText = (data.avgTokPerSec || 0) + " tok/s";				const reqsEl = document.getElementById("stat-tokens-reqs");				if (reqsEl) reqsEl.innerText = (data.requests || 0) + "次";			} catch (e) { console.error("Failed to load token stats:", e); }		}
 		async function loadUsageDetails(isManual = false) {
 			// 如果已经在刷新中，则直接返回，避免并发请求
 			if (isRefreshingUsage) return;
@@ -5052,6 +5194,7 @@ async function handleAdminPage(request, env, ctx) {
 
 		function onAdminThemeChange() {
 			if (currentTab === 'overview') loadUsageDetails();
+			loadTokenStats();
 		}
 
 		initTheme();
@@ -5070,6 +5213,7 @@ async function handleAdminPage(request, env, ctx) {
 				anthropicUrlEl.textContent = anthropicUrl;
 			}
 			loadUsageDetails();
+			loadTokenStats();
 		};
 
 		function toggleSidebar() {
@@ -5107,6 +5251,7 @@ async function handleAdminPage(request, env, ctx) {
 
 			if (tabName === 'overview') {
 				loadUsageDetails();
+				loadTokenStats();
 			} else if (tabName === 'accounts') {
 				loadAccounts();
 			} else if (tabName === 'keys') {
