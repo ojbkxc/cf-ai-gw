@@ -58,7 +58,11 @@ const DEFAULT_MODEL_MAP = {
 	'llava-1.5-7b': '@cf/llava-hf/llava-1.5-7b-hf',
 	'flux-1-schnell': '@cf/black-forest-labs/flux-1-schnell',
 	'sdxl': '@cf/stabilityai/stable-diffusion-xl-base-1.0',
-	'whisper': '@cf/openai/whisper-large-v3-turbo'
+	'whisper': '@cf/openai/whisper-large-v3-turbo',
+	'whisper-1': '@cf/openai/whisper-large-v3-turbo',
+
+	// 文本转语音（TTS）模型
+	'tts': '@cf/myshell-ai/tts'
 };
 
 // CF 模型前缀 → owned_by 映射表（替代 /v1/models 中的 if/else 判断链）
@@ -69,6 +73,7 @@ const CF_OWNER_MAP = [
 	['@cf/moonshotai/', 'moonshotai'], ['@cf/baai/', 'baai'], ['@cf/stabilityai/', 'stabilityai'],
 	['@cf/black-forest-labs/', 'black-forest-labs'], ['@cf/codellama/', 'codellama'],
 	['@cf/llava-hf/', 'llava-hf'], ['@cf/internlm/', 'internlm'],
+	['@cf/myshell-ai/', 'myshell-ai'],
 ];
 
 export default {
@@ -835,6 +840,11 @@ async function handleV1Proxy(request, env, ctx) {
 	// 音频转录接口
 	if (url.pathname === '/v1/audio/transcriptions' && request.method === 'POST') {
 		return handleAudioTranscriptions(request, env);
+	}
+
+	// 文本转语音接口（TTS）
+	if (url.pathname === '/v1/audio/speech' && request.method === 'POST') {
+		return handleAudioSpeech(request, env);
 	}
 
 	// Anthropic token 计数接口
@@ -1875,8 +1885,14 @@ async function handleAudioTranscriptions(request, env) {
 
 		const { cfModel, fallbackWarning } = await resolveModelWithFallback(model, env);
 
+		// 安全保护：如果解析出的模型不是 whisper（语音转录模型），
+		// 强制使用默认 whisper 模型，避免音频文件被误发给文字聊天模型导致 "Invalid input" (code 8001)
+		const WHISPER_MODEL = '@cf/openai/whisper-large-v3-turbo';
+		const actualCfModel = cfModel.includes('whisper') ? cfModel : WHISPER_MODEL;
+		const actualFallbackWarning = cfModel.includes('whisper') ? fallbackWarning : `Model "${model}" is not a whisper model, forced to ${WHISPER_MODEL}`;
+
 		const result = await callCFRunAPI(
-			cfModel,
+			actualCfModel,
 			(account) => {
 				const cfFormData = new FormData();
 				cfFormData.append('audio', audioFile, audioFile.name || 'audio.wav');
@@ -1897,11 +1913,86 @@ async function handleAudioTranscriptions(request, env) {
 		}
 
 		const audioHeaders = { 'Content-Type': 'application/json' };
-		if (fallbackWarning) audioHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		if (actualFallbackWarning) audioHeaders['X-Model-Fallback-Warning'] = actualFallbackWarning;
 		return new Response(JSON.stringify(result.data), { headers: audioHeaders });
 	} catch (e) {
 		return new Response(JSON.stringify({ error: { message: `Failed to process audio: ${e.message}`, type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
+}
+
+// ----------------------------------------------------
+// 文本转语音接口 /v1/audio/speech
+// 支持 Cloudflare Workers AI 的 TTS 模型（如 @cf/myshell-ai/tts）
+// 接受 OpenAI TTS 格式请求，转发给 CF 并返回音频二进制数据
+// OpenAI 格式: { model, input, voice, response_format, speed }
+// CF TTS 格式: { prompt: "text to speak" }
+// CF TTS 返回: 二进制音频数据（audio/wav）
+// ----------------------------------------------------
+async function handleAudioSpeech(request, env) {
+	const body = await safeJsonBody(request);
+	if (!body) {
+		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+	}
+
+	const { model, input, voice } = body;
+	if (!input) {
+		return new Response(JSON.stringify({ error: { message: "input is required", type: "invalid_request_error" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+	}
+
+	// 模型映射：默认使用 @cf/myshell-ai/tts
+	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model || 'tts', env);
+
+	// TTS 模型返回二进制音频数据（非 JSON），不能复用 callCFRunAPI
+	const accounts = await getAccounts(env);
+	const activeAccounts = accounts.filter(a => a.status === 'active');
+	if (activeAccounts.length === 0) {
+		return new Response(JSON.stringify({ error: { message: "No active Cloudflare accounts configured", type: "server_error" } }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+	}
+
+	// 构造 CF TTS 请求体：OpenAI input → CF prompt
+	const cfPayload = { prompt: input };
+	if (voice) cfPayload.voice = voice;
+
+	let lastError = null;
+	let lastStatus = 502;
+
+	for (const account of activeAccounts) {
+		try {
+			const cfResponse = await fetch(
+				`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/run/${cfModel}`,
+				{
+					method: 'POST',
+					headers: {
+						'Authorization': `Bearer ${account.apiToken}`,
+						'Content-Type': 'application/json',
+					},
+					body: JSON.stringify(cfPayload),
+					signal: AbortSignal.timeout(60000),
+				}
+			);
+
+			if (cfResponse.ok) {
+				// TTS 返回二进制音频，直接透传给客户端
+				const audioBuffer = await cfResponse.arrayBuffer();
+				const contentType = cfResponse.headers.get('Content-Type') || 'audio/wav';
+				const speechHeaders = { 'Content-Type': contentType };
+				if (fallbackWarning) speechHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+				return new Response(audioBuffer, { headers: speechHeaders });
+			}
+
+			// 非 2xx：记录错误后继续尝试下一个账号（failover）
+			const errorText = await cfResponse.text();
+			lastStatus = cfResponse.status;
+			lastError = `CF API status ${cfResponse.status}: ${errorText}`;
+		} catch (e) {
+			lastStatus = 502;
+			lastError = `Connection error: ${e.message}`;
+		}
+	}
+
+	return new Response(JSON.stringify({
+		error: { message: `All Cloudflare accounts failed. Last error: ${lastError}`, type: "server_error" }
+	}), { status: lastStatus, headers: { 'Content-Type': 'application/json' } });
 }
 
 // ----------------------------------------------------
