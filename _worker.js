@@ -835,7 +835,7 @@ async function getUsageLimits(env) {
 
 // 获取当月用量的 KV 键名
 function getMonthlyUsageKey() {
-	const now = new Date();
+	const now = beijingNow();
 	return `usage_monthly_${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
@@ -4499,27 +4499,52 @@ async function handleAdminPage(request, env, ctx) {
 
 		.usage-progress-container {
 			width: 100%;
-			height: 10px;
-			background-color: rgba(255, 255, 255, 0.06);
-			border-radius: 5px;
+			height: 8px;
+			background: linear-gradient(135deg, rgba(255,255,255,0.04), rgba(255,255,255,0.08));
+			border-radius: 4px;
 			overflow: hidden;
 			margin: 10px 0 6px;
-			box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.15);
+			box-shadow: inset 0 1px 3px rgba(0,0,0,0.2);
+			position: relative;
+		}
+		.usage-progress-container::after {
+			content: '';
+			position: absolute;
+			top: 0; left: 0; right: 0;
+			height: 50%;
+			background: linear-gradient(180deg, rgba(255,255,255,0.15), transparent);
+			border-radius: 4px 4px 0 0;
+			pointer-events: none;
 		}
 
 		:root[data-theme="light"] .usage-progress-container {
-			background-color: rgba(0, 0, 0, 0.05);
+			background: linear-gradient(135deg, rgba(0,0,0,0.03), rgba(0,0,0,0.06));
+		}
+		:root[data-theme="light"] .usage-progress-container::after {
+			background: linear-gradient(180deg, rgba(255,255,255,0.5), transparent);
 		}
 
 		.usage-progress-bar {
 			height: 100%;
-			border-radius: 5px;
-			transition: width 1.2s cubic-bezier(0.34, 1.56, 0.64, 1);
-			box-shadow: 0 0 6px rgba(168, 85, 247, 0.3), 0 1px 2px rgba(0, 0, 0, 0.1);
+			border-radius: 4px;
+			transition: width 1.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+			position: relative;
+			overflow: hidden;
 		}
-		.usage-progress-bar[data-level="ok"] { background: linear-gradient(135deg, var(--primary-color), var(--accent-color)); }
-		.usage-progress-bar[data-level="warn"] { background: linear-gradient(135deg, #f59e0b, #f97316); box-shadow: 0 0 6px rgba(245, 158, 11, 0.3); }
-		.usage-progress-bar[data-level="danger"] { background: linear-gradient(135deg, #ef4444, #dc2626); box-shadow: 0 0 6px rgba(239, 68, 68, 0.3); }
+		.usage-progress-bar::after {
+			content: '';
+			position: absolute;
+			top: 0; left: -100%; width: 100%; height: 100%;
+			background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+			animation: progressShine 3s ease-in-out infinite;
+		}
+		@keyframes progressShine {
+			0% { left: -100%; }
+			100% { left: 200%; }
+		}
+		.usage-progress-bar[data-level="ok"] { background: linear-gradient(90deg, #6366f1, #a855f7); box-shadow: 0 0 8px rgba(168,85,247,0.35); }
+		.usage-progress-bar[data-level="warn"] { background: linear-gradient(90deg, #f59e0b, #f97316); box-shadow: 0 0 8px rgba(245,158,11,0.35); }
+		.usage-progress-bar[data-level="danger"] { background: linear-gradient(90deg, #ef4444, #dc2626); box-shadow: 0 0 8px rgba(239,68,68,0.35); }
 
 		/* Section Cards */
 		.section-card {
@@ -5321,8 +5346,8 @@ async function handleAdminPage(request, env, ctx) {
 				// 7天请求次数
 				const requests7d = (account.history || []).reduce((sum, h) => sum + (h.requests || 0), 0);
 				// 账号ID 短格式
-				const shortId = account.accountId.length > 12
-					? account.accountId.substring(0, 6) + '...' + account.accountId.substring(account.accountId.length - 4)
+				const shortId = account.accountId.length > 14
+					? account.accountId.substring(0, 8) + '...' + account.accountId.substring(account.accountId.length - 4)
 					: account.accountId;
 
 				let item = existingCards.get(account.id);
@@ -5479,9 +5504,7 @@ async function handleAdminPage(request, env, ctx) {
 		}
 
 
-		const AUTO_REFRESH_INTERVAL = 60000; // 60s 自动刷新
-		let autoRefreshRemaining = AUTO_REFRESH_INTERVAL / 1000;
-		let autoRefreshTimer = null;
+		let refreshTimer = null;
 
 		async function loadUsageDetails(isManual = false) {
 			if (isRefreshingUsage) return;
@@ -5508,8 +5531,8 @@ async function handleAdminPage(request, env, ctx) {
 			// 更新文字显示
 			updateLastUpdatedText(lastFetched);
 
-			// 自动刷新：距上次不到 60s 则跳过（从 15min 改为 60s）
-			if (!isManual && lastFetched && (now - lastFetched) < AUTO_REFRESH_INTERVAL) {
+			// 防抖：距上次刷新不到 60s 则跳过（手动刷新除外）
+			if (!isManual && lastFetched && (now - lastFetched) < 60000) {
 				return;
 			}
 
@@ -5593,22 +5616,19 @@ async function handleAdminPage(request, env, ctx) {
 			}
 			loadUsageDetails();
 			loadTokenStats();
-			// 每秒更新"距上次刷新"的相对时间，到时间自动触发刷新
-			autoRefreshTimer = setInterval(() => {
+			// 每秒更新"距上次刷新"的相对时间，并在每天 0:03 触发自动刷新
+			refreshTimer = setInterval(() => {
 				const lastFetchedRaw = localStorage.getItem('cache_usage_details_last_fetched');
 				const lastFetched = lastFetchedRaw ? parseInt(lastFetchedRaw, 10) : 0;
 				if (lastFetched) {
 					updateLastUpdatedText(lastFetched);
 				}
-				autoRefreshRemaining--;
-				if (autoRefreshRemaining <= 0) {
-					// 每天 0:02~0:05 之间强制刷新（跨天数据重置）
-					const h = new Date().getHours();
-					const m = new Date().getMinutes();
-					const isJustPastMidnight = h === 0 && m >= 2 && m <= 5;
-					loadUsageDetails(isJustPastMidnight);
+				// 每天 UTC 0:02~0:05 之间强制刷新（跨天数据重置）
+				const h = new Date().getUTCHours();
+				const m = new Date().getUTCMinutes();
+				if (h === 0 && m >= 2 && m <= 5) {
+					loadUsageDetails(true);
 					loadTokenStats();
-					autoRefreshRemaining = AUTO_REFRESH_INTERVAL / 1000;
 				}
 			}, 1000);
 		};
