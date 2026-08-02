@@ -9,12 +9,12 @@
 - OpenAI 兼容接口(`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/models`、`/v1/images/generations`、`/v1/audio/transcriptions`)
 - Anthropic Messages API 兼容接口(`/v1/messages`、`/v1/messages/count_tokens`),支持流式与非流式
 - 多 Cloudflare 账号绑定,负载均衡 + 故障自动切换重试
-- 内置可视化管理面板(`/admin`),查看今日/本月用量、历史趋势、模型分布
+- 内置可视化管理面板(`/admin`),查看今日/本月用量、历史趋势、模型分布、各账号用量明细
 - 可配置每日/每月 Neurons 限额及拦截阈值
 - 代理 API Key 管理(可随机生成或自定义)
 - 模型名称映射:客户端模型名自动映射到 Cloudflare `@cf/` 模型,找不到映射时回退到默认模型并返回 `X-Model-Fallback-Warning` 响应头
 - 跨域(CORS)支持
-- 安全加固:异常日志不泄露 token、前端 XSS 防护、CSRF 防护
+- 安全加固:异常日志不泄露 token、前端 XSS 防护、CSRF 防护,所有响应携带 `X-Request-Id` 请求追踪头
 
 ## 部署到 Cloudflare Pages
 
@@ -69,8 +69,11 @@
 | `/v1/completions` | POST | Text 文本补全,返回 `text_completion` 格式 |
 | `/v1/embeddings` | POST | 文本向量化 |
 | `/v1/models` | GET | 可用模型列表 |
+| `/v1/models/{model}` | GET | 查询单个模型详情 |
 | `/v1/images/generations` | POST | 图片生成(基于 Flux 模型) |
 | `/v1/audio/transcriptions` | POST | 音频转文字(基于 Whisper 模型) |
+| `/v1/audio/translations` | POST | 音频翻译为英文(基于 Whisper 模型) |
+| `/v1/audio/speech` | POST | 文字转语音(TTS) |
 
 ### Anthropic 兼容端点
 
@@ -84,12 +87,16 @@
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/admin` | GET | 管理面板页面 |
+| `/api/auth/login` | POST | 登录认证 |
+| `/api/auth/logout` | POST | 退出登录 |
 | `/api/usage/summary` | GET/POST | 用量汇总(需认证) |
-| `/api/accounts/usage` | GET | 各账号用量明细(需认证) |
 | `/api/accounts` | GET/POST | 账号管理(需认证 + CSRF) |
-| `/api/accounts/:id` | DELETE | 删除账号(需认证 + CSRF) |
+| `/api/accounts/:id` | PUT/DELETE | 更新/删除账号(需认证 + CSRF) |
+| `/api/accounts/test` | POST | 测试账号连接与 Token 权限(需认证 + CSRF) |
+| `/api/accounts/usage` | GET | 各账号用量明细(需认证) |
 | `/api/keys` | GET/POST | API Key 管理(需认证 + CSRF) |
-| `/api/keys/:id` | DELETE | 删除 API Key(需认证 + CSRF) |
+| `/api/keys/:id` | PUT/DELETE | 更新/删除 API Key(需认证 + CSRF) |
+| `/api/tokens/today` | GET | 今日 Token 统计(上传/下载/速度/推理/缓存) |
 | `/api/settings` | GET/PUT | 模型映射配置(需认证 + CSRF) |
 | `/api/limits` | GET/PUT | 限额配置(需认证 + CSRF) |
 
@@ -155,6 +162,28 @@ curl https://<你的项目>.pages.dev/v1/audio/transcriptions \
   -F "model=whisper-1"
 ```
 
+### OpenAI Audio Translations
+
+```bash
+curl https://<你的项目>.pages.dev/v1/audio/translations \
+  -H "Authorization: Bearer <代理APIKey>" \
+  -F "file=@audio.mp3" \
+  -F "model=whisper-1"
+```
+
+### OpenAI Audio Speech
+
+```bash
+curl https://<你的项目>.pages.dev/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <代理APIKey>" \
+  -d '{
+    "model": "tts-1",
+    "input": "你好，世界",
+    "voice": "alloy"
+  }'
+```
+
 ### Anthropic Messages
 
 ```bash
@@ -218,6 +247,8 @@ curl https://<你的项目>.pages.dev/v1/messages \
 返回格式为 Anthropic SSE 流,包含 `message_start`、`content_block_start`、`content_block_delta`(含 `text_delta` 和 `input_json_delta`)、`content_block_stop`、`message_delta`、`message_stop` 等事件。支持 `tool_use` 流式输出。
 
 > **注意:** 流式响应由 Cloudflare Workers AI 上游直接透传(OpenAI 格式仅替换模型名)或实时转换(Anthropic 格式)。如果上游在流式传输中途断开,客户端会收到截断的流,不会触发账号切换重试——这是 SSE 流式的设计特性。
+>
+> 内置**可恢复流(Resumable Stream)**机制:当流式连接意外断开时,会自动尝试重连(最多 5 次,间隔递增 1s→5s),并通过 `skipCount` 跳过已发送的事件,确保不丢不重。
 
 ## 模型映射
 
@@ -229,3 +260,12 @@ curl https://<你的项目>.pages.dev/v1/messages \
 ## 关于数据看板"今日总消耗量"百分比
 
 看板百分比按真实用量计算,不再封顶到 100.00%,用量超过限额时会显示超过 100% 的真实值。为避免 UI 溢出,进度条宽度仍限制在最大 100%。
+
+### 数据看板功能
+
+- **账号用量明细**:顶部展示各账号用量、额度及进度条,每账号卡片显示状态、百分比、用量/限额
+- **今日用量**:实时显示今日 Neurons/Token 消耗、请求次数、输入/输出量,带自动刷新(30s)
+- **Token 统计**:上传/下载/速度/推理/缓存读数据
+- **本月用量限额**:月度累计用量及限额,支持进度条展示
+- **过去 7 日消耗走势**:折线图展示每日 Neurons 消耗趋势
+- **今日模型消耗占比**:环形图展示各模型消耗比例
