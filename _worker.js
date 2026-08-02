@@ -38,6 +38,9 @@ function browserHeaders(token, contentType = 'application/json') {
 		'User-Agent': randomUA(),
 		'Accept': 'application/json',
 		'Accept-Language': 'en-US,en;q=0.9',
+		'Sec-Fetch-Dest': 'empty',
+		'Sec-Fetch-Mode': 'cors',
+		'Sec-Fetch-Site': 'cross-site',
 	};
 	if (contentType) headers['Content-Type'] = contentType;
 	return headers;
@@ -1124,7 +1127,7 @@ async function queryGraphQL(accountId, apiToken, startDateTime) {
 				start: startDateTime
 			}
 		}),
-		signal: AbortSignal.timeout(30000),
+		signal: AbortSignal.timeout(60000),
 	});
 
 	if (!response.ok) {
@@ -1422,7 +1425,7 @@ async function resolveModelName(model, env) {
 async function callCFRunAPI(cfModel, buildPayload, processResult, env) {
 	return withFailover(env, async (account, attempt, accountIndex) => {
 		const cfPayload = buildPayload(account);
-		cfPayload.headers = { ...cfPayload.headers, 'User-Agent': randomUA(), 'Accept': 'application/json', 'Accept-Language': 'en-US,en;q=0.9' };
+		cfPayload.headers = { ...cfPayload.headers, 'User-Agent': randomUA(), 'Accept': 'application/json', 'Accept-Language': 'en-US,en;q=0.9', 'Sec-Fetch-Dest': 'empty', 'Sec-Fetch-Mode': 'cors', 'Sec-Fetch-Site': 'cross-site' };
 		const apiUrl = buildCFUrl(account, `run/${cfModel}`);
 		const cfResponse = await fetch(apiUrl, {
 			...cfPayload,
@@ -1455,6 +1458,10 @@ async function resolveModelWithFallback(model, env) {
 
 // 对话补全 / 文本补全
 async function handleCompletions(request, env, ctx, pathname) {
+	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+	if (contentLength > 10 * 1024 * 1024) {
+		return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	}
 	const body = await safeJsonBody(request);
 	if (!body) {
 		return jsonError("Invalid JSON body", 400, "invalid_request_error");
@@ -1807,6 +1814,10 @@ function convertOpenAIErrorToAnthropic(openaiError) {
 // Anthropic /v1/messages 路由
 async function handleMessages(request, env, ctx) {
 	const requestStartTime = Date.now();
+	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+	if (contentLength > 10 * 1024 * 1024) {
+		return anthropicError('Request body too large (max 10MB).');
+	}
 	const anthropicBody = await safeJsonBody(request);
 	if (!anthropicBody) {
 		return anthropicError('Invalid JSON body.');
@@ -2228,7 +2239,6 @@ async function handleEmbeddings(request, env, ctx) {
 			method: 'POST',
 			headers: { 'Authorization': `Bearer ${account.apiToken}`, 'Content-Type': 'application/json' },
 			body: JSON.stringify({ text: textArray }),
-			signal: AbortSignal.timeout(120000),
 		}),
 		(cfResult) => {
 			const data = cfResult.data || cfResult;
@@ -2294,7 +2304,6 @@ async function handleImageGenerations(request, env, ctx) {
 				method: 'POST',
 				headers: { 'Authorization': `Bearer ${account.apiToken}`, 'Content-Type': 'application/json' },
 				body: JSON.stringify(cfPayload),
-				signal: AbortSignal.timeout(120000),
 			};
 		},
 		(cfResult) => {
