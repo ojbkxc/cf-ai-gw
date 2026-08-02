@@ -4499,52 +4499,22 @@ async function handleAdminPage(request, env, ctx) {
 
 		.usage-progress-container {
 			width: 100%;
-			height: 8px;
-			background: linear-gradient(135deg, rgba(255,255,255,0.04), rgba(255,255,255,0.08));
-			border-radius: 4px;
+			height: 6px;
+			background-color: rgba(255, 255, 255, 0.06);
+			border-radius: 3px;
 			overflow: hidden;
 			margin: 10px 0 6px;
-			box-shadow: inset 0 1px 3px rgba(0,0,0,0.2);
-			position: relative;
 		}
-		.usage-progress-container::after {
-			content: '';
-			position: absolute;
-			top: 0; left: 0; right: 0;
-			height: 50%;
-			background: linear-gradient(180deg, rgba(255,255,255,0.15), transparent);
-			border-radius: 4px 4px 0 0;
-			pointer-events: none;
-		}
-
 		:root[data-theme="light"] .usage-progress-container {
-			background: linear-gradient(135deg, rgba(0,0,0,0.03), rgba(0,0,0,0.06));
-		}
-		:root[data-theme="light"] .usage-progress-container::after {
-			background: linear-gradient(180deg, rgba(255,255,255,0.5), transparent);
+			background-color: rgba(0, 0, 0, 0.05);
 		}
 
 		.usage-progress-bar {
 			height: 100%;
-			border-radius: 4px;
+			background: var(--primary-gradient);
+			border-radius: 3px;
 			transition: width 1.5s cubic-bezier(0.34, 1.56, 0.64, 1);
-			position: relative;
-			overflow: hidden;
 		}
-		.usage-progress-bar::after {
-			content: '';
-			position: absolute;
-			top: 0; left: -100%; width: 100%; height: 100%;
-			background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
-			animation: progressShine 3s ease-in-out infinite;
-		}
-		@keyframes progressShine {
-			0% { left: -100%; }
-			100% { left: 200%; }
-		}
-		.usage-progress-bar[data-level="ok"] { background: linear-gradient(90deg, #6366f1, #a855f7); box-shadow: 0 0 8px rgba(168,85,247,0.35); }
-		.usage-progress-bar[data-level="warn"] { background: linear-gradient(90deg, #f59e0b, #f97316); box-shadow: 0 0 8px rgba(245,158,11,0.35); }
-		.usage-progress-bar[data-level="danger"] { background: linear-gradient(90deg, #ef4444, #dc2626); box-shadow: 0 0 8px rgba(239,68,68,0.35); }
 
 		/* Section Cards */
 		.section-card {
@@ -5281,14 +5251,6 @@ async function handleAdminPage(request, env, ctx) {
 			return (n / 1000000000).toFixed(2).replace(/\.?0+$/, '') + 'B';
 		}
 
-		function fmtLimit(n) {
-			if (n <= 0) return '0';
-			if (n % 10000 === 0) return (n / 10000) + 'w';
-			if (n < 1000) return String(n);
-			if (n < 1000000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
-			return (n / 1000000).toFixed(2).replace(/\.?0+$/, '') + 'M';
-		}
-
 		let currentTab = 'overview';
 		let historyChart = null;
 		let modelsChart = null;
@@ -5377,15 +5339,15 @@ async function handleAdminPage(request, env, ctx) {
 						<span class="badge \${warningClass}" style="flex-shrink: 0; font-size: 10px; padding: 3px 8px;">\${statusText} · \${percentage.toFixed(2)}%</span>
 					</div>
 					<div class="usage-progress-container">
-						<div class="usage-progress-bar" data-level="\${level}" style="width: \${Math.min(100, percentage)}%;"></div>
+						<div class="usage-progress-bar" style="width: \${Math.min(100, percentage)}%;"></div>
 					</div>
 					<div style="display:grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px 12px; font-size:11px; color: var(--text-muted); margin-top: 10px;">
-						<div><span style="opacity:0.6;">今日</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtLimit(roundedUsage)}</strong> <span style="opacity:0.5;">N</span></div>
+						<div><span style="opacity:0.6;">今日</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtTok(roundedUsage)}</strong> <span style="opacity:0.5;">N</span></div>
 						<div><span style="opacity:0.6;">今日请求</span><br><strong style="color: var(--text-color); font-size: 13px;">\${(account.usageTodayRequests || 0).toLocaleString()}</strong></div>
-						<div><span style="opacity:0.6;">7日总量</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtLimit(history7d)}</strong> <span style="opacity:0.5;">N</span></div>
+						<div><span style="opacity:0.6;">7日总量</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtTok(history7d)}</strong> <span style="opacity:0.5;">N</span></div>
 						<div><span style="opacity:0.6;">7日请求</span><br><strong style="color: var(--text-color); font-size: 13px;">\${requests7d.toLocaleString()}</strong></div>
-						<div><span style="opacity:0.6;">本月用量</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtLimit(monthUsage)}</strong> <span style="opacity:0.5;">N</span></div>
-						<div><span style="opacity:0.6;">日限额</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtLimit(limits.dailyLimit)}</strong> <span style="opacity:0.5;">N</span></div>
+						<div><span style="opacity:0.6;">本月用量</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtTok(monthUsage)}</strong> <span style="opacity:0.5;">N</span></div>
+						<div><span style="opacity:0.6;">日限额</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtTok(limits.dailyLimit)}</strong> <span style="opacity:0.5;">N</span></div>
 						<div><span style="opacity:0.6;">模型数</span><br><strong style="color: var(--text-color); font-size: 13px;">\${modelCount}</strong></div>
 						<div><span style="opacity:0.6;">状态</span><br><strong style="color: \${level === 'danger' ? '#ef4444' : (level === 'warn' ? '#f59e0b' : '#22c55e')}; font-size: 13px;">\${statusText}</strong></div>
 					</div>
@@ -5422,7 +5384,7 @@ async function handleAdminPage(request, env, ctx) {
 				const leftSpan = neuronsDesc.querySelector('span:first-child');
 				const rightSpan = neuronsDesc.querySelector('#stat-neurons-pct');
 				if (leftSpan) {
-					leftSpan.innerHTML = fmtLimit(roundedTotalUsageToday) + ' / ' + fmtLimit(totalLimit) + ' Neurons';
+					leftSpan.innerHTML = fmtTok(roundedTotalUsageToday) + ' / ' + fmtTok(totalLimit) + ' Neurons';
 				}
 				if (rightSpan) {
 					const pctText = overallPercentage > 100 ? '+' + (overallPercentage - 100).toFixed(2) + '%' : overallPercentage.toFixed(2) + '%';
@@ -5458,8 +5420,8 @@ async function handleAdminPage(request, env, ctx) {
 			const rightSpan = monthlyDesc.querySelector('#stat-monthly-pct');
 			if (leftSpan) {
 				leftSpan.innerText = limitDisabled
-					? fmtLimit(Math.ceil(monthlyUsage)) + ' Neurons · 限额关闭'
-					: fmtLimit(Math.ceil(monthlyUsage)) + ' / ' + fmtLimit(monthlyLimit) + ' Neurons';
+					? fmtTok(Math.ceil(monthlyUsage)) + ' Neurons · 限额关闭'
+					: fmtTok(Math.ceil(monthlyUsage)) + ' / ' + fmtTok(monthlyLimit) + ' Neurons';
 			}
 			if (rightSpan) {
 				if (limitDisabled) {
@@ -5736,7 +5698,7 @@ async function handleAdminPage(request, env, ctx) {
 							grid: { color: gridColor },
 							ticks: {
 								color: textColor,
-								callback: function(value) { return fmtLimit(value); }
+								callback: function(value) { return fmtTok(value); }
 							}
 						},
 						x: {
