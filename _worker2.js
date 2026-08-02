@@ -34,98 +34,11 @@ function randomDelay(minMs = 200, maxMs = 1500) {
 	return new Promise(r => setTimeout(r, delay));
 }
 
-// ===== 通用工具函数 =====
-
-function safeJSONParse(raw, defaultVal) {
-	if (!raw) return defaultVal;
-	try { return JSON.parse(raw); } catch { return defaultVal; }
-}
-
-function getTodayStr() {
-	return new Date().toISOString().split('T')[0];
-}
-
-function trackUsage(env, ctx, tokens, requestStartTime) {
-	accumulateTokens(env, ctx, {
-		...tokens,
-		durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
-	});
-}
-
-function trackUsageFromResponse(env, ctx, response, requestStartTime) {
-	if (ctx && response.usage) {
-		const usage = response.usage;
-		const promptDetails = usage.prompt_tokens_details || {};
-		trackUsage(env, ctx, {
-			input: usage.prompt_tokens || 0,
-			output: usage.completion_tokens || 0,
-			reasoning: usage.reasoning_tokens || 0,
-			cacheRead: promptDetails.cached_tokens || usage.cache_read_tokens || 0,
-			cacheWrite: usage.cache_write_tokens || 0,
-		}, requestStartTime);
-	}
-}
-
-// 多账号 failover 通用函数：遍历账号列表，每账号最多重试一次
-// onAccount(account, attempt, accountIndex) 返回:
-//   { retry: false, ... }  → 成功或不可重试错误，直接返回
-//   { retry: true, error, status } → 可重试错误，同账号重试
-//   { retry: true, skipAccount: true, error, status } → 跳过当前账号剩余重试，切下一个账号
-//   抛出异常 → 网络错误，继续重试
-async function withFailover(env, onAccount) {
-	const accounts = await getAccounts(env);
-	const activeAccounts = accounts.filter(a => a.status === 'active');
-	if (activeAccounts.length === 0) {
-		return { success: false, status: 503, error: "No active Cloudflare accounts configured" };
-	}
-
-	let lastError = null;
-	let lastStatus = 502;
-	let accountIndex = 0;
-
-	for (const account of activeAccounts) {
-		accountIndex++;
-		for (let attempt = 0; attempt < 2; attempt++) {
-			if (attempt > 0) {
-				await new Promise(r => setTimeout(r, 1000));
-			}
-			try {
-				const result = await onAccount(account, attempt, accountIndex);
-				if (!result.retry) return result;
-				lastError = result.error;
-				lastStatus = result.status || 502;
-				if (result.skipAccount) break;
-			} catch (e) {
-				lastStatus = 502;
-				lastError = `Connection error: ${e.message}`;
-			}
-		}
-	}
-
-	return { success: false, status: lastStatus, error: `All Cloudflare accounts failed. Last error: ${lastError}` };
-}
-
-// ===== Workers AI REST API 直连（无 AI Gateway） =====
-// 直接 API URL 格式: https://api.cloudflare.com/client/v4/accounts/{accountId}/ai/{path}
-
-// 构建 Workers AI REST API 的 URL（直连，不经过 AI Gateway）
-function buildCFUrl(account, path) {
-	return `https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/${path}`;
-}
-
-// ===== 错误分类体系 =====
-
-// 判断 HTTP 状态码是否可重试（参照 cloudflare_ai 的 isRetryableStatus）
-// 408 超时、409 冲突、429 限流、5xx 服务端错误 → 可重试
-function isRetryableStatus(status) {
-	return status === 408 || status === 409 || status === 429 || status >= 500;
-}
-
+// ===== 参照 cloudflare_ai 实现的错误分类体系 =====
 // 将 HTTP 状态码分类为可读的错误类型，附带是否可重试的提示
 function classifyStatus(status) {
 	if (status === 401 || status === 403) return { code: 'auth', recoverable: false };
 	if (status === 429) return { code: 'rate-limit', recoverable: true };
-	if (status === 408) return { code: 'timeout', recoverable: true };
 	if (status === 404) return { code: 'not-found', recoverable: false };
 	if (status === 400 || status === 422) return { code: 'bad-request', recoverable: false };
 	if (status >= 500) return { code: 'provider-error', recoverable: true };
@@ -162,19 +75,16 @@ function extractErrorMessage(raw) {
 	return undefined;
 }
 
-// ===== 响应文本提取 =====
-// 处理多种格式
+// ===== 参照 cloudflare_ai 实现的响应文本提取 =====
+// 处理多种 Workers AI 响应格式:
+// - OpenAI 格式: { choices: [{ message: { content: "..." } }] }
+// - 原生格式: { response: "..." }
+// - 结构化输出: { response: { ... } } (对象转JSON)
+// - 数值: { response: 42 }
 function processText(output) {
 	const choices = output.choices;
-	if (choices && choices[0]) {
-		// chat completions: choices[0].message.content
-		if (choices[0].message?.content) {
-			return String(choices[0].message.content);
-		}
-		// text completions: choices[0].text
-		if (choices[0].text !== undefined && choices[0].text !== null) {
-			return String(choices[0].text);
-		}
+	if (choices && choices[0]?.message?.content) {
+		return String(choices[0].message.content);
 	}
 	if ('response' in output) {
 		const response = output.response;
@@ -188,7 +98,7 @@ function processText(output) {
 	return undefined;
 }
 
-// ===== binary 输出统一处理 =====
+// ===== 参照 cloudflare_ai 实现的 binary 输出统一处理 =====
 // 将各种输出格式统一转换为 Uint8Array
 // 处理: Uint8Array, ArrayBuffer, ReadableStream, Response, { image: base64 }, { audio: base64 }
 async function toUint8Array(output) {
@@ -313,11 +223,6 @@ function createResumableStream(reader, options) {
 					if (!value || value.length === 0) continue;
 
 					pending = concat(pending, value);
-					// 限制 pending 缓冲最大 1MB，防止 SSE 流中长时间无 \n\n 边界导致内存溢出
-					if (pending.length > 1024 * 1024) {
-						controller.error(new Error('Stream buffer overflow: no SSE boundary found within 1MB'));
-						return;
-					}
 					const boundary = lastEventBoundary(pending);
 					if (boundary > 0) {
 						const complete = pending.slice(0, boundary);
@@ -416,7 +321,7 @@ const TOKEN_KV_TTL_SEC = 86400 * 2;    // KV 键保留 2 天
 
 // 获取 token 统计 KV 键名
 function getTokenDailyKey() {
-	return `tokens_daily_${getTodayStr()}`;
+	return `tokens_daily_${new Date().toISOString().split('T')[0]}`;
 }
 
 // 获取月度 token 统计 KV 键名
@@ -425,7 +330,7 @@ function getTokenMonthlyKey() {
 	return `tokens_monthly_${d.getFullYear()}_${String(d.getMonth() + 1).padStart(2, '0')}`;
 }
 
-// 从 CF 响应中提取完整的 usage 信息
+// 参照 cloudflare_ai 的 mapWorkersAIUsage，从 CF 响应中提取完整的 usage 信息
 // 处理多种格式: { usage: { prompt_tokens, completion_tokens, ... } }
 //            或 { result: { usage: ... } }
 // 支持 prompt_tokens_details.cached_tokens（云flare_ai 的标准方式）
@@ -445,6 +350,8 @@ function extractUsage(response) {
 }
 
 // 累加 token 直接写入 KV（无内存缓冲，避免冷启动丢失）
+// 用 ctx.waitUntil() 后台执行，不阻塞响应
+// 参照 cloudflare_ai 的 mapWorkersAIUsage 格式，增加了 reasoning/cache 字段
 async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0, cacheRead = 0, cacheWrite = 0, durationSec = 0 }) {
 	ctx.waitUntil((async () => {
 		try {
@@ -564,18 +471,8 @@ const DEFAULT_MODEL_MAP = {
 	'llava-1.5-7b': '@cf/llava-hf/llava-1.5-7b-hf',
 	'flux-1-schnell': '@cf/black-forest-labs/flux-1-schnell',
 	'sdxl': '@cf/stabilityai/stable-diffusion-xl-base-1.0',
-
-	// 语音识别（Whisper）模型
-	'whisper': '@cf/openai/whisper',
-	'whisper-1': '@cf/openai/whisper',
-	'whisper-tiny-en': '@cf/openai/whisper-tiny-en',
-	'whisper-large-v3-turbo': '@cf/openai/whisper-large-v3-turbo',
-
-	// 视觉模型
-	'moondream3.1-9B-A2B': '@cf/moondream/moondream3.1-9B-A2B',
-
-	// 向量嵌入（Embeddings）模型补充
-	'bge-base-en-v1.5': '@cf/baai/bge-base-en-v1.5',
+	'whisper': '@cf/openai/whisper-large-v3-turbo',
+	'whisper-1': '@cf/openai/whisper-large-v3-turbo',
 
 	// 文本转语音（TTS）模型
 	'tts': '@cf/myshell-ai/tts'
@@ -589,21 +486,14 @@ const CF_OWNER_MAP = [
 	['@cf/moonshotai/', 'moonshotai'], ['@cf/baai/', 'baai'], ['@cf/stabilityai/', 'stabilityai'],
 	['@cf/black-forest-labs/', 'black-forest-labs'], ['@cf/codellama/', 'codellama'],
 	['@cf/llava-hf/', 'llava-hf'], ['@cf/internlm/', 'internlm'],
-	['@cf/myshell-ai/', 'myshell-ai'], ['@cf/moondream/', 'moondream'],
+	['@cf/myshell-ai/', 'myshell-ai'],
 ];
-
-function getModelOwnedBy(cfModel, id) {
-	let ownedBy = 'system';
-	for (const [prefix, owner] of CF_OWNER_MAP) {
-		if (cfModel.startsWith(prefix)) { ownedBy = owner; break; }
-	}
-	if (ownedBy === 'system' && id.includes('embedding')) ownedBy = 'openai';
-	return ownedBy;
-}
 
 export default {
 	async fetch(request, env, ctx) {
 		try {
+			// 清空请求级缓存，确保每次请求独立
+			clearRequestCache();
 			// 1. 检查是否绑定了 KV 存储
 			if (!env.KV) {
 				const url = new URL(request.url);
@@ -682,12 +572,12 @@ export default {
 			// robots.txt 支持，用于屏蔽搜索引擎爬虫
 			if (url.pathname === '/robots.txt') {
 				return new Response('User-agent: *\nDisallow: /', {
-					headers: { 'Content-Type': 'text/plain; charset=utf-8', 'X-Request-Id': generateRequestId() }
+					headers: { 'Content-Type': 'text/plain; charset=utf-8' }
 				});
 			}
 
 			// 7. 其他路径一律返回 404
-			return new Response('404 Not Found', { status: 404, headers: { 'X-Request-Id': generateRequestId() } });
+			return new Response('404 Not Found', { status: 404 });
 		} catch (e) {
 			// 顶层兜底：仅记录安全信息，不打印异常对象本身，
 			// 避免异常可能携带的 Authorization 请求头被 Cloudflare tail workers 捕获
@@ -697,13 +587,10 @@ export default {
 	}
 };
 
-// 工具函数：给响应加上跨域（CORS）响应头和请求追踪 ID
+// 工具函数：给响应加上跨域（CORS）响应头
 // /v1/ 代理接口保持宽松（供 OpenAI 客户端跨域调用），/api/ 管理接口仅允许同源
 function addCORSHeaders(response, request) {
 	const newResponse = new Response(response.body, response);
-	if (!newResponse.headers.has('X-Request-Id')) {
-		newResponse.headers.set('X-Request-Id', generateRequestId());
-	}
 	newResponse.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
 	newResponse.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key');
 	try {
@@ -732,53 +619,116 @@ async function sha256(message) {
 	return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// KV 工具函数：配置拆分为独立键，避免单键放大
-// 使用工厂函数减少重复代码，闭包内 _promise 做同请求内去重
-// 跨请求缓存由 KV 的 cacheTtl: 60 承担
-function createKVGetter(kvKey, defaultValue) {
-	let _promise = null;
-	return async function(env) {
-		if (_promise) return _promise;
-		_promise = (async () => {
-			const raw = await env.KV.get(kvKey, { cacheTtl: 60 });
-			return safeJSONParse(raw, defaultValue);
-		})();
-		try { return await _promise; } finally { _promise = null; }
-	};
+// 请求级缓存：同一请求内复用 KV 读取结果，避免重复读取
+let _accountsCache = null;
+let _accountsPromise = null;
+let _apiKeysCache = null;
+let _apiKeysPromise = null;
+let _modelMapCache = null;
+let _modelMapPromise = null;
+let _limitsCache = null;
+let _limitsPromise = null;
+
+function clearRequestCache() {
+	_accountsCache = null;
+	_accountsPromise = null;
+	_apiKeysCache = null;
+	_apiKeysPromise = null;
+	_modelMapCache = null;
+	_modelMapPromise = null;
+	_limitsCache = null;
+	_limitsPromise = null;
 }
-const getAccounts = createKVGetter('cfg_accounts', []);
-const getApiKeys = createKVGetter('cfg_api_keys', []);
-const getCustomModelMap = createKVGetter('cfg_model_map', {});
-const getUsageLimitsConfig = createKVGetter('cfg_limits', {});
+
+// KV 工具函数：配置拆分为独立键，避免单键放大
+async function getAccounts(env) {
+	if (_accountsCache !== null) return _accountsCache;
+	if (_accountsPromise) return _accountsPromise;
+	_accountsPromise = (async () => {
+		const raw = await env.KV.get('cfg_accounts', { cacheTtl: 60 });
+		if (!raw) return [];
+		try { return JSON.parse(raw); } catch { return []; }
+	})();
+	try {
+		_accountsCache = await _accountsPromise;
+		return _accountsCache;
+	} finally {
+		_accountsPromise = null;
+	}
+}
+
+async function saveAccounts(env, accounts) {
+	await env.KV.put('cfg_accounts', JSON.stringify(accounts));
+	_accountsCache = accounts; // 更新缓存
+	await env.KV.delete('cache_usage_summary'); // 清除用量统计的缓存
+}
+
+async function getApiKeys(env) {
+	if (_apiKeysCache !== null) return _apiKeysCache;
+	if (_apiKeysPromise) return _apiKeysPromise;
+	_apiKeysPromise = (async () => {
+		const raw = await env.KV.get('cfg_api_keys', { cacheTtl: 60 });
+		if (!raw) return [];
+		try { return JSON.parse(raw); } catch { return []; }
+	})();
+	try {
+		_apiKeysCache = await _apiKeysPromise;
+		return _apiKeysCache;
+	} finally {
+		_apiKeysPromise = null;
+	}
+}
+
+async function saveApiKeys(env, keys) {
+	await env.KV.put('cfg_api_keys', JSON.stringify(keys));
+	_apiKeysCache = keys; // 更新缓存
+}
+
+async function getCustomModelMap(env) {
+	if (_modelMapCache !== null) return _modelMapCache;
+	if (_modelMapPromise) return _modelMapPromise;
+	_modelMapPromise = (async () => {
+		const raw = await env.KV.get('cfg_model_map', { cacheTtl: 60 });
+		if (!raw) return {};
+		try { return JSON.parse(raw); } catch { return {}; }
+	})();
+	try {
+		_modelMapCache = await _modelMapPromise;
+		return _modelMapCache;
+	} finally {
+		_modelMapPromise = null;
+	}
+}
+
+async function saveCustomModelMap(env, map) {
+	await env.KV.put('cfg_model_map', JSON.stringify(map));
+	_modelMapCache = map; // 更新缓存
+}
+
+async function getUsageLimitsConfig(env) {
+	if (_limitsCache !== null) return _limitsCache;
+	if (_limitsPromise) return _limitsPromise;
+	_limitsPromise = (async () => {
+		const raw = await env.KV.get('cfg_limits', { cacheTtl: 60 });
+		if (!raw) return {};
+		try { return JSON.parse(raw); } catch { return {}; }
+	})();
+	try {
+		_limitsCache = await _limitsPromise;
+		return _limitsCache;
+	} finally {
+		_limitsPromise = null;
+	}
+}
 
 async function saveUsageLimitsConfig(env, limits) {
 	const existing = await getUsageLimitsConfig(env);
 	const merged = { ...existing, ...limits };
 	await env.KV.put('cfg_limits', JSON.stringify(merged));
-}
-
-async function saveCustomModelMap(env, map) {
-	await env.KV.put('cfg_model_map', JSON.stringify(map));
-}
-
-async function saveAccounts(env, accounts) {
-	await env.KV.put('cfg_accounts', JSON.stringify(accounts));
-}
-
-async function saveApiKeys(env, keys) {
-	await env.KV.put('cfg_api_keys', JSON.stringify(keys));
+	_limitsCache = merged; // 更新缓存
 }
 
 const COOKIE_TOKEN_RE = /admin_token=([^;]+)/;
-
-// 脱敏 API Token（参照 new-api 的 MaskTokenKey）
-// 长度 ≤4 全部遮蔽，≤8 保留首尾各 2 位，>8 保留首尾各 4 位
-function maskTokenKey(key) {
-	if (!key) return '';
-	if (key.length <= 4) return '*'.repeat(key.length);
-	if (key.length <= 8) return key.slice(0, 2) + '****' + key.slice(-2);
-	return key.slice(0, 4) + '**********' + key.slice(-4);
-}
 
 // 恒定时间字符串比较，防止时序攻击
 function timingSafeEqual(a, b) {
@@ -789,10 +739,6 @@ function timingSafeEqual(a, b) {
 	}
 	return result === 0;
 }
-
-// 缓存 ADMIN_PASSWORD 的 SHA-256 哈希，避免每个请求重复计算（同一 isolate 内 ADMIN_PASSWORD 不变）
-let _cachedAdminHash = null;
-let _cachedAdminPassword = null;
 
 // 管理员身份验证（Cookie + Authorization 头）
 async function checkAdminAuth(request, env) {
@@ -814,12 +760,8 @@ async function checkAdminAuth(request, env) {
 
 	if (!expectedPassword) return false; // 还没配置管理员密码
 
-	// 复用缓存的哈希值，仅当 ADMIN_PASSWORD 变化时才重新计算
-	if (_cachedAdminHash === null || _cachedAdminPassword !== expectedPassword) {
-		_cachedAdminHash = await sha256(expectedPassword);
-		_cachedAdminPassword = expectedPassword;
-	}
-	return timingSafeEqual(token, _cachedAdminHash);
+	const expectedHash = await sha256(expectedPassword);
+	return timingSafeEqual(token, expectedHash);
 }
 
 // 代理接口鉴权
@@ -843,46 +785,9 @@ async function checkProxyAuth(request, env) {
 	return false;
 }
 
-// 通用 JSON 错误响应（OpenAI 标准格式）
-function jsonError(message, status = 500, type = 'server_error', code = null, param = null) {
-	const errBody = { error: { message, type } };
-	if (code !== null) errBody.error.code = code;
-	if (param !== null) errBody.error.param = param;
-	const reqId = generateRequestId();
-	return new Response(JSON.stringify(errBody), {
-		status,
-		headers: { 'Content-Type': 'application/json', 'X-Request-Id': reqId }
-	});
-}
-
-// 405 Method Not Allowed 响应（OpenAI 标准格式，含 Allow 头）
-function methodNotAllowed(allowedMethods) {
-	const allow = Array.isArray(allowedMethods) ? allowedMethods.join(', ') : allowedMethods;
-	const reqId = generateRequestId();
-	return new Response(JSON.stringify({
-		error: { message: `Method not allowed. Allowed: ${allow}`, type: 'invalid_request_error', code: 'method_not_allowed' }
-	}), {
-		status: 405,
-		headers: { 'Content-Type': 'application/json', 'X-Request-Id': reqId, 'Allow': allow }
-	});
-}
-
-// Anthropic 格式错误响应（用于 /v1/messages 和 /v1/messages/count_tokens）
-function anthropicError(message, status = 400) {
-	return new Response(JSON.stringify({
-		type: 'error',
-		error: { type: 'invalid_request_error', message }
-	}), { status, headers: { 'Content-Type': 'application/json' } });
-}
-
-// 生成唯一请求 ID（OpenAI 标准 X-Request-Id 格式）
-function generateRequestId() {
-	const chars = 'abcdef0123456789';
-	let id = 'req_';
-	for (let i = 0; i < 24; i++) {
-		id += chars[Math.floor(Math.random() * chars.length)];
-	}
-	return id;
+// 通用 JSON 错误响应
+function jsonError(message, status = 500, type = 'server_error') {
+	return new Response(JSON.stringify({ error: { message, type } }), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
 // 从 CF API 错误响应中提取可读的错误消息
@@ -1032,7 +937,7 @@ async function getCachedSummary(env) {
 async function setCachedSummary(env, summaryData) {
 	const data = {
 		...summaryData,
-		summaryDate: getTodayStr(),
+		summaryDate: new Date().toISOString().split('T')[0],
 		timestamp: Date.now()
 	};
 	await env.KV.put('cache_usage_summary', JSON.stringify(data), { expirationTtl: USAGE_CACHE_TTL_MS / 1000 });
@@ -1052,7 +957,7 @@ function emptyUsageResponse(limits) {
 // 从 cacheMap + accounts 构建用量汇总
 async function buildUsageSummary(env, accounts, cacheMap) {
 	const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
-	const todayStr = getTodayStr();
+	const todayStr = new Date().toISOString().split('T')[0];
 	let totalNeuronsToday = 0;
 	let totalRequestsToday = 0;
 	let totalRequestsMonth = 0;
@@ -1143,7 +1048,7 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) 
 			const todayUsage = historyParsed.todayTotalNeurons;
 			const todayRequests = historyParsed.todayTotalRequests;
 			const todayModels = historyParsed.todayModels;
-			const todayDateStr = getTodayStr();
+			const todayDateStr = new Date().toISOString().split('T')[0];
 
 			// 月初在窗口内则从同一查询提取，否则独立查
 			let monthlyTotal;
@@ -1272,10 +1177,13 @@ async function queryGraphQL(accountId, apiToken, startDateTime) {
 }
 
 function processAnalytics(groups) {
-	const todayStr = getTodayStr();
+	const todayStr = new Date().toISOString().split('T')[0];
 
-	let todayTotalNeurons = 0, todayTotalRequests = 0;
-	const todayModelsMap = {}, historyMap = {}, historyRequestsMap = {};
+	let todayTotalNeurons = 0;
+	let todayTotalRequests = 0;
+	const todayModelsMap = {};
+	const historyMap = {};
+	const historyRequestsMap = {};
 
 	// 先把最近 7 天的历史数据全部初始化为 0
 	for (let i = 6; i >= 0; i--) {
@@ -1332,9 +1240,16 @@ async function handleV1Proxy(request, env, ctx) {
 					type: 'authentication_error',
 					message: 'Invalid x-api-key or Authorization header.'
 				}
-			}), { status: 401, headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
+			}), { status: 401, headers: { 'Content-Type': 'application/json' } });
 		}
-		return jsonError("Incorrect or missing API key. Configure keys in the dashboard.", 401, "invalid_request_error", "invalid_api_key");
+		return new Response(JSON.stringify({
+			error: {
+				message: "Incorrect or missing API key. Configure keys in the dashboard.",
+				type: "invalid_request_error",
+				param: null,
+				code: "invalid_api_key"
+			}
+		}), { status: 401, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	const limitCheck = await checkUsageLimit(env);
@@ -1345,9 +1260,11 @@ async function handleV1Proxy(request, env, ctx) {
 			return new Response(JSON.stringify({
 				type: 'error',
 				error: { type: 'quota_exceeded', message: msg }
-			}), { status: 429, headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
+			}), { status: 429, headers: { 'Content-Type': 'application/json' } });
 		}
-		return jsonError(msg, 429, 'quota_exceeded');
+		return new Response(JSON.stringify({
+			error: { message: msg, type: 'quota_exceeded' }
+		}), { status: 429, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	if (url.pathname === '/v1/models' && request.method === 'GET') {
@@ -1356,7 +1273,11 @@ async function handleV1Proxy(request, env, ctx) {
 
 		const modelsData = Object.keys(combinedMap).map(id => {
 			const cfModel = combinedMap[id] || '';
-			const ownedBy = getModelOwnedBy(cfModel, id);
+			let ownedBy = 'system';
+			for (const [prefix, owner] of CF_OWNER_MAP) {
+				if (cfModel.startsWith(prefix)) { ownedBy = owner; break; }
+			}
+			if (ownedBy === 'system' && id.includes('embedding')) ownedBy = 'openai';
 			return {
 				id,
 				object: 'model',
@@ -1368,30 +1289,6 @@ async function handleV1Proxy(request, env, ctx) {
 		return new Response(JSON.stringify({
 			object: 'list',
 			data: modelsData
-		}), { headers: { 'Content-Type': 'application/json' } });
-	}
-
-	if (url.pathname.startsWith('/v1/models/') && request.method === 'GET') {
-		const modelId = decodeURIComponent(url.pathname.slice('/v1/models/'.length));
-		if (!modelId) {
-			return jsonError("Model ID is required", 400, "invalid_request_error");
-		}
-
-		const customMap = await getCustomModelMap(env);
-		const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
-		const cfModel = combinedMap[modelId];
-
-		if (!cfModel) {
-			return jsonError(`Model '${modelId}' not found`, 404, "model_not_found");
-		}
-
-		const ownedBy = getModelOwnedBy(cfModel, modelId);
-
-		return new Response(JSON.stringify({
-			id: modelId,
-			object: 'model',
-			created: MODEL_CREATED_TS,
-			owned_by: ownedBy
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
@@ -1412,11 +1309,7 @@ async function handleV1Proxy(request, env, ctx) {
 	}
 
 	if (url.pathname === '/v1/audio/transcriptions' && request.method === 'POST') {
-		return handleAudioTranscribe(request, env, ctx, false);
-	}
-
-	if (url.pathname === '/v1/audio/translations' && request.method === 'POST') {
-		return handleAudioTranscribe(request, env, ctx, true);
+		return handleAudioTranscriptions(request, env, ctx);
 	}
 
 	if (url.pathname === '/v1/audio/speech' && request.method === 'POST') {
@@ -1427,60 +1320,113 @@ async function handleV1Proxy(request, env, ctx) {
 		return handleCountTokens(request, env);
 	}
 
-	// 405 方法校验：检查是否匹配已知路径但使用了错误的方法
-	const methodRoutes = {
-		'/v1/models': ['GET'],
-		'/v1/chat/completions': ['POST'],
-		'/v1/completions': ['POST'],
-		'/v1/messages': ['POST'],
-		'/v1/embeddings': ['POST'],
-		'/v1/images/generations': ['POST'],
-		'/v1/audio/transcriptions': ['POST'],
-		'/v1/audio/translations': ['POST'],
-		'/v1/audio/speech': ['POST'],
-		'/v1/messages/count_tokens': ['POST'],
-	};
-	if (methodRoutes[url.pathname]) {
-		return methodNotAllowed(methodRoutes[url.pathname]);
-	}
-	if (url.pathname.startsWith('/v1/models/')) {
-		return methodNotAllowed(['GET']);
-	}
-
 	return jsonError(`Path not found: ${url.pathname}`, 404, "invalid_request_error");
 }
 
-// 可复用的核心 API 调用：OpenAI Chat Completions → Workers AI，支持多账号 failover
-async function callOpenAICompatibleAPI(cfPayload, env, stream) {
-	return withFailover(env, async (account, attempt, accountIndex) => {
-		if (attempt > 0) {
-			console.warn(`[Retry] Retrying account ${accountIndex} (attempt ${attempt + 1}/2)...`);
-		}
-		const timeoutMs = stream ? 300000 : 60000;
-		const apiUrl = buildCFUrl(account, 'v1/chat/completions');
-		const cfResponse = await fetch(apiUrl, {
-			method: 'POST',
-			headers: {
-				'Authorization': `Bearer ${account.apiToken}`,
-				'Content-Type': 'application/json',
-				'User-Agent': randomUA(),
-			},
-			body: JSON.stringify(cfPayload),
-			signal: AbortSignal.timeout(timeoutMs),
-		});
+// 可复用的核心 API 调用：OpenAI Chat Completions → CF AI 网关，支持多账号 failover
+// 从客户端请求头透传到上游的 cf-aig-* 头（零延迟开销，仅携带元数据）
+// 参照 cloudflare_ai 的 applyGatewayCacheHeaders 实现，补充了缓存/重试/日志等控制头
+const CF_AIG_PASSTHROUGH_HEADERS = [
+	// 日志与追踪（零延迟）
+	'cf-aig-event-id',       // 事件追踪 ID
+	'cf-aig-metadata',       // 日志元数据 (JSON)
+	'cf-aig-collect-log',    // 是否记录日志 (true/false)
+	'cf-aig-run-id',         // 可恢复流运行 ID（输出响应头）
+	// 上游超时控制（零延迟，仅控制上游超时时间）
+	'cf-aig-request-timeout', // 上游超时 (ms)
+	// 缓存控制（零延迟或加速）
+	'cf-aig-cache-ttl',      // 缓存 TTL (秒)
+	'cf-aig-cache-key',      // 自定义缓存键
+	'cf-aig-skip-cache',     // 跳过缓存 (true)
+	// 重试控制（仅在失败时生效，无延迟代价）
+	'cf-aig-max-attempts',   // 最大重试次数
+	'cf-aig-retry-delay',    // 重试间隔 (ms)
+	'cf-aig-backoff',        // 退避策略 (constant/linear/exponential)
+	// 高级控制
+	'cf-aig-byok-alias',     // BYOK 密钥别名
+	'cf-aig-zdr',            // 零数据保留 (true/false)
+];
 
-		if (cfResponse.ok) {
+// 从客户端请求头中提取 cf-aig-* 头，用于透传到上游
+function pickCfAigHeaders(headers) {
+	if (!headers) return {};
+	const picked = {};
+	for (const key of CF_AIG_PASSTHROUGH_HEADERS) {
+		const val = headers.get(key);
+		if (val) picked[key] = val;
+	}
+	return picked;
+}
+
+// 从上游响应头中提取 cf-aig-* 头，用于透传到客户端响应
+// 这些是 AI Gateway 返回的元数据头（如运行 ID、事件追踪等）
+function pickCfAigResponseHeaders(headers) {
+	if (!headers) return {};
+	const picked = {};
+	// cf-aig-* 响应头通常包含运行 ID、事件追踪、元数据等
+	for (const [key, val] of headers) {
+		if (key.startsWith('cf-aig-')) {
+			picked[key] = val;
+		}
+	}
+	return picked;
+}
+
+async function callOpenAICompatibleAPI(cfPayload, env, stream, incomingHeaders) {
+	const accounts = await getAccounts(env);
+	const activeAccounts = accounts.filter(a => a.status === 'active');
+	if (activeAccounts.length === 0) {
+		return { success: false, status: 503, error: "No active Cloudflare accounts configured. Add them in the WebUI." };
+	}
+
+	let lastError = null;
+	let lastStatus = 502; // 记录最后一次上游 HTTP 状态码，用于透传给客户端（区分 429 限流 / 5xx 故障等）
+	let accountIndex = 0;
+
+	for (const account of activeAccounts) {
+		// 非第一个账号时，添加随机延迟后再切换，避免被检测到连续请求模式
+		if (accountIndex > 0) {
+			await randomDelay(300, 2000);
+		}
+		accountIndex++;
+		try {
+			// 流式超时 5min，非流式 60s（大上下文处理需要更长时间）
+			const timeoutMs = stream ? 300000 : 60000;
+			const cfResponse = await fetch(
+				`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/v1/chat/completions`,
+				{
+					method: 'POST',
+					headers: {
+						'Authorization': `Bearer ${account.apiToken}`,
+						'Content-Type': 'application/json',
+						'User-Agent': randomUA(),
+						...pickCfAigHeaders(incomingHeaders),
+					},
+					body: JSON.stringify(cfPayload),
+					signal: AbortSignal.timeout(timeoutMs),
+				}
+			);
+
+			if (cfResponse.ok) {
+			// 捕获上游 cf-aig-* 响应头，透传给客户端
+			const aigRespHeaders = pickCfAigResponseHeaders(cfResponse.headers);
 			if (stream) {
 				if (!cfResponse.body) {
-					return { retry: true, error: 'CF API returned empty response body' };
+					lastError = `CF API returned empty response body`;
+					continue;
 				}
+				// 预读第一个 chunk 校验响应格式，
+				// 避免 CF 返回 HTTP 200 + {"success":false,...} 错误体被当作 SSE 流处理
+				// 推理模型首 token 可能较长，用 120s 超时
 				const streamReader = cfResponse.body.getReader();
 				const firstResult = await readWithTimeout(streamReader, 120000);
 				if (firstResult.done) {
-					return { retry: true, error: 'CF API returned empty stream' };
+					lastError = `CF API returned empty stream`;
+					continue;
 				}
 				const decoder = new TextDecoder();
 				const firstText = decoder.decode(firstResult.value, { stream: true });
+				// 以 { 开头且包含 success:false → JSON 错误体，非 SSE
 				if (firstText.trimStart().startsWith('{') && (firstText.includes('"success":false') || firstText.includes('"success": false'))) {
 					let errBody = firstText;
 					while (true) {
@@ -1488,36 +1434,55 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 						if (done) break;
 						errBody += decoder.decode(value, { stream: true });
 					}
-					return { retry: true, skipAccount: true, error: `CF API error: ${extractCleanCFError(errBody)}`, status: cfResponse.status };
+					lastStatus = cfResponse.status;
+					lastError = `CF API error: ${extractCleanCFError(errBody)}`;
+					continue;
 				}
+				// 是有效的 SSE 流，使用可恢复流包装（断点续传 + 事件边界对齐）
+				// 创建一个包装 reader，先把预读的 chunk 返回，再委托给真实 streamReader
 				const prependReader = {
 					_firstChunk: firstResult.value,
 					_firstDone: false,
 					_reader: streamReader,
 					async read() {
-						if (!this._firstDone) { this._firstDone = true; return { value: this._firstChunk, done: false }; }
+						if (!this._firstDone) {
+							this._firstDone = true;
+							return { value: this._firstChunk, done: false };
+						}
 						return this._reader.read();
 					},
-					cancel(reason) { try { this._reader.cancel(reason); } catch (_) {} },
-					releaseLock() { try { this._reader.releaseLock(); } catch (_) {} },
+					cancel(reason) {
+						try { this._reader.cancel(reason); } catch (_) {}
+					},
+					releaseLock() {
+						try { this._reader.releaseLock(); } catch (_) {}
+					},
 				};
+
+				// 保存当前账号信息，供重连时使用
 				const retryAccount = account;
 				const retryPayload = cfPayload;
+				const retryHeaders = incomingHeaders;
+
 				const resumableStream = createResumableStream(prependReader, {
 					createRetryFetch: async (emittedEvents, reconnectAttempt) => {
+						// 重连前等待，间隔递增（1s, 2s, 3s, 4s, 5s）
 						await new Promise(r => setTimeout(r, Math.min(1000 * reconnectAttempt, 5000)));
 						console.warn(`[ResumableStream] Re-fetching request (attempt ${reconnectAttempt}) at event ${emittedEvents}...`);
-						const retryUrl = buildCFUrl(retryAccount, 'v1/chat/completions');
-						const retryResponse = await fetch(retryUrl, {
-							method: 'POST',
-							headers: {
-								'Authorization': `Bearer ${retryAccount.apiToken}`,
-								'Content-Type': 'application/json',
-								'User-Agent': randomUA(),
-							},
-							body: JSON.stringify(retryPayload),
-							signal: AbortSignal.timeout(300000),
-						});
+						const retryResponse = await fetch(
+							`https://api.cloudflare.com/client/v4/accounts/${retryAccount.accountId}/ai/v1/chat/completions`,
+							{
+								method: 'POST',
+								headers: {
+									'Authorization': `Bearer ${retryAccount.apiToken}`,
+									'Content-Type': 'application/json',
+									'User-Agent': randomUA(),
+									...pickCfAigHeaders(retryHeaders),
+								},
+								body: JSON.stringify(retryPayload),
+								signal: AbortSignal.timeout(300000),
+							}
+						);
 						if (!retryResponse.ok || !retryResponse.body) {
 							console.error(`[ResumableStream] Retry fetch failed (status ${retryResponse.status})`);
 							return null;
@@ -1526,21 +1491,30 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 					},
 					maxReconnects: 5,
 					onResumeExpired: 'accept-partial',
-					onProgress: () => {},
+					onProgress: (eventOffset) => {
+						// 可选的进度回调，供日志或监控使用
+					},
 				});
-				return { success: true, status: cfResponse.status, stream: resumableStream };
+				return { success: true, status: cfResponse.status, stream: resumableStream, aigResponseHeaders: aigRespHeaders };
 			}
-			const cfJson = await cfResponse.json();
-			return { success: true, status: cfResponse.status, data: cfJson };
-		}
+				const cfJson = await cfResponse.json();
+				return { success: true, status: cfResponse.status, data: cfJson, aigResponseHeaders: aigRespHeaders };
+			}
 
-		const errorText = await cfResponse.text();
-		const error = `CF API returned ${cfResponse.status}: ${extractCleanCFError(errorText)}`;
-		if (!isRetryableStatus(cfResponse.status)) {
-			return { success: false, status: cfResponse.status, error };
+			const errorText = await cfResponse.text();
+			lastStatus = cfResponse.status;
+			lastError = `CF API returned ${cfResponse.status}: ${extractCleanCFError(errorText)}`;
+			// 4xx 客户端错误（除 429 限流外）切换账号也不会成功，直接返回
+			if (cfResponse.status >= 400 && cfResponse.status < 500 && cfResponse.status !== 429) {
+				return { success: false, status: lastStatus, error: lastError };
+			}
+		} catch (e) {
+			lastStatus = 502; // 网络异常归为 502
+			lastError = `Connection error: ${e.message}`;
 		}
-		return { retry: true, error, status: cfResponse.status };
-	});
+	}
+
+	return { success: false, status: lastStatus, error: `All Cloudflare accounts failed. Last error: ${lastError}` };
 }
 
 // 共享的模型名解析函数：根据用户传入的模型名，映射到 Cloudflare 实际模型
@@ -1557,28 +1531,53 @@ async function resolveModelName(model, env) {
 
 // 通用的 CF /ai/run/{model} failover 调用函数
 // 用于 embeddings、images、audio 等非 chat 端点，统一多账号 failover 逻辑
-async function callCFRunAPI(cfModel, buildPayload, processResult, env) {
-	return withFailover(env, async (account, attempt, accountIndex) => {
-		const cfPayload = buildPayload(account);
-		cfPayload.headers = { ...cfPayload.headers, 'User-Agent': randomUA() };
-		const apiUrl = buildCFUrl(account, `run/${cfModel}`);
-		const cfResponse = await fetch(apiUrl, cfPayload);
+// 最后一个参数 incomingHeaders 可选，用于透传 cf-aig-* 请求头
+async function callCFRunAPI(cfModel, buildPayload, processResult, env, incomingHeaders) {
+	const accounts = await getAccounts(env);
+	const activeAccounts = accounts.filter(a => a.status === 'active');
+	if (activeAccounts.length === 0) {
+		return { success: false, status: 503, error: "No active accounts configured" };
+	}
 
-		if (cfResponse.ok) {
-			const cfJson = await cfResponse.json();
-			if (cfJson.success && cfJson.result) {
-				return { success: true, data: processResult(cfJson.result) };
+	let lastError = null;
+	let accountIndex = 0;
+	for (const account of activeAccounts) {
+		// 非第一个账号时，添加随机延迟后再切换
+		if (accountIndex > 0) {
+			await randomDelay(300, 2000);
+		}
+		accountIndex++;
+		try {
+			const cfPayload = buildPayload(account);
+			// 注入随机 User-Agent 和 cf-aig-* 头
+			cfPayload.headers = cfPayload.headers || {};
+			cfPayload.headers['User-Agent'] = randomUA();
+			if (incomingHeaders) {
+				const aigHeaders = pickCfAigHeaders(incomingHeaders);
+				Object.assign(cfPayload.headers, aigHeaders);
 			}
-			return { retry: true, error: `CF Run failed: ${cfJson.errors?.[0]?.message || JSON.stringify(cfJson.errors || cfJson)}` };
-		}
+			const cfResponse = await fetch(
+				`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/run/${cfModel}`,
+				cfPayload
+			);
 
-		const errorText = await cfResponse.text();
-		const error = `CF API status ${cfResponse.status}: ${extractCleanCFError(errorText)}`;
-		if (!isRetryableStatus(cfResponse.status)) {
-			return { success: false, status: cfResponse.status, error };
+			if (cfResponse.ok) {
+				const cfJson = await cfResponse.json();
+				if (cfJson.success && cfJson.result) {
+					return { success: true, data: processResult(cfJson.result) };
+				} else {
+					lastError = `CF Run failed: ${cfJson.errors?.[0]?.message || JSON.stringify(cfJson.errors || cfJson)}`;
+				}
+			} else {
+				const errorText = await cfResponse.text();
+				lastError = `CF API status ${cfResponse.status}: ${extractCleanCFError(errorText)}`;
+			}
+		} catch (e) {
+			lastError = `Connection error: ${e.message}`;
 		}
-		return { retry: true, error, status: cfResponse.status };
-	});
+	}
+
+	return { success: false, status: 502, error: `All Cloudflare accounts failed. Last error: ${lastError}` };
 }
 
 // 统一的模型名解析 + fallback warning 构造
@@ -1630,38 +1629,61 @@ async function handleCompletions(request, env, ctx, pathname) {
 		cfPayload.stream_options = { include_usage: true };
 	}
 
-	const result = await callOpenAICompatibleAPI(cfPayload, env, stream);
+	const result = await callOpenAICompatibleAPI(cfPayload, env, stream, request.headers);
 
 	if (!result.success) {
 		return jsonError(result.error, result.status || 502, "server_error");
 	}
 
 	if (stream) {
-		return streamResponse(
-			passthroughStream(result.stream, model, pathname === '/v1/completions', env, ctx, requestStartTime),
-			fallbackWarning
-		);
+		const transformedStream = passthroughStream(result.stream, model, pathname === '/v1/completions', env, ctx, requestStartTime);
+		const streamHeaders = {
+			'Content-Type': 'text/event-stream',
+			'Cache-Control': 'no-cache',
+		};
+		if (fallbackWarning) streamHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		// 透传上游 cf-aig-* 响应头
+		if (result.aigResponseHeaders) Object.assign(streamHeaders, result.aigResponseHeaders);
+		return new Response(transformedStream, { headers: streamHeaders });
+	} else {
+		const cfJson = result.data;
+		if (cfJson.model !== undefined) cfJson.model = model;
+		const responseHeaders = { 'Content-Type': 'application/json' };
+		if (fallbackWarning) responseHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		// 透传上游 cf-aig-* 响应头
+		if (result.aigResponseHeaders) Object.assign(responseHeaders, result.aigResponseHeaders);
+		if (cfJson.usage) {
+			const durationSec = (Date.now() - requestStartTime) / 1000;
+			const usage = cfJson.usage;
+			const promptDetails = usage.prompt_tokens_details || {};
+			accumulateTokens(env, ctx, {
+				input: usage.prompt_tokens || 0,
+				output: usage.completion_tokens || 0,
+				reasoning: usage.reasoning_tokens || 0,
+				cacheRead: promptDetails.cached_tokens || usage.cache_read_tokens || 0,
+				cacheWrite: usage.cache_write_tokens || 0,
+				durationSec,
+			});
+		}
+		if (pathname === '/v1/completions') {
+			const textChoices = (cfJson.choices || []).map(c => ({
+				text: c.message?.content || '',
+				index: c.index ?? 0,
+				logprobs: c.logprobs ?? null,
+				finish_reason: c.finish_reason || 'stop'
+			}));
+			const textResponse = {
+				id: cfJson.id,
+				object: 'text_completion',
+				created: cfJson.created,
+				model: cfJson.model,
+				choices: textChoices,
+				usage: cfJson.usage
+			};
+			return new Response(JSON.stringify(textResponse), { headers: responseHeaders });
+		}
+		return new Response(JSON.stringify(cfJson), { headers: responseHeaders });
 	}
-	const cfJson = result.data;
-	if (cfJson.model !== undefined) cfJson.model = model;
-	if (cfJson.usage) trackUsageFromResponse(env, ctx, cfJson, requestStartTime);
-	if (pathname === '/v1/completions') {
-		const textChoices = (cfJson.choices || []).map(c => ({
-			text: c.message?.content || '',
-			index: c.index ?? 0,
-			logprobs: c.logprobs ?? null,
-			finish_reason: c.finish_reason || 'stop'
-		}));
-		return jsonResponse({
-			id: cfJson.id,
-			object: 'text_completion',
-			created: cfJson.created,
-			model: cfJson.model,
-			choices: textChoices,
-			usage: cfJson.usage
-		}, fallbackWarning);
-	}
-	return jsonResponse(cfJson, fallbackWarning);
 }
 
 // Anthropic Messages API → OpenAI Chat Completions 格式转换
@@ -1706,7 +1728,7 @@ function convertAnthropicToOpenAI(anthropicBody) {
 			openaiMessages.push({ role, content });
 		} else if (Array.isArray(content)) {
 
-			// assistant 消息：text 和 tool_use 必须合并为同一条 OpenAI assistant 消息（OpenAI 要求 tool_calls 与 content 在同一消息中）
+			// assistant 消息：text 和 tool_use 需合并为一条消息（Bug #4）
 			if (role === 'assistant') {
 				let textContent = '';
 				const toolCalls = [];
@@ -1734,7 +1756,7 @@ function convertAnthropicToOpenAI(anthropicBody) {
 				continue;
 			}
 
-			// user 消息：先处理 tool_result（转为 OpenAI tool 角色），再处理 text/image（转为 user 角色）
+			// user 消息：先处理 tool_result，再处理 text/image（Bug #5）
 			if (role === 'user') {
 				// 先处理 tool_result 块
 				for (const block of content) {
@@ -1769,7 +1791,7 @@ function convertAnthropicToOpenAI(anthropicBody) {
 						const source = block.source || {};
 						let imageUrl = '';
 						if (source.type === 'url' && source.url) {
-							// URL 类型图片：直接使用 source.url 作为 image_url
+							// URL 类型图片（Bug #3）
 							imageUrl = source.url;
 						} else if (source.data) {
 							const mediaType = source.media_type || 'image/png';
@@ -1936,11 +1958,17 @@ async function handleMessages(request, env, ctx) {
 	const requestStartTime = Date.now();
 	const anthropicBody = await safeJsonBody(request);
 	if (!anthropicBody) {
-		return anthropicError('Invalid JSON body.');
+		return new Response(JSON.stringify({
+			type: 'error',
+			error: { type: 'invalid_request_error', message: 'Invalid JSON body.' }
+		}), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	if (!anthropicBody.messages || !Array.isArray(anthropicBody.messages)) {
-		return anthropicError('messages field is required and must be an array.');
+		return new Response(JSON.stringify({
+			type: 'error',
+			error: { type: 'invalid_request_error', message: 'messages field is required and must be an array.' }
+		}), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	const model = anthropicBody.model;
@@ -1954,7 +1982,7 @@ async function handleMessages(request, env, ctx) {
 		openaiBody.stream_options = { include_usage: true };
 	}
 
-	const result = await callOpenAICompatibleAPI(openaiBody, env, stream);
+	const result = await callOpenAICompatibleAPI(openaiBody, env, stream, request.headers);
 
 	if (!result.success) {
 		let errorDetail;
@@ -1977,14 +2005,38 @@ async function handleMessages(request, env, ctx) {
 	}
 
 	if (stream) {
-		return streamResponse(
-			anthropicStreamTransform(result.stream, model, anthropicBody.messages, env, ctx, requestStartTime),
-			fallbackWarning
-		);
+		const transformedStream = anthropicStreamTransform(result.stream, model, anthropicBody.messages, env, ctx, requestStartTime);
+		const streamHeaders = {
+			'Content-Type': 'text/event-stream',
+			'Cache-Control': 'no-cache',
+		};
+		if (fallbackWarning) streamHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		// 透传上游 cf-aig-* 响应头
+		if (result.aigResponseHeaders) Object.assign(streamHeaders, result.aigResponseHeaders);
+		return new Response(transformedStream, { headers: streamHeaders });
+	} else {
+		const openaiResponse = result.data;
+		const anthropicResponse = convertOpenAIToAnthropic(openaiResponse, model);
+		const responseHeaders = { 'Content-Type': 'application/json' };
+		if (fallbackWarning) responseHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+		// 透传上游 cf-aig-* 响应头
+		if (result.aigResponseHeaders) Object.assign(responseHeaders, result.aigResponseHeaders);
+		// 累加 token 统计（非流式）
+		if (ctx && openaiResponse.usage) {
+			const durationSec = (Date.now() - requestStartTime) / 1000;
+			const usage = openaiResponse.usage;
+			const promptDetails = usage.prompt_tokens_details || {};
+			accumulateTokens(env, ctx, {
+				input: usage.prompt_tokens || 0,
+				output: usage.completion_tokens || 0,
+				reasoning: usage.reasoning_tokens || 0,
+				cacheRead: promptDetails.cached_tokens || usage.cache_read_tokens || 0,
+				cacheWrite: usage.cache_write_tokens || 0,
+				durationSec,
+			});
+		}
+		return new Response(JSON.stringify(anthropicResponse), { headers: responseHeaders });
 	}
-	const openaiResponse = result.data;
-	if (ctx && openaiResponse.usage) trackUsageFromResponse(env, ctx, openaiResponse, requestStartTime);
-	return jsonResponse(convertOpenAIToAnthropic(openaiResponse, model), fallbackWarning);
 }
 
 // Anthropic SSE 流式转换：OpenAI SSE → Anthropic SSE
@@ -1994,12 +2046,12 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 	const encoder = new TextEncoder();
 	let buffer = '';
 	let messageId = `msg_${crypto.randomUUID()}`;
-	let contentBlockIndex = -1;  // 初始化为 -1，首次递增后从 0 开始（Anthropic content_block 索引从 0 计）
+	let contentBlockIndex = -1;  // 首次递增后从 0 开始（Bug #8）
 	let currentToolCallId = null;
 	let currentToolName = null;
 	let currentToolArgs = '';
 	let streamStarted = false;
-	let blockStopSent = false;  // 跟踪最后一个 content block 是否已发送 content_block_stop 事件，避免重复发送
+	let blockStopSent = false;  // 跟踪最后一个 content block 是否已发送 stop（Bug #2）
 	let finalEventSent = false;  // 跟踪 message_delta/message_stop 是否已发送（与 blockStopSent 解耦）
 	let thinkingBlockActive = false;  // 跟踪 thinking block 是否正在进行
 	let inputTokens = 0;
@@ -2111,7 +2163,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 					}
 
 					if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
-						// 首次发送任何数据前先发送 message_start 事件（Anthropic 流式协议要求第一个事件为 message_start）
+						// 首次发送任何数据前先发送 message_start（Bug #1）
 						if (!streamStarted) {
 							sendMessageStart(controller);
 							streamStarted = true;
@@ -2279,7 +2331,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 
 	function sendFinalEvent(controller) {
 		if (finalEventSent) return; // 已发送过终止事件则直接返回
-		// 如果 finish_reason 触发时已发送过 content_block_stop，跳过重复发送
+		// 如果 finish_reason 触发时已发送过 content_block_stop，跳过重复发送（Bug #2）
 		if (!streamStarted) {
 			// 上游未产生任何内容（空响应），仍需发送 message_start 以符合 Anthropic 协议
 			sendMessageStart(controller);
@@ -2313,13 +2365,15 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 
 		// 流结束时累加 token 统计
 		if (env && ctx && (inputTokens > 0 || outputTokens > 0)) {
-			trackUsage(env, ctx, {
+			const durationSec = requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0;
+			accumulateTokens(env, ctx, {
 				input: inputTokens,
 				output: outputTokens,
 				reasoning: reasoningTokens,
 				cacheRead: cacheReadTokens,
 				cacheWrite: cacheWriteTokens,
-			}, requestStartTime);
+				durationSec,
+			});
 		}
 	}
 }
@@ -2363,14 +2417,23 @@ async function handleEmbeddings(request, env, ctx) {
 			};
 		},
 		env,
+		request.headers
 	);
 
 	if (!result.success) {
 		return jsonError(result.error, result.status, "server_error");
 	}
 
+	// 累加 embedding 的估算 token 数（无 output，只有 input）
 	if (result.data?.usage?.prompt_tokens) {
-		trackUsage(env, ctx, { input: result.data.usage.prompt_tokens }, requestStartTime);
+		accumulateTokens(env, ctx, {
+			input: result.data.usage.prompt_tokens,
+			output: 0,
+			reasoning: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			durationSec: (Date.now() - requestStartTime) / 1000,
+		});
 	}
 
 	const embHeaders = { 'Content-Type': 'application/json' };
@@ -2440,6 +2503,7 @@ async function handleImageGenerations(request, env, ctx) {
 			};
 		},
 		env,
+		request.headers
 	);
 
 	if (!result.success) {
@@ -2448,15 +2512,22 @@ async function handleImageGenerations(request, env, ctx) {
 
 	const imgHeaders = { 'Content-Type': 'application/json' };
 	if (fallbackWarning) imgHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+	// 估算图片生成 token 数（按 prompt 字符数/3 粗略估算）
 	if (ctx && prompt) {
-		trackUsage(env, ctx, { input: Math.ceil(prompt.length / 3) }, requestStartTime);
+		accumulateTokens(env, ctx, {
+			input: Math.ceil(prompt.length / 3),
+			output: 0,
+			reasoning: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			durationSec: (Date.now() - requestStartTime) / 1000,
+		});
 	}
 	return new Response(JSON.stringify(result.data), { headers: imgHeaders });
 }
 
 // 音频转录 /v1/audio/transcriptions
-// 音频转录/翻译 /v1/audio/transcriptions 和 /v1/audio/translations
-async function handleAudioTranscribe(request, env, ctx, isTranslation) {
+async function handleAudioTranscriptions(request, env, ctx) {
 	const requestStartTime = Date.now();
 	const contentType = request.headers.get('Content-Type') || '';
 	if (!contentType.includes('multipart/form-data')) {
@@ -2489,9 +2560,8 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 			(account) => {
 				const cfFormData = new FormData();
 				cfFormData.append('audio', audioFile, audioFile.name || 'audio.wav');
-				// 转录透传 language/prompt/response_format/temperature，翻译无 language
-				const fields = isTranslation ? ['prompt', 'response_format', 'temperature'] : ['language', 'prompt', 'response_format', 'temperature'];
-				for (const field of fields) {
+				// 透传 OpenAI 标准参数：language/prompt/response_format/temperature
+				for (const field of ['language', 'prompt', 'response_format', 'temperature']) {
 					const val = formData.get(field);
 					if (val !== null) cfFormData.append(field, val);
 				}
@@ -2503,22 +2573,31 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 				};
 			},
 			(cfResult) => ({ text: cfResult.text || '' }),
-			env,
-		);
+		env,
+		request.headers
+	);
 
 		if (!result.success) {
 			return jsonError(result.error, result.status, "server_error");
 		}
 
+		// 估算音频转录 token 数（按输出文本长度/3 粗略估算）
 		if (ctx && result.data?.text) {
-			trackUsage(env, ctx, { output: Math.ceil(result.data.text.length / 3) }, requestStartTime);
+			accumulateTokens(env, ctx, {
+				input: 0,
+				output: Math.ceil(result.data.text.length / 3),
+				reasoning: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				durationSec: (Date.now() - requestStartTime) / 1000,
+			});
 		}
 
 		const audioHeaders = { 'Content-Type': 'application/json' };
 		if (actualFallbackWarning) audioHeaders['X-Model-Fallback-Warning'] = actualFallbackWarning;
 		return new Response(JSON.stringify(result.data), { headers: audioHeaders });
 	} catch (e) {
-		return jsonError(`Failed to process audio${isTranslation ? ' translation' : ''}: ${e.message}`, 400, "invalid_request_error");
+		return jsonError(`Failed to process audio: ${e.message}`, 400, "invalid_request_error");
 	}
 }
 
@@ -2530,6 +2609,7 @@ async function handleAudioSpeech(request, env, ctx) {
 	}
 
 	const requestStartTime = Date.now();
+
 	const { model, input, voice } = body;
 	if (!input) {
 		return jsonError("input is required", 400, "invalid_request_error");
@@ -2537,62 +2617,89 @@ async function handleAudioSpeech(request, env, ctx) {
 
 	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model || 'tts', env);
 
+	// TTS 返回二进制音频，不能复用 callCFRunAPI
+	const accounts = await getAccounts(env);
+	const activeAccounts = accounts.filter(a => a.status === 'active');
+	if (activeAccounts.length === 0) {
+		return jsonError("No active Cloudflare accounts configured", 503, "server_error");
+	}
+
 	const cfPayload = { prompt: input };
 	if (voice) cfPayload.voice = voice;
+	// 透传 OpenAI 标准参数
 	if (body.response_format) cfPayload.response_format = body.response_format;
 	if (body.speed !== undefined) cfPayload.speed = body.speed;
 
-	const result = await withFailover(env, async (account) => {
-		const apiUrl = buildCFUrl(account, `run/${cfModel}`);
-		const cfResponse = await fetch(apiUrl, {
-			method: 'POST',
-			headers: {
-				'Authorization': `Bearer ${account.apiToken}`,
-				'Content-Type': 'application/json',
-				'User-Agent': randomUA(),
-			},
-			body: JSON.stringify(cfPayload),
-			signal: AbortSignal.timeout(60000),
-		});
+	let lastError = null;
+	let lastStatus = 502;
+	let accountIndex = 0;
 
-		if (cfResponse.ok) {
-			const audioBuffer = await cfResponse.arrayBuffer();
-			const contentType = cfResponse.headers.get('Content-Type') || 'audio/wav';
-			if (ctx) {
-				trackUsage(env, ctx, { input: Math.ceil(input.length / 4) }, requestStartTime);
+	for (const account of activeAccounts) {
+		if (accountIndex > 0) {
+			await randomDelay(300, 2000);
+		}
+		accountIndex++;
+		try {
+			const cfResponse = await fetch(
+				`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/run/${cfModel}`,
+				{
+					method: 'POST',
+					headers: {
+						'Authorization': `Bearer ${account.apiToken}`,
+						'Content-Type': 'application/json',
+						'User-Agent': randomUA(),
+						...pickCfAigHeaders(request.headers),
+					},
+					body: JSON.stringify(cfPayload),
+					signal: AbortSignal.timeout(60000),
+				}
+			);
+
+			if (cfResponse.ok) {
+				// TTS 返回二进制音频，直接透传给客户端
+				const audioBuffer = await cfResponse.arrayBuffer();
+				const contentType = cfResponse.headers.get('Content-Type') || 'audio/wav';
+				const speechHeaders = { 'Content-Type': contentType };
+				if (fallbackWarning) speechHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
+				// 估算 TTS token 数（按字符数/4 粗略估算）
+				if (ctx) {
+					const inputTokens = Math.ceil(input.length / 4);
+					accumulateTokens(env, ctx, {
+						input: inputTokens,
+						output: 0,
+						reasoning: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						durationSec: (Date.now() - requestStartTime) / 1000,
+					});
+				}
+				return new Response(audioBuffer, { headers: speechHeaders });
 			}
-			return { success: true, data: { audioBuffer, contentType } };
-		}
 
-		const errorText = await cfResponse.text();
-		const error = `CF API status ${cfResponse.status}: ${extractCleanCFError(errorText)}`;
-		if (!isRetryableStatus(cfResponse.status)) {
-			return { success: false, status: cfResponse.status, error };
+			const errorText = await cfResponse.text();
+			lastStatus = cfResponse.status;
+			lastError = `CF API status ${cfResponse.status}: ${extractCleanCFError(errorText)}`;
+		} catch (e) {
+			lastStatus = 502;
+			lastError = `Connection error: ${e.message}`;
 		}
-		return { retry: true, error, status: cfResponse.status };
-	});
-
-	if (!result.success) {
-		return jsonError(`All Cloudflare accounts failed. Last error: ${result.error}`, result.status, "server_error");
 	}
-	const { audioBuffer, contentType } = result.data;
-	return new Response(audioBuffer, {
-		headers: {
-			'Content-Type': contentType,
-			...(fallbackWarning ? { 'X-Model-Fallback-Warning': fallbackWarning } : {}),
-		}
-	});
+
+	return jsonError(`All Cloudflare accounts failed. Last error: ${lastError}`, lastStatus, "server_error");
 }
 
 // Token 计数 /v1/messages/count_tokens（近似估算）
 async function handleCountTokens(request, env) {
 	const body = await safeJsonBody(request);
 	if (!body) {
-		return anthropicError("Invalid JSON body");
+		return new Response(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: "Invalid JSON body" } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	if (!body.messages || !Array.isArray(body.messages)) {
-		return anthropicError('messages field is required and must be an array.');
+		return new Response(JSON.stringify({
+			type: 'error',
+			error: { type: 'invalid_request_error', message: 'messages field is required and must be an array.' }
+		}), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	let totalChars = 0;
@@ -2657,7 +2764,8 @@ async function handleCountTokens(request, env) {
 }
 
 // 透传 CF /ai/v1/chat/completions 返回的 SSE 流
-// 只改模型名，其余原样透传
+// CF 返回的本来就是标准 OpenAI 的 SSE 格式，我们只把模型名改一下，
+// 这样 tool_calls、finish_reason、reasoning_content、usage 等字段都能原样保留。
 function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requestStartTime) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
@@ -2690,15 +2798,18 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 						}
 						controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 						controller.close();
+						// 流结束时累加 token 统计
 						if (streamUsage && env && ctx) {
+							const durationSec = requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0;
 							const promptDetails = streamUsage.prompt_tokens_details || {};
-							trackUsage(env, ctx, {
+							accumulateTokens(env, ctx, {
 								input: streamUsage.prompt_tokens || 0,
 								output: streamUsage.completion_tokens || 0,
 								reasoning: streamUsage.reasoning_tokens || 0,
 								cacheRead: promptDetails.cached_tokens || streamUsage.cache_read_tokens || 0,
 								cacheWrite: streamUsage.cache_write_tokens || 0,
-							}, requestStartTime);
+								durationSec,
+							});
 						}
 						break;
 					}
@@ -2775,20 +2886,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 
 // 管理面板 API 路由
 // 安全解析 JSON body，非法 JSON 返回 null 而非抛异常（避免冒泡到 Workers 运行时）
-// JSON 请求体最大大小（MB），参照 new-api 的 MaxRequestBodyMB（默认 128MB）
-const MAX_REQUEST_BODY_MB = 128;
-
 async function safeJsonBody(request) {
-	// 检查 Content-Type 是否为 JSON
-	const ct = request.headers.get('Content-Type') || '';
-	if (!ct.includes('application/json') && !ct.includes('text/plain')) {
-		return null;
-	}
-	// 限制请求体大小，防止超大 JSON 耗尽内存（参照 new-api 的 request body limit）
-	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
-	if (contentLength > MAX_REQUEST_BODY_MB * 1024 * 1024) {
-		return null;
-	}
 	try { return await request.json(); } catch { return null; }
 }
 
@@ -2827,12 +2925,12 @@ async function handleDashboardApi(request, env, ctx) {
 		// GET 和 POST 均需要登录认证
 		const isAuthorized = await checkAdminAuth(request, env);
 		if (!isAuthorized) {
-			return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
+			return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
 		}
 
 		if (method === 'GET') {
 			const cached = await getCachedSummary(env);
-			const todayStr = getTodayStr();
+			const todayStr = new Date().toISOString().split('T')[0];
 			if (cached && cached.summaryDate === todayStr) {
 				// 补充最新限额配置
 				// 月度用量从 KV 读取最新值（refreshAccountsUsage 会更新该键）
@@ -2850,14 +2948,14 @@ async function handleDashboardApi(request, env, ctx) {
 					threshold,
 					dailyRequests: cached.dailyRequests ?? cached.totalRequestsToday ?? 0,
 					monthlyRequests: cached.monthlyRequests ?? cached.totalRequestsMonth ?? 0
-				}), { headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
+				}), { headers: { 'Content-Type': 'application/json' } });
 			}
 
 			const accounts = await getAccounts(env);
 			const limits = await getUsageLimits(env);
 
 			if (accounts.length === 0) {
-				return new Response(JSON.stringify(emptyUsageResponse(limits)), { headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
+				return new Response(JSON.stringify(emptyUsageResponse(limits)), { headers: { 'Content-Type': 'application/json' } });
 			}
 
 			// 读取缓存的卡片明细
@@ -2869,7 +2967,7 @@ async function handleDashboardApi(request, env, ctx) {
 
 			const summary = await buildUsageSummary(env, accounts, cacheMap);
 			ctx.waitUntil(setCachedSummary(env, summary)); // 后台写缓存，不阻塞响应
-			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
+			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json' } });
 		}
 
 		if (method === 'POST') {
@@ -2877,13 +2975,13 @@ async function handleDashboardApi(request, env, ctx) {
 			const limits = await getUsageLimits(env);
 
 			if (accounts.length === 0) {
-				return new Response(JSON.stringify(emptyUsageResponse(limits)), { headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
+				return new Response(JSON.stringify(emptyUsageResponse(limits)), { headers: { 'Content-Type': 'application/json' } });
 			}
 
 			const cacheMap = await refreshAccountsUsage(env, accounts);
 			const summary = await buildUsageSummary(env, accounts, cacheMap);
 			ctx.waitUntil(setCachedSummary(env, summary)); // 后台写缓存，不阻塞响应
-			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
+			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json' } });
 		}
 	}
 
@@ -2908,9 +3006,7 @@ async function handleDashboardApi(request, env, ctx) {
 	if (url.pathname === '/api/accounts') {
 		if (method === 'GET') {
 			const accounts = await getAccounts(env);
-			// 脱敏：不向 API 响应暴露明文 apiToken，参照 new-api 的 MaskTokenKey
-			const masked = accounts.map(a => ({ ...a, apiToken: maskTokenKey(a.apiToken) }));
-			return new Response(JSON.stringify(masked), { headers: { 'Content-Type': 'application/json' } });
+			return new Response(JSON.stringify(accounts), { headers: { 'Content-Type': 'application/json' } });
 		}
 
 		if (method === 'POST') {
@@ -2948,7 +3044,7 @@ async function handleDashboardApi(request, env, ctx) {
 			if (idx === -1) {
 				return new Response(JSON.stringify({ error: 'Account not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
 			}
-			const updatedToken = (apiToken && apiToken.includes('*')) ? accounts[idx].apiToken : apiToken;
+			const updatedToken = (apiToken.includes('...') || apiToken === '********') ? accounts[idx].apiToken : apiToken;
 			accounts[idx] = { ...accounts[idx], name: name || accounts[idx].name, accountId, apiToken: updatedToken };
 			await saveAccounts(env, accounts);
 			return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
@@ -2972,7 +3068,7 @@ async function handleDashboardApi(request, env, ctx) {
 			const acc = accounts.find(a => a.id === id);
 			if (acc) {
 				if (!targetAccountId) targetAccountId = acc.accountId;
-				if (!targetApiToken || targetApiToken.includes('*')) {
+				if (!targetApiToken || targetApiToken.includes('...') || targetApiToken === '********') {
 					targetApiToken = acc.apiToken;
 				}
 			}
@@ -3106,7 +3202,7 @@ async function handleDashboardApi(request, env, ctx) {
 
 		const cacheMap = await refreshAccountsUsage(env, accounts);
 
-		const todayStr = getTodayStr();
+		const todayStr = new Date().toISOString().split('T')[0];
 		const results = accounts.map(account => {
 			const cached = cacheMap[account.id];
 			let usageToday = 0;
@@ -3342,22 +3438,9 @@ const SHARED_JS = `
 		}
 
 		function attrEscape(str) {
-			return escapeHtml(JSON.stringify(String(str)));
-		}
-
-		async function copyText(text, msg) {
-			try {
-				await navigator.clipboard.writeText(text);
-				showToast(msg || '已复制！');
-			} catch (_) {
-				showToast('复制失败，请手动复制', 'error');
-			}
-		}
-
-		async function deleteResource(apiPath, id, loadFn, successMsg, errorMsg) {
-			const res = await apiFetch(apiPath + encodeURIComponent(id), { method: 'DELETE' });
-			if (res.ok) { loadFn(); showToast(successMsg); }
-			else { showToast(errorMsg || '删除失败', 'error'); }
+			return JSON.stringify(String(str))
+				.replace(/&/g, '&amp;')
+				.replace(/"/g, '&quot;');
 		}
 
 		// 共享的 toggleTheme（通过回调参数在主题切换后触发页面特定的重渲染）
@@ -3404,36 +3487,6 @@ const SHARED_JS = `
 					item.style.opacity = '1';
 					item.style.transform = 'translateX(0)';
 				}, index * 80);
-			});
-		}
-
-		function createDoughnutChart(canvasId, labels, data, borderColor) {
-			const ctx = document.getElementById(canvasId).getContext('2d');
-			return new Chart(ctx, {
-				type: 'doughnut',
-				data: {
-					labels: labels,
-					datasets: [{
-						data: data,
-						backgroundColor: ['#6366f1', '#a855f7', '#ec4899', '#10b981', '#f59e0b', '#3b82f6'],
-						borderWidth: 2,
-						borderColor: borderColor
-					}]
-				},
-				options: {
-					responsive: true,
-					maintainAspectRatio: false,
-					cutout: '70%',
-					animation: {
-						animateRotate: true,
-						animateScale: true,
-						duration: 1000,
-						easing: 'easeOutQuart'
-					},
-					plugins: {
-						legend: { display: false }
-					}
-				}
 			});
 		}`;
 
@@ -3579,10 +3632,6 @@ const SHARED_THEME_CSS = `
 			margin: 0;
 			padding: 0;
 		}
-
-		.hidden {
-			display: none !important;
-		}
 `;
 
 // 两个页面共享的 Toast 样式
@@ -3660,48 +3709,48 @@ const SHARED_STAT_CARD_CSS = `
 		.stat-card {
 			background-color: var(--card-bg);
 			border: 1px solid var(--border-color);
-			border-radius: 20px;
-			padding: 28px 26px;
+			border-radius: 18px;
+			padding: 26px;
 			display: flex;
 			flex-direction: column;
-			gap: 16px;
+			gap: 14px;
 			box-shadow: var(--card-shadow);
 			backdrop-filter: blur(var(--glass-blur));
 			-webkit-backdrop-filter: blur(var(--glass-blur));
-			transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.35s, border-color 0.35s;
+			transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.3s, border-color 0.3s;
 			min-width: 0;
 			overflow: hidden;
-			position: relative;
-		}
-
-		.stat-card::before {
-			content: '';
-			position: absolute;
-			top: 0;
-			left: 0;
-			right: 0;
-			height: 3px;
-			background: var(--primary-gradient);
-			opacity: 0;
-			transition: opacity 0.35s;
 		}
 
 		.stat-card:hover {
 			transform: translateY(-4px);
-			border-color: rgba(168, 85, 247, 0.35);
-			box-shadow: 0 16px 40px rgba(168, 85, 247, 0.12);
-		}
-
-		.stat-card:hover::before {
-			opacity: 1;
+			border-color: rgba(168, 85, 247, 0.3);
+			box-shadow: 0 12px 30px rgba(168, 85, 247, 0.1);
 		}
 
 		.stat-title {
-			font-size: 13px;
+			font-size: 14px;
 			color: var(--text-muted);
-			font-weight: 600;
-			letter-spacing: 0.02em;
-			text-transform: uppercase;
+			font-weight: 500;
+		}`;
+
+// 进度条基础（容器高度 / 圆角 / shimmer / threshold 等差异在各页面内覆盖）
+const SHARED_PROGRESS_CSS = `
+		.progress-container {
+			width: 100%;
+			background-color: rgba(255, 255, 255, 0.06);
+			overflow: hidden;
+		}
+
+		:root[data-theme="light"] .progress-container {
+			background-color: rgba(0, 0, 0, 0.05);
+		}
+
+		.progress-bar {
+			height: 100%;
+			background: var(--primary-gradient);
+			width: 0%;
+			transition: width 1.2s cubic-bezier(0.34, 1.56, 0.64, 1);
 		}`;
 
 // 表单输入框（.form-group 因页面布局差异保留在各页面内）
@@ -3732,7 +3781,6 @@ const SHARED_FORM_CSS = `
 
 		:root[data-theme="light"] input:focus {
 			background-color: rgba(255, 255, 255, 0.95);
-			box-shadow: 0 0 0 3px rgba(147, 51, 234, 0.15);
 		}`;
 
 // 按钮主/次态（.btn 基础因 padding/gap 差异保留在各页面内）
@@ -3809,54 +3857,7 @@ const SHARED_MODAL_CSS = `
 
 		.modal-overlay.active .modal-card {
 			transform: scale(1) translateY(0);
-		}
-
-		.modal-header {
-			display: flex;
-			justify-content: space-between;
-			align-items: center;
-			border-bottom: 1px solid var(--border-color);
-			padding-bottom: 16px;
-		}
-
-		.modal-header h3 {
-			font-size: 18px;
-			font-weight: 600;
-		}
-
-		.close-btn {
-			background: none;
-			border: none;
-			color: var(--text-muted);
-			cursor: pointer;
-			padding: 4px;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			outline: none;
-			transition: color 0.2s;
-		}
-
-		.close-btn:hover {
-			color: var(--text-main);
 		}`;
-
-// 模态框关闭按钮 SVG 图标
-const SVG_CLOSE = '<svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>';
-
-// 构建流式 SSE 响应（含通用头 + 可选 fallback 警告）
-function streamResponse(stream, fallbackWarning) {
-	const headers = { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' };
-	if (fallbackWarning) headers['X-Model-Fallback-Warning'] = fallbackWarning;
-	return new Response(stream, { headers });
-}
-
-// 构建 JSON 响应（含通用头 + 可选 fallback 警告）
-function jsonResponse(data, fallbackWarning) {
-	const headers = { 'Content-Type': 'application/json' };
-	if (fallbackWarning) headers['X-Model-Fallback-Warning'] = fallbackWarning;
-	return new Response(JSON.stringify(data), { headers });
-}
 
 // 1. 首页 / 登录页
 async function handleLandingPage(request, env, ctx) {
@@ -3891,6 +3892,11 @@ async function handleLandingPage(request, env, ctx) {
 
 		h1, h2, h3 {
 			font-family: 'Outfit', sans-serif;
+		}
+
+		/* Utility Hidden Class */
+		.hidden {
+			display: none !important;
 		}
 
 		${SHARED_BG_CSS}
@@ -4033,6 +4039,42 @@ async function handleLandingPage(request, env, ctx) {
 			font-family: 'Outfit', sans-serif;
 		}
 
+		${SHARED_PROGRESS_CSS}
+
+		.progress-container {
+			height: 8px;
+			border-radius: 4px;
+			position: relative;
+		}
+
+		.progress-bar {
+			border-radius: 4px;
+			position: relative;
+			overflow: hidden;
+		}
+
+		.progress-bar::after {
+			content: '';
+			position: absolute;
+			top: 0;
+			left: 0;
+			right: 0;
+			bottom: 0;
+			background: linear-gradient(
+				90deg,
+				rgba(255, 255, 255, 0) 0%,
+				rgba(255, 255, 255, 0.2) 50%,
+				rgba(255, 255, 255, 0) 100%
+			);
+			animation: progress-shimmer 2s infinite linear;
+			background-size: 200% 100%;
+		}
+
+		@keyframes progress-shimmer {
+			0% { background-position: -200% 0; }
+			100% { background-position: 200% 0; }
+		}
+
 		.section-title {
 			font-size: 18px;
 			font-weight: 600;
@@ -4070,6 +4112,36 @@ async function handleLandingPage(request, env, ctx) {
 
 		.modal-card {
 			max-width: 400px;
+		}
+
+		.modal-header {
+			display: flex;
+			justify-content: space-between;
+			align-items: center;
+			border-bottom: 1px solid var(--border-color);
+			padding-bottom: 16px;
+		}
+
+		.modal-header h3 {
+			font-size: 18px;
+			font-weight: 600;
+		}
+
+		.close-btn {
+			background: none;
+			border: none;
+			color: var(--text-muted);
+			cursor: pointer;
+			padding: 4px;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			outline: none;
+			transition: color 0.2s;
+		}
+
+		.close-btn:hover {
+			color: var(--text-main);
 		}
 
 		${SHARED_TOAST_CSS}
@@ -4130,6 +4202,9 @@ async function handleLandingPage(request, env, ctx) {
 				</div>
 				
 				<div style="margin-top: 16px;">
+					<div class="progress-container">
+						<div class="progress-bar" id="public-progress" style="width: 0%;"></div>
+					</div>
 					<div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted); margin-top: 8px;">
 						<span id="public-limit-desc">总限额: 0 Neurons</span>
 						<span id="public-percent-desc" style="font-weight: 600; color: var(--accent-color);">0.00%</span>
@@ -4164,7 +4239,11 @@ async function handleLandingPage(request, env, ctx) {
 		<div class="modal-card">
 			<div class="modal-header">
 				<h3 id="modal-title">${isLoggedIn ? '管理面板入口' : '管理员登录'}</h3>
-				<button onclick="closeLoginModal()" class="close-btn">${SVG_CLOSE}</button>
+				<button onclick="closeLoginModal()" class="close-btn">
+					<svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+					</svg>
+				</button>
 			</div>
 			
 			${isLoggedIn ? `
@@ -4275,6 +4354,7 @@ async function handleLandingPage(request, env, ctx) {
 			// 触发数字滚动的动效
 			animateNumber('public-neurons', roundedNeurons, 1000);
 			
+			document.getElementById('public-progress').style.width = percent + '%';
 			document.getElementById('public-limit-desc').innerText = '总限额: ' + Number(data.totalLimit).toLocaleString() + ' Neurons';
 			document.getElementById('public-percent-desc').innerText = percent + '%';
 
@@ -4295,11 +4375,39 @@ async function handleLandingPage(request, env, ctx) {
 				const isLight = document.documentElement.getAttribute('data-theme') === 'light';
 				const borderColor = isLight ? '#ffffff' : '#1e293b';
 				
+				const ctx = document.getElementById('publicModelsChart').getContext('2d');
 				if (publicModelsChartInstance) {
 					publicModelsChartInstance.destroy();
 				}
 
-				publicModelsChartInstance = createDoughnutChart('publicModelsChart', labels, chartData, borderColor);
+				publicModelsChartInstance = new Chart(ctx, {
+					type: 'doughnut',
+					data: {
+						labels: labels,
+						datasets: [{
+							data: chartData,
+							backgroundColor: ['#6366f1', '#a855f7', '#ec4899', '#10b981', '#f59e0b', '#3b82f6'],
+							borderWidth: 2,
+							borderColor: borderColor
+						}]
+					},
+					options: {
+						responsive: true,
+						maintainAspectRatio: false,
+						cutout: '70%',
+						animation: {
+							animateRotate: true,
+							animateScale: true,
+							duration: 1000,
+							easing: 'easeOutQuart'
+						},
+						plugins: {
+							legend: {
+								display: false // 关闭原生图例，使用 HTML 图例
+							}
+						}
+					}
+				});
 
 				// 动态且逐个淡入渲染模型说明 ID
 				renderChartLegend(legendContainer, labels, chartData);
@@ -4416,6 +4524,11 @@ async function handleAdminPage(request, env, ctx) {
 			flex-direction: column;
 			overflow-x: hidden;
 			position: relative;
+		}
+
+		/* Utility Hidden Class */
+		.hidden {
+			display: none !important;
 		}
 
 		/* Tab Content Transition — Cyberpunk Terminal Reveal */
@@ -4647,30 +4760,41 @@ async function handleAdminPage(request, env, ctx) {
 		/* Card Grid & Stats */
 		.card-grid {
 			display: grid;
-			grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+			grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
 			gap: 20px;
-			grid-auto-rows: 1fr;
 		}
 
 		${SHARED_STAT_CARD_CSS}
 
 		.stat-value {
-			font-size: 38px;
+			font-size: 32px;
 			font-weight: 700;
 			font-family: 'Outfit', sans-serif;
-			letter-spacing: -0.02em;
-			line-height: 1;
 		}
 
 		.stat-desc {
 			font-size: 12px;
 			color: var(--text-muted);
-			line-height: 1.6;
+		}
+
+		${SHARED_PROGRESS_CSS}
+
+		.progress-container {
+			height: 6px;
+			border-radius: 3px;
+		}
+
+		.progress-threshold {
+			position: absolute;
+			top: 0;
+			bottom: 0;
+			width: 2px;
+			background: var(--warning-color);
 		}
 
 		.stat-metrics-row {
 			display: flex;
-			gap: 28px;
+			gap: 24px;
 			align-items: flex-start;
 		}
 
@@ -4683,36 +4807,6 @@ async function handleAdminPage(request, env, ctx) {
 			width: 1px;
 			background: var(--border-color);
 			align-self: stretch;
-			margin: 4px 0;
-		}
-
-		.stat-icon-badge {
-			width: 36px;
-			height: 36px;
-			border-radius: 10px;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			flex-shrink: 0;
-		}
-
-		.usage-progress-container {
-			width: 100%;
-			height: 6px;
-			background-color: rgba(255, 255, 255, 0.06);
-			border-radius: 3px;
-			overflow: hidden;
-		}
-
-		:root[data-theme="light"] .usage-progress-container {
-			background-color: rgba(0, 0, 0, 0.05);
-		}
-
-		.usage-progress-bar {
-			height: 100%;
-			background: var(--primary-gradient);
-			border-radius: 3px;
-			transition: width 1.2s cubic-bezier(0.34, 1.56, 0.64, 1);
 		}
 
 		/* Section Cards */
@@ -4971,6 +5065,19 @@ async function handleAdminPage(request, env, ctx) {
 			max-width: 500px;
 		}
 
+		.modal-header {
+			display: flex;
+			justify-content: space-between;
+			align-items: center;
+			border-bottom: 1px solid var(--border-color);
+			padding-bottom: 16px;
+		}
+
+		.modal-header h3 {
+			font-size: 18px;
+			font-weight: 600;
+		}
+
 		.modal-footer {
 			display: flex;
 			justify-content: flex-end;
@@ -5104,62 +5211,62 @@ async function handleAdminPage(request, env, ctx) {
 
 				<!-- TAB: Overview -->
 				<div id="tab-overview" class="tab-content active">
-
-					<!-- Account Usage Details -->
-					<div class="section-card" style="padding: 30px 60px 30px 24px;">
-						<div class="section-title" style="display: flex; align-items: center; justify-content: space-between;">
-							<span>账号用量明细</span>
-							<div style="display: flex; align-items: center; gap: 12px;">
-								<div style="display: flex; align-items: center; gap: 14px; font-size: 12px; color: var(--text-muted);">
-									<span>账号 <strong id="stat-accounts-count" style="font-size: 14px; color: var(--text-color);">0</strong></span>
-									<span>密钥 <strong id="stat-keys-count" style="font-size: 14px; color: var(--text-color);">0</strong></span>
-								</div>
-								<span id="txt-last-updated" style="font-size: 11px; color: var(--text-muted); font-family: monospace;"></span>
-								<button class="btn btn-secondary" id="btn-refresh-usage" onclick="loadUsageDetails(true)" style="padding: 5px 12px; font-size: 11px;">刷新</button>
-							</div>
-						</div>
-						<div id="accounts-usage-list" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; margin-top: 12px;">
-						</div>
-					</div>
-
 					<div class="card-grid">
 						<div class="stat-card">
-							<div class="stat-title-row" style="display: flex; align-items: center; justify-content: space-between;">
-								<div class="stat-title">今日用量</div>
-								<span id="stat-total-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap; background: rgba(168, 85, 247, 0.08); padding: 3px 10px; border-radius: 12px;">0</span>
-							</div>
-							<div class="stat-value" id="stat-total-neurons" style="font-size: 42px;">0</div>
-							<div class="stat-desc" id="stat-neurons-desc" style="margin-top: auto; display: flex; justify-content: space-between; align-items: center;">
-								<span>0 / <span id="stat-neurons-limit">1w</span> Neurons</span>
-								<span id="stat-neurons-pct" style="font-weight: 600; color: var(--primary-color);">0%</span>
-							</div>
-							<div class="stat-desc" id="stat-cost-saving" style="font-size: 11px; color: #22c55e;">$0.00 节省成本</div>
-						</div>
-
-						<div class="stat-card">
-							<div class="stat-title-row" style="display: flex; align-items: center; justify-content: space-between;">
-								<div class="stat-title">Token 统计</div>
-								<div class="stat-icon-badge" style="background: linear-gradient(135deg, rgba(59, 130, 246, 0.15), rgba(16, 185, 129, 0.15)); color: var(--accent-color);">
-									<svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+							<div class="stat-title">今日用量</div>
+							<div class="stat-metrics-row">
+								<div class="stat-metric">
+									<div class="stat-value" id="stat-total-neurons">0</div>
+									<div class="stat-desc" style="margin-top: 2px;"><span id="stat-total-requests">0</span> 次请求</div>
+								</div>
+								<div class="stat-metric-divider"></div>
+								<div class="stat-metric">
+									<div class="stat-value" id="stat-tokens-total">0</div>
+									<div class="stat-desc" id="stat-tokens-desc" style="margin-top: 2px;">入 0 / 出 0</div>
+									<div class="stat-desc" id="stat-tokens-speed" style="margin-top: 2px; font-size: 11px;">0 tok/s</div>
+									<div class="stat-desc" id="stat-tokens-reasoning" style="margin-top: 1px; font-size: 10px; opacity: 0.7;">推理 0 / 缓存读 0</div>
 								</div>
 							</div>
-							<div class="stat-value" id="stat-tokens-total" style="font-size: 36px;">0</div>
-							<div class="stat-desc" style="margin-top: 4px; font-size: 11px; color: var(--text-muted);">↑上传 <span id="stat-tokens-input">0</span></div>
-							<div class="stat-desc" style="font-size: 11px; color: var(--text-muted);">↓下载 <span id="stat-tokens-output">0</span></div>
-							<div class="stat-desc" id="stat-tokens-speed" style="font-size: 11px; color: var(--text-muted);">0 tok/s</div>
-							<div class="stat-desc" id="stat-tokens-reasoning" style="margin-top: auto; font-size: 10px; opacity: 0.65;">推理 0 / 缓存读 0</div>
+							<div class="progress-container" style="margin-top: 2px;">
+								<div class="progress-bar" id="stat-neurons-progress" style="width: 0%;"></div>
+							</div>
+							<div class="stat-desc" id="stat-neurons-desc" style="margin-top: 4px;">0 / 0 Neurons (0%)</div>
 						</div>
-
+					<div class="stat-card">
+						<div style="display: flex; justify-content: space-between; align-items: center;">
+							<div class="stat-title">本月用量限额</div>
+							<span id="stat-monthly-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">0次</span>
+						</div>
+						<div class="stat-value" id="stat-monthly-usage">0</div>
+						<div class="progress-container" style="position: relative;">
+							<div class="progress-bar" id="stat-monthly-progress" style="width: 0%;"></div>
+							<div class="progress-threshold" id="stat-monthly-threshold" style="position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warning-color); left: 90%;"></div>
+						</div>
+						<div class="stat-desc" id="stat-monthly-desc" style="margin-top: 4px;">0 / 100,000 Neurons (0%)</div>
+					</div>
+					<div class="stat-card">
+						<div class="stat-title">资源</div>
+						<div class="stat-metrics-row">
+							<div class="stat-metric">
+								<div class="stat-value" id="stat-accounts-count">0</div>
+								<div class="stat-desc">账号</div>
+							</div>
+							<div class="stat-metric-divider"></div>
+							<div class="stat-metric">
+								<div class="stat-value" id="stat-keys-count">0</div>
+								<div class="stat-desc">密钥</div>
+							</div>
+						</div>
+					</div>
 						<div class="stat-card">
-							<div class="stat-title-row" style="display: flex; align-items: center; justify-content: space-between;">
-								<div class="stat-title">本月用量限额</div>
-								<span id="stat-monthly-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap; background: rgba(168, 85, 247, 0.08); padding: 3px 10px; border-radius: 12px;">0</span>
+							<div style="display: flex; justify-content: space-between; align-items: flex-start;">
+								<div class="stat-title">节省成本 (估算)</div>
+								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
+									<path stroke-linecap="round" stroke-linejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+								</svg>
 							</div>
-							<div class="stat-value" id="stat-monthly-usage" style="font-size: 42px;">0</div>
-							<div class="stat-desc" id="stat-monthly-desc" style="margin-top: auto; display: flex; justify-content: space-between;">
-								<span>0 / 100K Neurons</span>
-								<span id="stat-monthly-pct" style="font-weight: 600; color: var(--text-muted);">0%</span>
-							</div>
+							<div class="stat-value" id="stat-cost-saving">$0.00</div>
+							<div class="stat-desc">对比 OpenAI completions 同等额度价格</div>
 						</div>
 					</div>
 
@@ -5194,7 +5301,19 @@ async function handleAdminPage(request, env, ctx) {
 						</div>
 					</div>
 
-
+					<!-- Detailed Accounts Usage Grid -->
+					<div class="section-card" style="margin-top: 24px;">
+						<div class="section-header">
+							<div class="section-title">账号用量明细</div>
+							<div style="display: flex; align-items: center; gap: 12px;">
+								<span id="txt-last-updated" style="font-size: 12px; color: var(--text-muted); font-family: monospace;"></span>
+								<button class="btn btn-secondary" id="btn-refresh-usage" onclick="loadUsageDetails(true)">刷新用量</button>
+							</div>
+						</div>
+						<div id="accounts-usage-list" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px;">
+							<!-- Individual account progress item -->
+						</div>
+					</div>
 				</div>
 
 				<!-- TAB: Accounts -->
@@ -5357,7 +5476,9 @@ async function handleAdminPage(request, env, ctx) {
 		<div class="modal-card">
 			<div class="modal-header">
 				<h3 id="account-modal-title">添加 Cloudflare 账号</h3>
-				<button onclick="closeAccountModal()" class="close-btn">${SVG_CLOSE}</button>
+				<button onclick="closeAccountModal()" style="background: none; border: none; color: var(--text-muted); cursor: pointer;">
+					<svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+				</button>
 			</div>
 			<input type="hidden" id="account-id-edit">
 			<div class="form-group">
@@ -5392,7 +5513,9 @@ async function handleAdminPage(request, env, ctx) {
 		<div class="modal-card">
 			<div class="modal-header">
 				<h3 id="key-modal-title">生成新 API 密钥</h3>
-				<button onclick="closeKeyModal()" class="close-btn">${SVG_CLOSE}</button>
+				<button onclick="closeKeyModal()" style="background: none; border: none; color: var(--text-muted); cursor: pointer;">
+					<svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+				</button>
 			</div>
 			<div id="key-modal-form">
 				<div class="form-group" style="margin-bottom: 16px;">
@@ -5435,14 +5558,6 @@ async function handleAdminPage(request, env, ctx) {
 			if (n < 1000000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
 			if (n < 1000000000) return (n / 1000000).toFixed(2).replace(/\.?0+$/, '') + 'M';
 			return (n / 1000000000).toFixed(2).replace(/\.?0+$/, '') + 'B';
-		}
-
-		function fmtLimit(n) {
-			if (n <= 0) return '0';
-			if (n % 10000 === 0) return (n / 10000) + 'w';
-			if (n < 1000) return String(n);
-			if (n < 1000000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
-			return (n / 1000000).toFixed(2).replace(/\.?0+$/, '') + 'M';
 		}
 
 		let currentTab = 'overview';
@@ -5490,7 +5605,7 @@ async function handleAdminPage(request, env, ctx) {
 				// Percentage formatted to 2 decimal places（不封顶，允许超过 100%）
 			const percentage = limits.dailyLimit > 0 ? Number(((account.usageToday / limits.dailyLimit) * 100).toFixed(2)) : 0;
 				const warningClass = account.status === 'error' ? 'badge-danger' : (account.status === 'pending' ? 'badge-info' : (percentage >= 90 ? 'badge-warning' : 'badge-success'));
-				const statusText = account.status === 'error' ? '连接异常' : (account.status === 'pending' ? '待刷新' : (percentage >= 100 ? '用尽 (' + fmtLimit(limits.dailyLimit) + ')' : '正常运行'));
+				const statusText = account.status === 'error' ? '连接异常' : (account.status === 'pending' ? '待刷新' : (percentage >= 100 ? '用尽 (' + limits.dailyLimit.toLocaleString() + ')' : '正常运行'));
 				
 				// Usage rounded up (Math.ceil)
 				const roundedUsage = Math.ceil(account.usageToday);
@@ -5500,21 +5615,22 @@ async function handleAdminPage(request, env, ctx) {
 				item.className = 'section-card' + (isRefreshed ? ' card-update-flash' : '');
 				item.dataset.id = account.id;
 				item.dataset.lastUpdated = account.lastUpdated || 0;
-				item.style.padding = '14px 18px';
+				item.style.padding = '20px';
 				item.style.backgroundColor = 'rgba(255,255,255,0.01)';
 				item.innerHTML = \`
-					<div style="display:flex; justify-content:space-between; align-items:center; gap: 12px;">
+					<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px; gap: 12px;">
 						<div style="min-width: 0; flex: 1; display: flex; align-items: center; gap: 8px;">
-							<strong style="font-size:14px; font-weight:600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto;" title="\${escapeHtml(account.name)}">\${escapeHtml(account.name)}</strong>
-							<span style="font-size:11px; color: var(--text-muted); font-family: monospace; white-space: nowrap; flex-shrink: 0;">(\${escapeHtml(account.accountId.substring(0,6))}...\${escapeHtml(account.accountId.substring(account.accountId.length-4))})</span>
+							<strong style="font-size:15px; font-weight:600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto;" title="\${escapeHtml(account.name)}">\${escapeHtml(account.name)}</strong>
+							<span style="font-size:12px; color: var(--text-muted); font-family: monospace; white-space: nowrap; flex-shrink: 0;">(\${escapeHtml(account.accountId.substring(0,6))}...\${escapeHtml(account.accountId.substring(account.accountId.length-4))})</span>
 						</div>
-						<span class="badge \${warningClass}" style="flex-shrink: 0;">\${statusText} · \${percentage.toFixed(2)}%</span>
+						<span class="badge \${warningClass}" style="flex-shrink: 0;">\${statusText}</span>
 					</div>
-					<div class="usage-progress-container">
-						<div class="usage-progress-bar" style="width: \${Math.min(100, percentage)}%;"></div>
-					</div>
-					<div style="display:flex; justify-content:space-between; font-size:12px; color: var(--text-muted);">
-						<span>今日已用: \${fmtLimit(roundedUsage)} / \${fmtLimit(limits.dailyLimit)} Neurons</span>
+					<div class="progress-container">
+					<div class="progress-bar" style="width: \${Math.min(100, percentage)}%;"></div>
+				</div>
+				<div style="display:flex; justify-content:space-between; font-size:12px; color: var(--text-muted); margin-top: 6px;">
+						<span>今日已用: \${roundedUsage.toLocaleString()} / \${limits.dailyLimit.toLocaleString()} Neurons</span>
+						<span>\${percentage.toFixed(2)}%</span>
 					</div>
 					\${account.error ? \`<div style="color: var(--danger-color); font-size:11px; margin-top: 8px; background: rgba(239,68,68,0.08); padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(239,68,68,0.12);">错误信息: \${escapeHtml(account.error)}</div>\` : ''}
 				\`;
@@ -5537,25 +5653,14 @@ async function handleAdminPage(request, env, ctx) {
 			const roundedTotalUsageToday = Math.ceil(totalUsageToday);
 			document.getElementById('stat-total-neurons').innerText = fmtTok(roundedTotalUsageToday);
 			document.getElementById('stat-accounts-count').innerText = accounts.length;
-			document.getElementById('stat-total-requests').innerText = totalRequestsToday.toLocaleString();
+			document.getElementById('stat-total-requests').innerText = totalRequestsToday.toLocaleString() + '次';
 			
 			const overallPercentage = totalLimit > 0 ? Number(((totalUsageToday / totalLimit) * 100).toFixed(2)) : 0;
-			const neuronsDesc = document.getElementById('stat-neurons-desc');
-			if (neuronsDesc) {
-				const leftSpan = neuronsDesc.querySelector('span:first-child');
-				const rightSpan = neuronsDesc.querySelector('#stat-neurons-pct');
-				if (leftSpan) {
-					leftSpan.innerHTML = fmtLimit(roundedTotalUsageToday) + ' / ' + fmtLimit(totalLimit) + ' Neurons';
-				}
-				if (rightSpan) {
-					const pctText = overallPercentage > 100 ? '+' + (overallPercentage - 100).toFixed(2) + '%' : overallPercentage.toFixed(2) + '%';
-					rightSpan.innerText = pctText;
-					rightSpan.style.color = overallPercentage > 100 ? '#ef4444' : 'var(--primary-color)';
-				}
-			}
+			document.getElementById('stat-neurons-progress').style.width = Math.min(100, overallPercentage) + '%';
+			document.getElementById('stat-neurons-desc').innerText = \`\${roundedTotalUsageToday.toLocaleString()} / \${totalLimit.toLocaleString()} Neurons (\${overallPercentage.toFixed(2)}%)\`;
 			
 			const costSaved = (totalUsageToday / 1000) * 0.011;
-			document.getElementById('stat-cost-saving').innerText = '$' + costSaved.toFixed(2) + ' 节省成本';
+			document.getElementById('stat-cost-saving').innerText = '$' + costSaved.toFixed(2);
 
 			updateLimitCards(limits);
 
@@ -5575,27 +5680,20 @@ async function handleAdminPage(request, env, ctx) {
 			// 本月限额
 		const monthlyPct = monthlyLimit > 0 ? Number(((monthlyUsage / monthlyLimit) * 100).toFixed(2)) : 0;
 		document.getElementById('stat-monthly-usage').innerText = fmtTok(Math.ceil(monthlyUsage));
-		const monthlyDesc = document.getElementById('stat-monthly-desc');
-		if (monthlyDesc) {
-			const leftSpan = monthlyDesc.querySelector('span:first-child');
-			const rightSpan = monthlyDesc.querySelector('#stat-monthly-pct');
-			if (leftSpan) {
-				leftSpan.innerText = limitDisabled
-					? fmtLimit(Math.ceil(monthlyUsage)) + ' Neurons · 限额关闭'
-					: fmtLimit(Math.ceil(monthlyUsage)) + ' / ' + fmtLimit(monthlyLimit) + ' Neurons';
-			}
-			if (rightSpan) {
-				if (limitDisabled) {
-					rightSpan.style.display = 'none';
+		document.getElementById('stat-monthly-progress').style.width = Math.min(100, monthlyPct) + '%';
+		document.getElementById('stat-monthly-desc').innerText = limitDisabled
+			? Math.ceil(monthlyUsage).toLocaleString() + ' Neurons · 限额关闭'
+			: Math.ceil(monthlyUsage).toLocaleString() + ' / ' + monthlyLimit.toLocaleString() + ' Neurons (' + monthlyPct.toFixed(1) + '%)';
+			document.getElementById('stat-monthly-requests').innerText = monthlyRequests.toLocaleString() + '次';
+			const monthlyThresholdEl = document.getElementById('stat-monthly-threshold');
+			if (monthlyThresholdEl) {
+				if (threshold > 0) {
+					monthlyThresholdEl.style.left = Math.round(threshold * 100) + '%';
+					monthlyThresholdEl.style.display = '';
 				} else {
-					rightSpan.style.display = '';
-					rightSpan.innerText = monthlyPct.toFixed(1) + '%';
-					rightSpan.style.color = '';
+					monthlyThresholdEl.style.display = 'none';
 				}
 			}
-		}
-			document.getElementById('stat-monthly-requests').innerText = monthlyRequests.toLocaleString();
-			
 		}
 
 		let isRefreshingUsage = false;
@@ -5606,23 +5704,12 @@ async function handleAdminPage(request, env, ctx) {
 				const data = await res.json();
 				const totalEl = document.getElementById("stat-tokens-total");
 				if (totalEl) totalEl.innerText = data.totalFmt || "0";
-				const inputEl = document.getElementById("stat-tokens-input");
-				if (inputEl) inputEl.innerText = data.inputFmt || "0";
-				const outputEl = document.getElementById("stat-tokens-output");
-				if (outputEl) outputEl.innerText = data.outputFmt || "0";
+				const descEl = document.getElementById("stat-tokens-desc");
+				if (descEl) descEl.innerText = "入 " + (data.inputFmt || "0") + " / 出 " + (data.outputFmt || "0");
 				const speedEl = document.getElementById("stat-tokens-speed");
 				if (speedEl) speedEl.innerText = (data.avgTokPerSec || 0) + " tok/s";
 				const reasoningEl = document.getElementById("stat-tokens-reasoning");
-			if (reasoningEl) {
-				const reasoningVal = data.reasoningFmt || "0";
-				const cacheReadVal = data.cacheReadFmt || "0";
-				if (reasoningVal === "0" && cacheReadVal === "0") {
-					reasoningEl.style.display = "none";
-				} else {
-					reasoningEl.style.display = "";
-					reasoningEl.innerText = "推理 " + reasoningVal + " / 缓存读 " + cacheReadVal;
-				}
-			}
+				if (reasoningEl) reasoningEl.innerText = "推理 " + (data.reasoningFmt || "0") + " / 缓存读 " + (data.cacheReadFmt || "0");
 			} catch (e) { console.error("Failed to load token stats:", e); }
 		}
 
@@ -5704,18 +5791,17 @@ async function handleAdminPage(request, env, ctx) {
 			const label = document.getElementById('txt-last-updated');
 			if (!label) return;
 			if (!timestamp) {
-				label.innerText = '';
-				label.style.display = 'none';
+				label.innerText = '从未更新';
 				return;
 			}
-			const diff = Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000);
-			let text;
-			if (diff < 10) text = 'now';
-			else if (diff < 60) text = diff + 's';
-			else if (diff < 3600) text = Math.floor(diff / 60) + 'm';
-			else if (diff < 86400) text = Math.floor(diff / 3600) + 'h';
-			else text = Math.floor(diff / 86400) + 'd';
-			label.innerText = text;
+			const date = new Date(timestamp);
+			const yyyy = date.getFullYear();
+			const MM = String(date.getMonth() + 1).padStart(2, '0');
+			const dd = String(date.getDate()).padStart(2, '0');
+			const hh = String(date.getHours()).padStart(2, '0');
+			const mm = String(date.getMinutes()).padStart(2, '0');
+			const ss = String(date.getSeconds()).padStart(2, '0');
+			label.innerText = '最后更新: ' + yyyy + '-' + MM + '-' + dd + ' ' + hh + ':' + mm + ':' + ss;
 		}
 
 		function onAdminThemeChange() {
@@ -5740,11 +5826,6 @@ async function handleAdminPage(request, env, ctx) {
 			}
 			loadUsageDetails();
 			loadTokenStats();
-			// 每 30 秒自动刷新数据
-			setInterval(() => {
-				loadUsageDetails();
-				loadTokenStats();
-			}, 30000);
 		};
 
 		function toggleSidebar() {
@@ -5846,26 +5927,8 @@ async function handleAdminPage(request, env, ctx) {
 					maintainAspectRatio: false,
 					plugins: { legend: { display: false } },
 					scales: {
-						y: {
-							grid: { color: gridColor },
-							ticks: {
-								color: textColor,
-								callback: function(value) { return fmtLimit(value); }
-							}
-						},
-						x: {
-							grid: { display: false },
-							ticks: {
-								color: textColor,
-								maxTicksLimit: 7,
-								callback: function(value, index) {
-									const d = new Date(labels[index]);
-									const month = String(d.getMonth() + 1).padStart(2, '0');
-									const day = String(d.getDate()).padStart(2, '0');
-									return month + '/' + day;
-								}
-							}
-						}
+						y: { grid: { color: gridColor }, ticks: { color: textColor } },
+						x: { grid: { display: false }, ticks: { color: textColor } }
 					}
 				}
 			});
@@ -5904,9 +5967,36 @@ async function handleAdminPage(request, env, ctx) {
 
 			const isLight = document.documentElement.getAttribute('data-theme') === 'light';
 			const borderColor = isLight ? '#ffffff' : '#1e293b';
+			const ctx = document.getElementById('modelsChart').getContext('2d');
 			
-			if (modelsChart) modelsChart.destroy();
-			modelsChart = createDoughnutChart('modelsChart', sortedLabels, sortedData, borderColor);
+			modelsChart = new Chart(ctx, {
+				type: 'doughnut',
+				data: {
+					labels: sortedLabels,
+					datasets: [{
+						data: sortedData,
+						backgroundColor: ['#6366f1', '#a855f7', '#ec4899', '#10b981', '#f59e0b', '#3b82f6'],
+						borderWidth: 2,
+						borderColor: borderColor
+					}]
+				},
+				options: {
+					responsive: true,
+					maintainAspectRatio: false,
+					cutout: '70%',
+					animation: {
+						animateRotate: true,
+						animateScale: true,
+						duration: 1000,
+						easing: 'easeOutQuart'
+					},
+					plugins: {
+						legend: {
+							display: false // 关闭原生图例，使用 HTML 自定义图例
+						}
+					}
+				}
+			});
 
 			// Render Custom HTML Legend for Admin Page
 			renderChartLegend(legendContainer, sortedLabels, sortedData, combined.map(x => x.fullLabel));
@@ -5914,45 +6004,43 @@ async function handleAdminPage(request, env, ctx) {
 
 		async function copyEndpointUrl(url) {
 			if (!url) return;
-			await copyText(url, '已复制接入地址！');
-		}
-
-		// 通用表格数据加载函数
-		async function loadTableData(url, tbodyId, emptyMsg, renderFn, onEmpty) {
 			try {
-				const res = await apiFetch(url);
-				const items = await res.json();
-				const tbody = document.getElementById(tbodyId);
-				tbody.innerHTML = '';
-				if (items.length === 0) {
-					tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-muted); padding: 30px;">' + emptyMsg + '</td></tr>';
-					if (onEmpty) onEmpty();
-					return;
-				}
-				if (onEmpty) onEmpty(items.length > 0);
-				items.forEach(renderFn);
-			} catch (e) {
-				console.error(e);
+				await navigator.clipboard.writeText(url);
+				showToast('已复制接入地址！');
+			} catch (_) {
+				showToast('复制失败，请手动复制 URL', 'error');
 			}
 		}
 
 		async function loadAccounts() {
-			await loadTableData('/api/accounts', 'accounts-table-body', '暂无配置的 Cloudflare 账号', (acc) => {
-				const maskedToken = acc.apiToken.length > 8 ? acc.apiToken.substring(0, 4) + '...' + acc.apiToken.substring(acc.apiToken.length - 4) : '********';
-				const tr = document.createElement('tr');
-				tr.innerHTML = \`
-					<td><strong style="font-weight:600;">\${escapeHtml(acc.name)}</strong></td>
-					<td><code>\${escapeHtml(acc.accountId)}</code></td>
-					<td><code>\${escapeHtml(maskedToken)}</code></td>
-					<td>
-						<div style="display:flex; gap:8px;">
-							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" onclick="editAccount(\${attrEscape(acc.id)}, \${attrEscape(acc.name)}, \${attrEscape(acc.accountId)}, \${attrEscape(acc.apiToken)})">编辑</button>
-							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteAccount(\${attrEscape(acc.id)})">删除</button>
-						</div>
-					</td>
-				\`;
-				document.getElementById('accounts-table-body').appendChild(tr);
-			});
+			try {
+				const res = await apiFetch('/api/accounts');
+				const accounts = await res.json();
+				const tbody = document.getElementById('accounts-table-body');
+				tbody.innerHTML = '';
+				if (accounts.length === 0) {
+					tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-muted); padding: 30px;">暂无配置的 Cloudflare 账号</td></tr>';
+					return;
+				}
+				accounts.forEach(acc => {
+					const maskedToken = acc.apiToken.length > 8 ? acc.apiToken.substring(0, 4) + '...' + acc.apiToken.substring(acc.apiToken.length - 4) : '********';
+					const tr = document.createElement('tr');
+					tr.innerHTML = \`
+						<td><strong style="font-weight:600;">\${escapeHtml(acc.name)}</strong></td>
+						<td><code>\${escapeHtml(acc.accountId)}</code></td>
+						<td><code>\${escapeHtml(maskedToken)}</code></td>
+						<td>
+							<div style="display:flex; gap:8px;">
+								<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" onclick="editAccount(\${attrEscape(acc.id)}, \${attrEscape(acc.name)}, \${attrEscape(acc.accountId)}, \${attrEscape(acc.apiToken)})">编辑</button>
+								<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteAccount(\${attrEscape(acc.id)})">删除</button>
+							</div>
+						</td>
+					\`;
+					tbody.appendChild(tr);
+				});
+			} catch (e) {
+				console.error(e);
+			}
 		}
 
 		function openAddAccountModal() {
@@ -6128,35 +6216,60 @@ async function handleAdminPage(request, env, ctx) {
 
 		async function deleteAccount(id) {
 			if (!confirm('确定要删除这个 Cloudflare 账号吗？')) return;
-			await deleteResource('/api/accounts/', id, loadAccounts, '账号已成功删除', '删除失败');
+			const res = await apiFetch('/api/accounts/' + encodeURIComponent(id), {
+				method: 'DELETE'
+			});
+			if (res.ok) {
+				loadAccounts();
+				showToast('账号已成功删除');
+			} else {
+				showToast('删除失败', 'error');
+			}
 		}
 
 		async function loadKeys() {
-			await loadTableData('/api/keys', 'keys-table-body', '暂无配置的 API 密钥', (k) => {
-				const tr = document.createElement('tr');
-				const dateStr = new Date(k.createdAt).toLocaleString();
-				tr.innerHTML = \`
-					<td><strong style="font-weight:600;">\${escapeHtml(k.name)}</strong></td>
-					<td>
-						<div style="display:flex; align-items:center; gap:8px;">
-							<code id="key-val-\${k.id}">\${k.key.length > 6 ? k.key.substring(0, 5) + '...' + k.key.substring(k.key.length - 1) : k.key.substring(0, Math.min(3, k.key.length)) + '...'}</code>
-							<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" onclick="copyKeyText('\${attrEscape(k.key)}')">复制</button>
-						</div>
-					</td>
-					<td>\${dateStr}</td>
-					<td>
-						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey('\${k.id}')">删除</button>
-					</td>
-				\`;
-				document.getElementById('keys-table-body').appendChild(tr);
-			}, (hasData) => {
-				const el = document.getElementById('no-key-warning');
-				if (el) el.classList.toggle('hidden', !!hasData);
-			});
+			try {
+				const res = await apiFetch('/api/keys');
+				const keys = await res.json();
+				const tbody = document.getElementById('keys-table-body');
+				tbody.innerHTML = '';
+				if (keys.length === 0) {
+					tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-muted); padding: 30px;">暂无配置的 API 密钥</td></tr>';
+					document.getElementById('no-key-warning').classList.remove('hidden');
+					return;
+				} else {
+					document.getElementById('no-key-warning').classList.add('hidden');
+				}
+				keys.forEach(k => {
+					const tr = document.createElement('tr');
+					const dateStr = new Date(k.createdAt).toLocaleString();
+					tr.innerHTML = \`
+						<td><strong style="font-weight:600;">\${escapeHtml(k.name)}</strong></td>
+						<td>
+							<div style="display:flex; align-items:center; gap:8px;">
+								<code id="key-val-\${k.id}">\${k.key.length > 6 ? k.key.substring(0, 5) + '...' + k.key.substring(k.key.length - 1) : k.key.substring(0, Math.min(3, k.key.length)) + '...'}</code>
+								<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" onclick="copyKeyText('\${attrEscape(k.key)}')">复制</button>
+							</div>
+						</td>
+						<td>\${dateStr}</td>
+						<td>
+							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey('\${k.id}')">删除</button>
+						</td>
+					\`;
+					tbody.appendChild(tr);
+				});
+			} catch (e) {
+				console.error(e);
+			}
 		}
 
 		async function copyKeyText(val) {
-			await copyText(val, 'API Key 复制成功！');
+			try {
+				await navigator.clipboard.writeText(val);
+				showToast('API Key 复制成功！');
+			} catch (_) {
+				showToast('复制失败，请手动复制', 'error');
+			}
 		}
 
 		function openAddKeyModal() {
@@ -6197,16 +6310,34 @@ async function handleAdminPage(request, env, ctx) {
 		}
 
 		async function copyGeneratedKey() {
-			await copyText(document.getElementById('generated-key-val').value, 'API Key 复制成功！');
+			try {
+				await navigator.clipboard.writeText(document.getElementById('generated-key-val').value);
+				showToast('API Key 复制成功！');
+			} catch (_) {
+				showToast('复制失败，请手动复制', 'error');
+			}
 		}
 
 		async function deleteKey(id) {
 			if (!confirm('确定要删除这个 API 密钥吗？')) return;
-			await deleteResource('/api/keys/', id, loadKeys, '密钥已成功删除', '删除密钥失败');
+			const res = await apiFetch('/api/keys/' + encodeURIComponent(id), {
+				method: 'DELETE'
+			});
+			if (res.ok) {
+				loadKeys();
+				showToast('密钥已成功删除');
+			} else {
+				showToast('删除密钥失败', 'error');
+			}
 		}
 
 		async function copyModelId(val) {
-			await copyText(val, \`已复制模型: \${val}\`);
+			try {
+				await navigator.clipboard.writeText(val);
+				showToast(\`已复制模型: \${val}\`);
+			} catch (_) {
+				showToast('复制失败，请手动复制', 'error');
+			}
 		}
 
 		async function loadSettings() {
