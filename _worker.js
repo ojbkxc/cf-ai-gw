@@ -6206,6 +6206,9 @@ async function handleAdminPage(request, env, ctx) {
 		}
 
 		async function copyModelId(val) {
+			if (typeof val === 'string' && val.length >= 2 && val.charCodeAt(0) === 0x22 && val.charCodeAt(val.length - 1) === 0x22) {
+				val = val.slice(1, -1);
+			}
 			await copyText(val, \`已复制模型: \${val}\`);
 		}
 
