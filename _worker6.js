@@ -31,6 +31,7 @@ function randomUA() {
 	return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
+// 构建带浏览器特征的请求头，避免被 Cloudflare 识别为自动化脚本
 function browserHeaders(token, contentType = 'application/json') {
 	const headers = {
 		'Authorization': `Bearer ${token}`,
@@ -44,6 +45,8 @@ function browserHeaders(token, contentType = 'application/json') {
 	if (contentType) headers['Content-Type'] = contentType;
 	return headers;
 }
+
+// ===== 通用工具函数 =====
 
 function safeJSONParse(raw, defaultVal) {
 	if (!raw) return defaultVal;
@@ -103,6 +106,10 @@ async function withFailover(env, onAccount) {
 	return { success: false, status: lastStatus, error: `All Cloudflare accounts failed. Last error: ${lastError}` };
 }
 
+// ===== Workers AI REST API 直连（无 AI Gateway） =====
+// 直接 API URL 格式: https://api.cloudflare.com/client/v4/accounts/{accountId}/ai/{path}
+
+// 构建 Workers AI REST API 的 URL（直连，不经过 AI Gateway）
 function buildCFUrl(account, path) {
 	return `https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/${path}`;
 }
@@ -145,7 +152,8 @@ function extractErrorMessage(raw) {
 	return undefined;
 }
 
-// 可恢复流：跟踪 SSE 事件边界，在流中断时自动重连。
+// ===== 可恢复流（客户端断点续传） =====
+// 跟踪 SSE 事件边界，在流中断时自动重连。
 // 由于 CF API 不支持服务端断点续传，重连时重新拉取完整请求，
 // 然后通过事件计数跳过已发出的 SSE 事件，避免下游输出重复。
 // 支持最多 5 次重连，每次重连间隔递增。
@@ -317,6 +325,9 @@ function createResumableStream(reader, options) {
 	});
 }
 
+// ===== Token 统计（参照 cloudflare_ai 的 mapWorkersAIUsage 模式） =====
+
+// 格式化 token 数为可读形式
 function fmtTok(n) {
 	if (n < 1000) return String(n);
 	if (n < 1000000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
@@ -372,6 +383,7 @@ async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0
 	})());
 }
 
+// 从 KV 读取今日 token 统计
 async function getTodayTokenStats(env) {
 	const key = getTokenDailyKey();
 	let kvData = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0 };
@@ -624,12 +636,27 @@ async function saveCustomModelMap(env, map) {
 	await env.KV.put('cfg_model_map', JSON.stringify(map));
 }
 
+// 简单互斥锁，防止多标签页并发写入覆盖
+let saveAccountsLock = 0;
 async function saveAccounts(env, accounts) {
-	await env.KV.put('cfg_accounts', JSON.stringify(accounts));
+	if (saveAccountsLock) return;
+	saveAccountsLock = 1;
+	try {
+		await env.KV.put('cfg_accounts', JSON.stringify(accounts));
+	} finally {
+		saveAccountsLock = 0;
+	}
 }
 
+let saveApiKeysLock = 0;
 async function saveApiKeys(env, keys) {
-	await env.KV.put('cfg_api_keys', JSON.stringify(keys));
+	if (saveApiKeysLock) return;
+	saveApiKeysLock = 1;
+	try {
+		await env.KV.put('cfg_api_keys', JSON.stringify(keys));
+	} finally {
+		saveApiKeysLock = 0;
+	}
 }
 
 const COOKIE_TOKEN_RE = /admin_token=([^;]+)/;
@@ -748,6 +775,25 @@ function generateRequestId() {
 	return id;
 }
 
+// 从 CF API 错误响应中提取可读的错误消息
+function extractCleanCFError(errorText) {
+	// 使用 extractErrorMessage 统一处理多种错误格式
+	const extracted = extractErrorMessage(errorText);
+	if (extracted) return extracted;
+	try {
+		const errJson = JSON.parse(errorText);
+		let msg = errJson.errors?.[0]?.message || errorText;
+		const innerJsonMatch = msg.match(/\{.*\}/);
+		if (innerJsonMatch) {
+			const inner = JSON.parse(innerJsonMatch[0]);
+			if (inner.message) msg = inner.message;
+		}
+		return msg;
+	} catch (_) {
+		return errorText;
+	}
+}
+
 // 带超时的流读取（初始读取）：用于首次预读校验。
 // 超时时会取消 reader，避免后续无效等待。
 function readWithTimeout(reader, timeoutMs) {
@@ -776,10 +822,18 @@ function readStreamWithTimeout(reader, timeoutMs) {
 	return Promise.race([read, timeout]).finally(() => clearTimeout(timer));
 }
 
-function getEnvNum(env, key, defaultVal, parseFn) {
+// 环境变量读取（避免 falsy 陷阱）
+function getEnvInt(env, key, defaultVal) {
 	const raw = env[key];
-	if (raw == null || raw === '') return defaultVal;
-	const val = parseFn(raw);
+	if (raw === undefined || raw === null || raw === '') return defaultVal;
+	const val = parseInt(raw, 10);
+	return isNaN(val) ? defaultVal : val;
+}
+
+function getEnvFloat(env, key, defaultVal) {
+	const raw = env[key];
+	if (raw === undefined || raw === null || raw === '') return defaultVal;
+	const val = parseFloat(raw);
 	return isNaN(val) ? defaultVal : val;
 }
 
@@ -788,9 +842,9 @@ async function getUsageLimits(env) {
 	const kvLimits = await getUsageLimitsConfig(env);
 
 	return {
-		dailyLimit: getEnvNum(env, 'DAILY_LIMIT', kvLimits.dailyLimit ?? DEFAULT_DAILY_LIMIT, parseInt),
-		monthlyLimit: getEnvNum(env, 'MONTHLY_LIMIT', kvLimits.monthlyLimit ?? DEFAULT_MONTHLY_LIMIT, parseInt),
-		threshold: getEnvNum(env, 'USAGE_THRESHOLD', kvLimits.threshold ?? DEFAULT_USAGE_THRESHOLD, parseFloat)
+		dailyLimit: getEnvInt(env, 'DAILY_LIMIT', kvLimits.dailyLimit ?? DEFAULT_DAILY_LIMIT),
+		monthlyLimit: getEnvInt(env, 'MONTHLY_LIMIT', kvLimits.monthlyLimit ?? DEFAULT_MONTHLY_LIMIT),
+		threshold: getEnvFloat(env, 'USAGE_THRESHOLD', kvLimits.threshold ?? DEFAULT_USAGE_THRESHOLD)
 	};
 }
 
@@ -800,6 +854,7 @@ function getMonthlyUsageKey() {
 	return `usage_monthly_${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
+// 读取当月用量
 async function getMonthlyUsage(env) {
 	const raw = await env.KV.get(getMonthlyUsageKey());
 	return raw ? parseInt(raw, 10) : 0;
@@ -848,6 +903,7 @@ async function checkUsageLimit(env) {
 	return result;
 }
 
+// 用量缓存工具
 async function getCachedSummary(env) {
 	const cached = await env.KV.get('cache_usage_summary');
 	if (cached) {
@@ -872,6 +928,7 @@ async function setCachedSummary(env, summaryData) {
 	await env.KV.put('cache_usage_summary', JSON.stringify(data), { expirationTtl: USAGE_CACHE_TTL_MS / 1000 });
 }
 
+// 构建空用量响应（无账号时用）
 function emptyUsageResponse(limits) {
 	return {
 		totalNeuronsToday: 0, totalRequestsToday: 0, totalRequestsMonth: 0, totalAccounts: 0, totalLimit: limits.dailyLimit,
@@ -1052,6 +1109,7 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) 
 	return cacheMap;
 }
 
+// GraphQL 用量分析
 async function queryGraphQL(accountId, apiToken, startDateTime) {
 	const query = `
 		query GetAIUsage($accountId: String!, $start: String!) {
@@ -1283,6 +1341,9 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 	return withFailover(env, async (account, attempt, accountIndex, activeAccounts) => {
 		if (attempt > 0) {
 			console.warn(`[Retry] Retrying account ${accountIndex} (attempt ${attempt + 1}/2)...`);
+		} else {
+			// 首次请求前加随机抖动，模拟人类行为
+			await new Promise(r => setTimeout(r, 50 + Math.random() * 150));
 		}
 		const timeoutMs = stream ? 600000 : 120000;
 		const apiUrl = buildCFUrl(account, 'v1/chat/completions');
@@ -1312,7 +1373,7 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 						if (done) break;
 						errBody += decoder.decode(value, { stream: true });
 					}
-					return { retry: true, skipAccount: true, error: `CF API error: ${extractErrorMessage(errBody) || errBody}`, status: cfResponse.status };
+					return { retry: true, skipAccount: true, error: `CF API error: ${extractCleanCFError(errBody)}`, status: cfResponse.status };
 				}
 				const prependReader = {
 					_firstChunk: firstResult.value,
@@ -1357,7 +1418,7 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 		}
 
 		const errorText = await cfResponse.text();
-		const error = `CF API returned ${cfResponse.status}: ${extractErrorMessage(errorText) || errorText}`;
+		const error = `CF API returned ${cfResponse.status}: ${extractCleanCFError(errorText)}`;
 		if (!isRetryableStatus(cfResponse.status)) {
 			return { success: false, status: cfResponse.status, error };
 		}
@@ -1379,8 +1440,13 @@ async function resolveModelName(model, env) {
 
 // 通用的 CF /ai/run/{model} failover 调用函数
 // 用于 embeddings、images、audio 等非 chat 端点，统一多账号 failover 逻辑
-async function callCFRunAPI(cfModel, buildPayload, processResult, env) {
+// raw=true 时 processResult 接收原始 Response 对象（用于二进制响应如 TTS）
+async function callCFRunAPI(cfModel, buildPayload, processResult, env, options = {}) {
 	return withFailover(env, async (account, attempt, accountIndex) => {
+		// 首次请求前加随机抖动，模拟人类行为
+		if (attempt === 0) {
+			await new Promise(r => setTimeout(r, 50 + Math.random() * 150));
+		}
 		const cfPayload = buildPayload(account);
 		cfPayload.headers = { ...cfPayload.headers, 'User-Agent': randomUA(), 'Accept': 'application/json', 'Accept-Language': 'en-US,en;q=0.9', 'Sec-Fetch-Dest': 'empty', 'Sec-Fetch-Mode': 'cors', 'Sec-Fetch-Site': 'cross-site' };
 		const apiUrl = buildCFUrl(account, `run/${cfModel}`);
@@ -1390,6 +1456,9 @@ async function callCFRunAPI(cfModel, buildPayload, processResult, env) {
 		});
 
 		if (cfResponse.ok) {
+			if (options.raw) {
+				return { success: true, data: await processResult(cfResponse) };
+			}
 			const cfJson = await cfResponse.json();
 			if (cfJson.success && cfJson.result) {
 				return { success: true, data: processResult(cfJson.result) };
@@ -1398,7 +1467,7 @@ async function callCFRunAPI(cfModel, buildPayload, processResult, env) {
 		}
 
 		const errorText = await cfResponse.text();
-		const error = `CF API status ${cfResponse.status}: ${extractErrorMessage(errorText) || errorText}`;
+		const error = `CF API status ${cfResponse.status}: ${extractCleanCFError(errorText)}`;
 		if (!isRetryableStatus(cfResponse.status)) {
 			return { success: false, status: cfResponse.status, error };
 		}
@@ -1413,9 +1482,16 @@ async function resolveModelWithFallback(model, env) {
 	return { cfModel, isFallback, fallbackWarning };
 }
 
+// 对话补全 / 文本补全
 async function handleCompletions(request, env, ctx, pathname) {
-	const body = await parseJSONBody(request);
-	if (!body) return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+	if (contentLength > 10 * 1024 * 1024) {
+		return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	}
+	const body = await safeJsonBody(request);
+	if (!body) {
+		return jsonError("Invalid JSON body", 400, "invalid_request_error");
+	}
 
 	const requestStartTime = Date.now();
 
@@ -1761,10 +1837,17 @@ function convertOpenAIErrorToAnthropic(openaiError) {
 	};
 }
 
+// Anthropic /v1/messages 路由
 async function handleMessages(request, env, ctx) {
 	const requestStartTime = Date.now();
-	const anthropicBody = await parseJSONBody(request);
-	if (!anthropicBody) return anthropicError('Request body too large (max 10MB).');
+	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+	if (contentLength > 10 * 1024 * 1024) {
+		return anthropicError('Request body too large (max 10MB).');
+	}
+	const anthropicBody = await safeJsonBody(request);
+	if (!anthropicBody) {
+		return anthropicError('Invalid JSON body.');
+	}
 
 	if (!anthropicBody.messages || !Array.isArray(anthropicBody.messages)) {
 		return anthropicError('messages field is required and must be an array.');
@@ -2161,8 +2244,14 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 
 // 向量嵌入
 async function handleEmbeddings(request, env, ctx) {
-	const body = await parseJSONBody(request);
-	if (!body) return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+	if (contentLength > 10 * 1024 * 1024) {
+		return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	}
+	const body = await safeJsonBody(request);
+	if (!body) {
+		return jsonError("Invalid JSON body", 400, "invalid_request_error");
+	}
 
 	const requestStartTime = Date.now();
 
@@ -2210,10 +2299,17 @@ async function handleEmbeddings(request, env, ctx) {
 	return new Response(JSON.stringify(result.data), { headers: embHeaders });
 }
 
+// 图片生成 /v1/images/generations
 async function handleImageGenerations(request, env, ctx) {
 	const requestStartTime = Date.now();
-	const body = await parseJSONBody(request);
-	if (!body) return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+	if (contentLength > 10 * 1024 * 1024) {
+		return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	}
+	const body = await safeJsonBody(request);
+	if (!body) {
+		return jsonError("Invalid JSON body", 400, "invalid_request_error");
+	}
 
 	const { model, prompt, response_format } = body;
 	if (!prompt) {
@@ -2352,8 +2448,14 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 
 // 文本转语音 /v1/audio/speech
 async function handleAudioSpeech(request, env, ctx) {
-	const body = await parseJSONBody(request);
-	if (!body) return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+	if (contentLength > 10 * 1024 * 1024) {
+		return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	}
+	const body = await safeJsonBody(request);
+	if (!body) {
+		return jsonError("Invalid JSON body", 400, "invalid_request_error");
+	}
 
 	const requestStartTime = Date.now();
 	const { model, input, voice } = body;
@@ -2368,31 +2470,24 @@ async function handleAudioSpeech(request, env, ctx) {
 	if (body.response_format) cfPayload.response_format = body.response_format;
 	if (body.speed !== undefined) cfPayload.speed = body.speed;
 
-	const result = await withFailover(env, async (account, attempt, accountIndex) => {
-		const apiUrl = buildCFUrl(account, `run/${cfModel}`);
-		const cfResponse = await fetch(apiUrl, {
+	const result = await callCFRunAPI(
+		cfModel,
+		(account) => ({
 			method: 'POST',
 			headers: browserHeaders(account.apiToken),
 			body: JSON.stringify(cfPayload),
-			signal: AbortSignal.timeout(120000),
-		});
-
-		if (cfResponse.ok) {
-			const audioBuffer = await cfResponse.arrayBuffer();
-			const contentType = cfResponse.headers.get('Content-Type') || 'audio/wav';
+		}),
+		async (response) => {
+			const audioBuffer = await response.arrayBuffer();
+			const contentType = response.headers.get('Content-Type') || 'audio/wav';
 			if (ctx) {
 				trackUsage(env, ctx, { input: Math.ceil(input.length / 4) }, requestStartTime);
 			}
-			return { success: true, data: { audioBuffer, contentType } };
-		}
-
-		const errorText = await cfResponse.text();
-		const error = `CF API status ${cfResponse.status}: ${extractErrorMessage(errorText) || errorText}`;
-		if (!isRetryableStatus(cfResponse.status)) {
-			return { success: false, status: cfResponse.status, error };
-		}
-		return { retry: true, error, status: cfResponse.status };
-	});
+			return { audioBuffer, contentType };
+		},
+		env,
+		{ raw: true }
+	);
 
 	if (!result.success) {
 		return jsonError(`All Cloudflare accounts failed. Last error: ${result.error}`, result.status, "server_error");
@@ -2406,9 +2501,16 @@ async function handleAudioSpeech(request, env, ctx) {
 	});
 }
 
+// Token 计数 /v1/messages/count_tokens（近似估算）
 async function handleCountTokens(request, env) {
-	const body = await parseJSONBody(request);
-	if (!body) return anthropicError("Request body too large or invalid");
+	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+	if (contentLength > 10 * 1024 * 1024) {
+		return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	}
+	const body = await safeJsonBody(request);
+	if (!body) {
+		return anthropicError("Invalid JSON body");
+	}
 
 	if (!body.messages || !Array.isArray(body.messages)) {
 		return anthropicError('messages field is required and must be an array.');
@@ -2592,20 +2694,23 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 	}
 }
 
+// 管理面板 API 路由
+// 安全解析 JSON body，非法 JSON 返回 null 而非抛异常（避免冒泡到 Workers 运行时）
+// JSON 请求体最大大小（MB），参照 new-api 的 MaxRequestBodyMB（默认 128MB）
 const MAX_REQUEST_BODY_MB = 128;
 
 async function safeJsonBody(request) {
+	// 检查 Content-Type 是否为 JSON
 	const ct = request.headers.get('Content-Type') || '';
-	if (!ct.includes('application/json') && !ct.includes('text/plain')) return null;
+	if (!ct.includes('application/json') && !ct.includes('text/plain')) {
+		return null;
+	}
+	// 限制请求体大小，防止超大 JSON 耗尽内存（参照 new-api 的 request body limit）
 	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
-	if (contentLength > MAX_REQUEST_BODY_MB * 1024 * 1024) return null;
+	if (contentLength > MAX_REQUEST_BODY_MB * 1024 * 1024) {
+		return null;
+	}
 	try { return await request.json(); } catch { return null; }
-}
-
-async function parseJSONBody(request) {
-	const cl = parseInt(request.headers.get('Content-Length') || '0', 10);
-	if (cl > 10 * 1024 * 1024) return null;
-	return safeJsonBody(request);
 }
 
 async function handleDashboardApi(request, env, ctx) {
@@ -2854,7 +2959,11 @@ async function handleDashboardApi(request, env, ctx) {
 
 					const res = await fetch(`https://api.cloudflare.com/client/v4/graphql`, {
 						method: 'POST',
-						headers: browserHeaders(targetApiToken),
+						headers: {
+							'Authorization': `Bearer ${targetApiToken}`,
+							'Content-Type': 'application/json',
+							'User-Agent': randomUA(),
+						},
 						body: JSON.stringify({
 							query,
 							variables: {
@@ -2862,7 +2971,7 @@ async function handleDashboardApi(request, env, ctx) {
 								start: startToday
 							}
 						}),
-						signal: AbortSignal.timeout(30000),
+						signal: AbortSignal.timeout(15000),
 					});
 					const data = await res.json();
 					if (res.ok && !data.errors && data.data?.viewer?.accounts) {
@@ -3241,6 +3350,7 @@ const SHARED_JS = `
 			});
 		}`;
 
+// 各页面共享的 CSS（背景装饰 orb 容器 + orb 样式 + float 动画）
 const SHARED_BG_CSS = `
 		.bg-orbs-container {
 			position: fixed;
@@ -3371,6 +3481,7 @@ const SHARED_THEME_CSS = `
 		}
 `;
 
+// 两个页面共享的 Toast 样式
 const SHARED_TOAST_CSS = `
 		.toast-container {
 			position: fixed;
@@ -5516,7 +5627,6 @@ async function handleAdminPage(request, env, ctx) {
 			loadUsageDetails();
 			loadTokenStats();
 			// 每秒更新"距上次刷新"的相对时间，并在每天 0:03 触发自动刷新
-			let _midnightRefreshed = false;
 			refreshTimer = setInterval(() => {
 				const lastFetchedRaw = localStorage.getItem('cache_usage_details_last_fetched');
 				const lastFetched = lastFetchedRaw ? parseInt(lastFetchedRaw, 10) : 0;
@@ -5527,13 +5637,8 @@ async function handleAdminPage(request, env, ctx) {
 				const h = new Date().getUTCHours();
 				const m = new Date().getUTCMinutes();
 				if (h === 0 && m >= 2 && m <= 5) {
-					if (!_midnightRefreshed) {
-						_midnightRefreshed = true;
-						loadUsageDetails(true);
-						loadTokenStats();
-					}
-				} else {
-					_midnightRefreshed = false;
+					loadUsageDetails(true);
+					loadTokenStats();
 				}
 			}, 1000);
 		};
