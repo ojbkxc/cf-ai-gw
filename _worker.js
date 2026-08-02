@@ -6139,7 +6139,7 @@ async function handleAdminPage(request, env, ctx) {
 					<td>
 						<div style="display:flex; align-items:center; gap:8px;">
 							<code id="key-val-\${k.id}">\${k.key.length > 6 ? k.key.substring(0, 5) + '...' + k.key.substring(k.key.length - 1) : k.key.substring(0, Math.min(3, k.key.length)) + '...'}</code>
-							<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" onclick="copyKeyText('\${attrEscape(k.key)}')">复制</button>
+							<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" onclick="copyKeyText(\${attrEscape(k.key)})">复制</button>
 						</div>
 					</td>
 					<td>\${dateStr}</td>
@@ -6224,11 +6224,11 @@ async function handleAdminPage(request, env, ctx) {
 					const typeText = isPreset ? '<span class="badge badge-success">预设映射</span>' : '<span class="badge badge-warning">自定义</span>';
 					const tr = document.createElement('tr');
 					tr.innerHTML = \`
-					<td><code style="cursor: pointer;" title="点击复制" onclick="copyModelId('\${attrEscape(source)}')">\${escapeHtml(source)}</code></td>
-					<td><code style="cursor: pointer;" title="点击复制" onclick="copyModelId('\${attrEscape(target)}')">\${escapeHtml(target)}</code></td>
+					<td><code style="cursor: pointer;" title="点击复制" onclick="copyModelId(\${attrEscape(source)})">\${escapeHtml(source)}</code></td>
+					<td><code style="cursor: pointer;" title="点击复制" onclick="copyModelId(\${attrEscape(target)})">\${escapeHtml(target)}</code></td>
 					<td>\${typeText}</td>
 					<td>
-							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteMapping('\${attrEscape(source)}')">删除</button>
+							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteMapping(\${attrEscape(source)})">删除</button>
 						</td>
 					\`;
 					tbody.appendChild(tr);
