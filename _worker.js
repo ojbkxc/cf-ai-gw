@@ -2218,6 +2218,10 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 
 // 向量嵌入
 async function handleEmbeddings(request, env, ctx) {
+	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+	if (contentLength > 10 * 1024 * 1024) {
+		return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	}
 	const body = await safeJsonBody(request);
 	if (!body) {
 		return jsonError("Invalid JSON body", 400, "invalid_request_error");
@@ -2237,7 +2241,7 @@ async function handleEmbeddings(request, env, ctx) {
 		cfModel,
 		(account) => ({
 			method: 'POST',
-			headers: { 'Authorization': `Bearer ${account.apiToken}`, 'Content-Type': 'application/json' },
+			headers: browserHeaders(account.apiToken),
 			body: JSON.stringify({ text: textArray }),
 		}),
 		(cfResult) => {
@@ -2272,6 +2276,10 @@ async function handleEmbeddings(request, env, ctx) {
 // 图片生成 /v1/images/generations
 async function handleImageGenerations(request, env, ctx) {
 	const requestStartTime = Date.now();
+	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+	if (contentLength > 10 * 1024 * 1024) {
+		return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	}
 	const body = await safeJsonBody(request);
 	if (!body) {
 		return jsonError("Invalid JSON body", 400, "invalid_request_error");
@@ -2302,7 +2310,7 @@ async function handleImageGenerations(request, env, ctx) {
 			if (cfModel.includes('flux')) cfPayload.num_steps = 4;
 			return {
 				method: 'POST',
-				headers: { 'Authorization': `Bearer ${account.apiToken}`, 'Content-Type': 'application/json' },
+				headers: browserHeaders(account.apiToken),
 				body: JSON.stringify(cfPayload),
 			};
 		},
@@ -2414,6 +2422,10 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 
 // 文本转语音 /v1/audio/speech
 async function handleAudioSpeech(request, env, ctx) {
+	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+	if (contentLength > 10 * 1024 * 1024) {
+		return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	}
 	const body = await safeJsonBody(request);
 	if (!body) {
 		return jsonError("Invalid JSON body", 400, "invalid_request_error");
@@ -2472,6 +2484,10 @@ async function handleAudioSpeech(request, env, ctx) {
 
 // Token 计数 /v1/messages/count_tokens（近似估算）
 async function handleCountTokens(request, env) {
+	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+	if (contentLength > 10 * 1024 * 1024) {
+		return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	}
 	const body = await safeJsonBody(request);
 	if (!body) {
 		return anthropicError("Invalid JSON body");
