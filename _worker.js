@@ -2873,12 +2873,8 @@ async function handleDashboardApi(request, env, ctx) {
 				try {
 					const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${targetAccountId}/ai/models/search?limit=1`, {
 						method: 'GET',
-						headers: {
-							'Authorization': `Bearer ${targetApiToken}`,
-							'Content-Type': 'application/json',
-							'User-Agent': randomUA(),
-						},
-						signal: AbortSignal.timeout(10000),
+						headers: browserHeaders(targetApiToken),
+						signal: AbortSignal.timeout(30000),
 					});
 					const data = await res.json();
 					if (res.ok && data.success !== false) {
@@ -2893,13 +2889,9 @@ async function handleDashboardApi(request, env, ctx) {
 				try {
 					const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${targetAccountId}/ai/run/@cf/google/embeddinggemma-300m`, {
 						method: 'POST',
-						headers: {
-							'Authorization': `Bearer ${targetApiToken}`,
-							'Content-Type': 'application/json',
-							'User-Agent': randomUA(),
-						},
+						headers: browserHeaders(targetApiToken),
 						body: JSON.stringify({ text: ['test'] }),
-						signal: AbortSignal.timeout(15000),
+						signal: AbortSignal.timeout(30000),
 					});
 					const data = await res.json();
 					if (res.ok && data.success !== false) {
@@ -4491,10 +4483,12 @@ async function handleAdminPage(request, env, ctx) {
 
 		.usage-progress-container {
 			width: 100%;
-			height: 6px;
+			height: 10px;
 			background-color: rgba(255, 255, 255, 0.06);
-			border-radius: 3px;
+			border-radius: 5px;
 			overflow: hidden;
+			margin: 10px 0 6px;
+			box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.15);
 		}
 
 		:root[data-theme="light"] .usage-progress-container {
@@ -4503,10 +4497,13 @@ async function handleAdminPage(request, env, ctx) {
 
 		.usage-progress-bar {
 			height: 100%;
-			background: var(--primary-gradient);
-			border-radius: 3px;
+			border-radius: 5px;
 			transition: width 1.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+			box-shadow: 0 0 6px rgba(168, 85, 247, 0.3), 0 1px 2px rgba(0, 0, 0, 0.1);
 		}
+		.usage-progress-bar[data-level="ok"] { background: linear-gradient(135deg, var(--primary-color), var(--accent-color)); }
+		.usage-progress-bar[data-level="warn"] { background: linear-gradient(135deg, #f59e0b, #f97316); box-shadow: 0 0 6px rgba(245, 158, 11, 0.3); }
+		.usage-progress-bar[data-level="danger"] { background: linear-gradient(135deg, #ef4444, #dc2626); box-shadow: 0 0 6px rgba(239, 68, 68, 0.3); }
 
 		/* Section Cards */
 		.section-card {
@@ -4684,6 +4681,16 @@ async function handleAdminPage(request, env, ctx) {
 
 		.card-update-flash {
 			animation: flash-green 2s cubic-bezier(0.25, 1, 0.5, 1);
+		}
+
+		/* 倒计时样式 */
+		.refresh-countdown {
+			font-size: 11px;
+			color: var(--text-muted);
+			font-family: monospace;
+			min-width: 28px;
+			text-align: center;
+			opacity: 0.7;
 		}
 
 		/* Tables */
@@ -4914,7 +4921,7 @@ async function handleAdminPage(request, env, ctx) {
 								</div>
 							</div>
 						</div>
-						<div id="accounts-usage-list" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; margin-top: 12px;">
+						<div id="accounts-usage-list" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 12px; margin-top: 16px;">
 						</div>
 					</div>
 
@@ -5262,19 +5269,15 @@ async function handleAdminPage(request, env, ctx) {
 
 			const usageList = document.getElementById('accounts-usage-list');
 
-			// 记录刷新前已有卡片的最后更新时间戳
-			const previousTimestamps = new Map();
-			usageList.querySelectorAll('.section-card').forEach(card => {
-				const id = card.dataset.id;
-				const ts = parseInt(card.dataset.lastUpdated || '0', 10);
-				if (id) previousTimestamps.set(id, ts);
+			// 增量更新：复用已有卡片，避免 innerHTML='' 导致全量闪烁
+			const existingCards = new Map();
+			usageList.querySelectorAll('[data-account-id]').forEach(card => {
+				existingCards.set(card.dataset.accountId, card);
 			});
-
-			usageList.innerHTML = '';
+			const newAccountIds = new Set();
 
 			if (accounts.length === 0) {
 				usageList.innerHTML = '<div style="color: var(--text-muted); font-size:14px; text-align:center; padding: 20px; width: 100%;">没有绑定的账号，请前往\u201c账号管理\u201d添加账号。</div>';
-				// 重置限额卡片
 				updateLimitCards(limits);
 				return;
 			}
@@ -5283,38 +5286,70 @@ async function handleAdminPage(request, env, ctx) {
 				totalUsageToday += account.usageToday;
 				totalRequestsToday += account.usageTodayRequests || 0;
 
-				// Percentage formatted to 2 decimal places（不封顶，允许超过 100%）
 			const percentage = limits.dailyLimit > 0 ? Number(((account.usageToday / limits.dailyLimit) * 100).toFixed(2)) : 0;
-				const warningClass = account.status === 'error' ? 'badge-danger' : (account.status === 'pending' ? 'badge-info' : (percentage >= 90 ? 'badge-warning' : 'badge-success'));
-				const statusText = account.status === 'error' ? '连接异常' : (account.status === 'pending' ? '待刷新' : (percentage >= 100 ? '用尽 (' + fmtLimit(limits.dailyLimit) + ')' : '正常运行'));
-				
-				// Usage rounded up (Math.ceil)
+				// ≥100% 红色，≥90% 橙色，其余绿色
+				const level = percentage >= 100 ? 'danger' : (percentage >= 90 ? 'warn' : 'ok');
+				const warningClass = account.status === 'error' ? 'badge-danger' : (account.status === 'pending' ? 'badge-info' : (level === 'danger' ? 'badge-danger' : (level === 'warn' ? 'badge-warning' : 'badge-success')));
+				const statusText = account.status === 'error' ? '连接异常' : (account.status === 'pending' ? '待刷新' : (percentage >= 100 ? '已用尽' : '正常运行'));
 				const roundedUsage = Math.ceil(account.usageToday);
-				
-				const item = document.createElement('div');
-				const isRefreshed = previousTimestamps.has(account.id) && previousTimestamps.get(account.id) !== account.lastUpdated;
-				item.className = 'section-card' + (isRefreshed ? ' card-update-flash' : '');
-				item.dataset.id = account.id;
+				newAccountIds.add(account.id);
+
+				// 7天历史总量
+				const history7d = (account.history || []).reduce((sum, h) => sum + (h.neurons || 0), 0);
+				// 本月用量（从 history 中提取当月）
+				const now = new Date();
+				const monthPrefix = now.toISOString().slice(0, 7); // "YYYY-MM"
+				const monthUsage = (account.history || []).filter(h => h.date && h.date.startsWith(monthPrefix)).reduce((sum, h) => sum + (h.neurons || 0), 0);
+				// 模型数量
+				const modelCount = (account.modelsToday || []).length;
+				// 7天请求次数
+				const requests7d = (account.history || []).reduce((sum, h) => sum + (h.requests || 0), 0);
+				// 账号ID 短格式
+				const shortId = account.accountId.length > 12
+					? account.accountId.substring(0, 6) + '...' + account.accountId.substring(account.accountId.length - 4)
+					: account.accountId;
+
+				let item = existingCards.get(account.id);
+				const isRefreshed = item && parseInt(item.dataset.lastUpdated || '0', 10) !== (account.lastUpdated || 0);
+
+				if (!item) {
+					item = document.createElement('div');
+					item.dataset.accountId = account.id;
+					item.style.padding = '16px 20px';
+					item.style.borderRadius = '14px';
+					item.style.border = '1px solid var(--border-color)';
+					item.style.backgroundColor = 'var(--card-bg)';
+					item.style.backdropFilter = 'blur(var(--glass-blur))';
+					usageList.appendChild(item);
+				} else {
+					item.className = '';
+					void item.offsetHeight;
+				}
+				if (isRefreshed) item.classList.add('card-update-flash');
 				item.dataset.lastUpdated = account.lastUpdated || 0;
-				item.style.padding = '14px 18px';
-				item.style.backgroundColor = 'rgba(255,255,255,0.01)';
 				item.innerHTML = \`
-					<div style="display:flex; justify-content:space-between; align-items:center; gap: 12px;">
+					<div style="display:flex; justify-content:space-between; align-items:center; gap: 12px; margin-bottom: 10px;">
 						<div style="min-width: 0; flex: 1; display: flex; align-items: center; gap: 8px;">
 							<strong style="font-size:14px; font-weight:600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto;" title="\${escapeHtml(account.name)}">\${escapeHtml(account.name)}</strong>
-							<span style="font-size:11px; color: var(--text-muted); font-family: monospace; white-space: nowrap; flex-shrink: 0;">(\${escapeHtml(account.accountId.substring(0,6))}...\${escapeHtml(account.accountId.substring(account.accountId.length-4))})</span>
+							<span style="font-size:10px; color: var(--text-muted); font-family: monospace; white-space: nowrap; flex-shrink: 0;">\${escapeHtml(shortId)}</span>
 						</div>
-						<span class="badge \${warningClass}" style="flex-shrink: 0;">\${statusText} · \${percentage.toFixed(2)}%</span>
+						<span class="badge \${warningClass}" style="flex-shrink: 0; font-size: 10px; padding: 3px 8px;">\${statusText} · \${percentage.toFixed(2)}%</span>
 					</div>
 					<div class="usage-progress-container">
-						<div class="usage-progress-bar" style="width: \${Math.min(100, percentage)}%;"></div>
+						<div class="usage-progress-bar" data-level="\${level}" style="width: \${Math.min(100, percentage)}%;"></div>
 					</div>
-					<div style="display:flex; justify-content:space-between; font-size:12px; color: var(--text-muted);">
-						<span>今日已用: \${fmtLimit(roundedUsage)} / \${fmtLimit(limits.dailyLimit)} Neurons</span>
+					<div style="display:grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px 12px; font-size:11px; color: var(--text-muted); margin-top: 10px;">
+						<div><span style="opacity:0.6;">今日</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtLimit(roundedUsage)}</strong> <span style="opacity:0.5;">N</span></div>
+						<div><span style="opacity:0.6;">今日请求</span><br><strong style="color: var(--text-color); font-size: 13px;">\${(account.usageTodayRequests || 0).toLocaleString()}</strong></div>
+						<div><span style="opacity:0.6;">7日总量</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtLimit(history7d)}</strong> <span style="opacity:0.5;">N</span></div>
+						<div><span style="opacity:0.6;">7日请求</span><br><strong style="color: var(--text-color); font-size: 13px;">\${requests7d.toLocaleString()}</strong></div>
+						<div><span style="opacity:0.6;">本月用量</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtLimit(monthUsage)}</strong> <span style="opacity:0.5;">N</span></div>
+						<div><span style="opacity:0.6;">日限额</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtLimit(limits.dailyLimit)}</strong> <span style="opacity:0.5;">N</span></div>
+						<div><span style="opacity:0.6;">模型数</span><br><strong style="color: var(--text-color); font-size: 13px;">\${modelCount}</strong></div>
+						<div><span style="opacity:0.6;">状态</span><br><strong style="color: \${level === 'danger' ? '#ef4444' : (level === 'warn' ? '#f59e0b' : '#22c55e')}; font-size: 13px;">\${statusText}</strong></div>
 					</div>
 					\${account.error ? \`<div style="color: var(--danger-color); font-size:11px; margin-top: 8px; background: rgba(239,68,68,0.08); padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(239,68,68,0.12);">错误信息: \${escapeHtml(account.error)}</div>\` : ''}
 				\`;
-				usageList.appendChild(item);
 
 				if (account.history) {
 					account.history.forEach(h => {
@@ -5327,6 +5362,11 @@ async function handleAdminPage(request, env, ctx) {
 						modelsToday[m.model] = (modelsToday[m.model] || 0) + m.neurons;
 					});
 				}
+			});
+
+			// 清理已不存在的账号卡片
+			existingCards.forEach((card, id) => {
+				if (!newAccountIds.has(id)) card.remove();
 			});
 
 			// Top stats formatting
@@ -5423,8 +5463,11 @@ async function handleAdminPage(request, env, ctx) {
 		}
 
 
+		const AUTO_REFRESH_INTERVAL = 60000; // 60s 自动刷新
+		let autoRefreshRemaining = AUTO_REFRESH_INTERVAL / 1000;
+		let autoRefreshTimer = null;
+
 		async function loadUsageDetails(isManual = false) {
-			// 如果已经在刷新中，则直接返回，避免并发请求
 			if (isRefreshingUsage) return;
 
 			const now = Date.now();
@@ -5449,9 +5492,8 @@ async function handleAdminPage(request, env, ctx) {
 			// 更新文字显示
 			updateLastUpdatedText(lastFetched);
 
-			// 如果不是手动刷新，且最后更新时间在 15 分钟以内，则直接使用缓存，不发起 API 请求
-			if (!isManual && lastFetched && (now - lastFetched) < 15 * 60 * 1000) {
-				console.log('Skipping auto refresh, last fetch was ' + Math.round((now - lastFetched) / 1000) + 's ago');
+			// 自动刷新：距上次不到 60s 则跳过（从 15min 改为 60s）
+			if (!isManual && lastFetched && (now - lastFetched) < AUTO_REFRESH_INTERVAL) {
 				return;
 			}
 
@@ -5466,24 +5508,23 @@ async function handleAdminPage(request, env, ctx) {
 			isRefreshingUsage = true;
 
 			try {
-				const res = await apiFetch('/api/accounts/usage');
-				const data = await res.json();
-				
+				// 并行请求账号用量和 API 密钥数
+				const [usageRes, keysRes] = await Promise.all([
+					apiFetch('/api/accounts/usage'),
+					apiFetch('/api/keys')
+				]);
+				const data = await usageRes.json();
+				const keys = await keysRes.json();
+
 				// 渲染最新的实时数据
 				renderUsageDetails(data);
-				
+				document.getElementById('stat-keys-count').innerText = keys.length;
+
 				// 保存/更新本地缓存
 				localStorage.setItem('cache_accounts_usage', JSON.stringify(data));
-
-				// 记录更新时间戳，并更新文字
+				localStorage.setItem('cache_keys_count', keys.length);
 				localStorage.setItem('cache_usage_details_last_fetched', now);
 				updateLastUpdatedText(now);
-
-				// 刷新并缓存 API 密钥数
-				const keysRes = await apiFetch('/api/keys');
-				const keys = await keysRes.json();
-				document.getElementById('stat-keys-count').innerText = keys.length;
-				localStorage.setItem('cache_keys_count', keys.length);
 
 			} catch (e) {
 				console.error(e);
@@ -5536,11 +5577,24 @@ async function handleAdminPage(request, env, ctx) {
 			}
 			loadUsageDetails();
 			loadTokenStats();
-			// 每 30 秒自动刷新数据
-			setInterval(() => {
-				loadUsageDetails();
-				loadTokenStats();
-			}, 30000);
+			// 每秒更新"距上次刷新"的相对时间，到时间自动触发刷新
+			autoRefreshTimer = setInterval(() => {
+				const lastFetchedRaw = localStorage.getItem('cache_usage_details_last_fetched');
+				const lastFetched = lastFetchedRaw ? parseInt(lastFetchedRaw, 10) : 0;
+				if (lastFetched) {
+					updateLastUpdatedText(lastFetched);
+				}
+				autoRefreshRemaining--;
+				if (autoRefreshRemaining <= 0) {
+					// 每天 0:02~0:05 之间强制刷新（跨天数据重置）
+					const h = new Date().getHours();
+					const m = new Date().getMinutes();
+					const isJustPastMidnight = h === 0 && m >= 2 && m <= 5;
+					loadUsageDetails(isJustPastMidnight);
+					loadTokenStats();
+					autoRefreshRemaining = AUTO_REFRESH_INTERVAL / 1000;
+				}
+			}, 1000);
 		};
 
 		function toggleSidebar() {
