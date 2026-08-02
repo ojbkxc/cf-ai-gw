@@ -11,36 +11,18 @@ const DEFAULT_USAGE_THRESHOLD = 0; // 0 表示关闭限额拦截（仅统计不�
 
 // 缓存与刷新常量
 const USAGE_CACHE_TTL_MS = 600000; // 从 5min 增加到 10min，减少检测频率
-const USAGE_REFRESH_LIMIT = 3; // 控制并发查询数，避免触发 Cloudflare 风控
+const USAGE_REFRESH_LIMIT = 10; // 从 20 减少到 10，每次刷新更少账号
 const MONTHLY_USAGE_TTL_SEC = 38 * 24 * 60 * 60;
 const MODEL_CREATED_TS = 1686935000;
 
 // 随机 User-Agent 池，模拟真实浏览器请求，避免被识别为自动化脚本
 const USER_AGENTS = [
 	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
 	'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
-	'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-	'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-	'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0',
-	'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
-	'Mozilla/5.0 (X11; Linux x86_64; rv:127.0) Gecko/20100101 Firefox/127.0',
 ];
 
 function randomUA() {
 	return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
-
-// 构建带浏览器特征的请求头，避免被 Cloudflare 识别为自动化脚本
-function browserHeaders(token, contentType = 'application/json') {
-	const headers = {
-		'Authorization': `Bearer ${token}`,
-		'User-Agent': randomUA(),
-		'Accept': 'application/json',
-		'Accept-Language': 'en-US,en;q=0.9',
-	};
-	if (contentType) headers['Content-Type'] = contentType;
-	return headers;
 }
 
 // ===== 通用工具函数 =====
@@ -82,13 +64,10 @@ async function withFailover(env, onAccount) {
 		accountIndex++;
 		for (let attempt = 0; attempt < 2; attempt++) {
 			if (attempt > 0) {
-				// 指数退避 + 抖动：1s, 2s, 4s... 避免限流场景下快速耗尽重试
-				const baseDelay = 1000 * Math.pow(2, attempt - 1);
-				const jitter = Math.random() * 500;
-				await new Promise(r => setTimeout(r, baseDelay + jitter));
+				await new Promise(r => setTimeout(r, 1000));
 			}
 			try {
-				const result = await onAccount(account, attempt, accountIndex, activeAccounts);
+				const result = await onAccount(account, attempt, accountIndex);
 				if (!result.retry) return result;
 				lastError = result.error;
 				lastStatus = result.status || 502;
@@ -233,9 +212,9 @@ function createResumableStream(reader, options) {
 					if (!value || value.length === 0) continue;
 
 					pending = concat(pending, value);
-					// 限制 pending 缓冲最大 4MB，防止 SSE 流中长时间无 \n\n 边界导致内存溢出
-					if (pending.length > 4 * 1024 * 1024) {
-						controller.error(new Error('Stream buffer overflow: no SSE boundary found within 4MB'));
+					// 限制 pending 缓冲最大 1MB，防止 SSE 流中长时间无 \n\n 边界导致内存溢出
+					if (pending.length > 1024 * 1024) {
+						controller.error(new Error('Stream buffer overflow: no SSE boundary found within 1MB'));
 						return;
 					}
 					const boundary = lastEventBoundary(pending);
@@ -1116,7 +1095,11 @@ async function queryGraphQL(accountId, apiToken, startDateTime) {
 	`;
 	const response = await fetch(`https://api.cloudflare.com/client/v4/graphql`, {
 		method: 'POST',
-		headers: browserHeaders(apiToken),
+		headers: {
+			'Authorization': `Bearer ${apiToken}`,
+			'Content-Type': 'application/json',
+			'User-Agent': randomUA(),
+		},
 		body: JSON.stringify({
 			query,
 			variables: {
@@ -1124,7 +1107,7 @@ async function queryGraphQL(accountId, apiToken, startDateTime) {
 				start: startDateTime
 			}
 		}),
-		signal: AbortSignal.timeout(30000),
+		signal: AbortSignal.timeout(15000),
 	});
 
 	if (!response.ok) {
@@ -1320,15 +1303,19 @@ async function handleV1Proxy(request, env, ctx) {
 
 // 可复用的核心 API 调用：OpenAI Chat Completions → Workers AI，支持多账号 failover
 async function callOpenAICompatibleAPI(cfPayload, env, stream) {
-	return withFailover(env, async (account, attempt, accountIndex, activeAccounts) => {
+	return withFailover(env, async (account, attempt, accountIndex) => {
 		if (attempt > 0) {
 			console.warn(`[Retry] Retrying account ${accountIndex} (attempt ${attempt + 1}/2)...`);
 		}
-		const timeoutMs = stream ? 600000 : 120000;
+		const timeoutMs = stream ? 300000 : 60000;
 		const apiUrl = buildCFUrl(account, 'v1/chat/completions');
 		const cfResponse = await fetch(apiUrl, {
 			method: 'POST',
-			headers: browserHeaders(account.apiToken),
+			headers: {
+				'Authorization': `Bearer ${account.apiToken}`,
+				'Content-Type': 'application/json',
+				'User-Agent': randomUA(),
+			},
 			body: JSON.stringify(cfPayload),
 			signal: AbortSignal.timeout(timeoutMs),
 		});
@@ -1339,7 +1326,7 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 					return { retry: true, error: 'CF API returned empty response body' };
 				}
 				const streamReader = cfResponse.body.getReader();
-				const firstResult = await readWithTimeout(streamReader, 240000);
+				const firstResult = await readWithTimeout(streamReader, 120000);
 				if (firstResult.done) {
 					return { retry: true, error: 'CF API returned empty stream' };
 				}
@@ -1365,20 +1352,22 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 					cancel(reason) { try { this._reader.cancel(reason); } catch (_) {} },
 					releaseLock() { try { this._reader.releaseLock(); } catch (_) {} },
 				};
+				const retryAccount = account;
 				const retryPayload = cfPayload;
 				const resumableStream = createResumableStream(prependReader, {
 					createRetryFetch: async (emittedEvents, reconnectAttempt) => {
 						await new Promise(r => setTimeout(r, Math.min(1000 * reconnectAttempt, 5000)));
-						const retryAccount = activeAccounts && activeAccounts.length > 0
-							? activeAccounts[(accountIndex - 1 + reconnectAttempt) % activeAccounts.length]
-							: account;
-						console.warn(`[ResumableStream] Re-fetching request (attempt ${reconnectAttempt}) at event ${emittedEvents}, rotating to account index ${(accountIndex - 1 + reconnectAttempt) % (activeAccounts?.length || 1)}...`);
+						console.warn(`[ResumableStream] Re-fetching request (attempt ${reconnectAttempt}) at event ${emittedEvents}...`);
 						const retryUrl = buildCFUrl(retryAccount, 'v1/chat/completions');
 						const retryResponse = await fetch(retryUrl, {
 							method: 'POST',
-							headers: browserHeaders(retryAccount.apiToken),
+							headers: {
+								'Authorization': `Bearer ${retryAccount.apiToken}`,
+								'Content-Type': 'application/json',
+								'User-Agent': randomUA(),
+							},
 							body: JSON.stringify(retryPayload),
-							signal: AbortSignal.timeout(600000),
+							signal: AbortSignal.timeout(300000),
 						});
 						if (!retryResponse.ok || !retryResponse.body) {
 							console.error(`[ResumableStream] Retry fetch failed (status ${retryResponse.status})`);
@@ -1422,12 +1411,9 @@ async function resolveModelName(model, env) {
 async function callCFRunAPI(cfModel, buildPayload, processResult, env) {
 	return withFailover(env, async (account, attempt, accountIndex) => {
 		const cfPayload = buildPayload(account);
-		cfPayload.headers = { ...cfPayload.headers, 'User-Agent': randomUA(), 'Accept': 'application/json', 'Accept-Language': 'en-US,en;q=0.9' };
+		cfPayload.headers = { ...cfPayload.headers, 'User-Agent': randomUA() };
 		const apiUrl = buildCFUrl(account, `run/${cfModel}`);
-		const cfResponse = await fetch(apiUrl, {
-			...cfPayload,
-			signal: AbortSignal.timeout(120000),
-		});
+		const cfResponse = await fetch(apiUrl, cfPayload);
 
 		if (cfResponse.ok) {
 			const cfJson = await cfResponse.json();
@@ -1910,7 +1896,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				while (true) {
 					let result;
 					try {
-						result = await readStreamWithTimeout(reader, 240000);
+						result = await readStreamWithTimeout(reader, 120000);
 					} catch (e) {
 						// 流读取超时：模型可能正在思考，重试
 						if (e.message === 'Stream read timed out' && timeoutRetries < MAX_TIMEOUT_RETRIES) {
@@ -2228,7 +2214,7 @@ async function handleEmbeddings(request, env, ctx) {
 			method: 'POST',
 			headers: { 'Authorization': `Bearer ${account.apiToken}`, 'Content-Type': 'application/json' },
 			body: JSON.stringify({ text: textArray }),
-			signal: AbortSignal.timeout(120000),
+			signal: AbortSignal.timeout(30000),
 		}),
 		(cfResult) => {
 			const data = cfResult.data || cfResult;
@@ -2294,7 +2280,7 @@ async function handleImageGenerations(request, env, ctx) {
 				method: 'POST',
 				headers: { 'Authorization': `Bearer ${account.apiToken}`, 'Content-Type': 'application/json' },
 				body: JSON.stringify(cfPayload),
-				signal: AbortSignal.timeout(120000),
+				signal: AbortSignal.timeout(60000),
 			};
 		},
 		(cfResult) => {
@@ -2423,13 +2409,17 @@ async function handleAudioSpeech(request, env, ctx) {
 	if (body.response_format) cfPayload.response_format = body.response_format;
 	if (body.speed !== undefined) cfPayload.speed = body.speed;
 
-	const result = await withFailover(env, async (account, attempt, accountIndex) => {
+	const result = await withFailover(env, async (account) => {
 		const apiUrl = buildCFUrl(account, `run/${cfModel}`);
 		const cfResponse = await fetch(apiUrl, {
 			method: 'POST',
-			headers: browserHeaders(account.apiToken),
+			headers: {
+				'Authorization': `Bearer ${account.apiToken}`,
+				'Content-Type': 'application/json',
+				'User-Agent': randomUA(),
+			},
 			body: JSON.stringify(cfPayload),
-			signal: AbortSignal.timeout(120000),
+			signal: AbortSignal.timeout(60000),
 		});
 
 		if (cfResponse.ok) {
@@ -2550,7 +2540,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 				while (true) {
 					let result;
 					try {
-						result = await readStreamWithTimeout(reader, 240000);
+						result = await readStreamWithTimeout(reader, 120000);
 					} catch (e) {
 						// 流读取超时：模型可能正在思考，重试
 						if (e.message === 'Stream read timed out' && timeoutRetries < MAX_TIMEOUT_RETRIES) {
