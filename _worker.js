@@ -567,7 +567,6 @@ const DEFAULT_MODEL_MAP = {
 
 	// 语音识别（Whisper）模型
 	'whisper': '@cf/openai/whisper',
-	'whisper-1': '@cf/openai/whisper',
 	'whisper-tiny-en': '@cf/openai/whisper-tiny-en',
 	'whisper-large-v3-turbo': '@cf/openai/whisper-large-v3-turbo',
 
