@@ -1421,7 +1421,7 @@ async function resolveModelWithFallback(model, env) {
 }
 
 async function handleCompletions(request, env, ctx, pathname) {
-	const body = await safeJsonBody(request, 10);
+	const body = await parseJSONBody(request);
 	if (!body) return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
 
 	const requestStartTime = Date.now();
@@ -1770,7 +1770,7 @@ function convertOpenAIErrorToAnthropic(openaiError) {
 
 async function handleMessages(request, env, ctx) {
 	const requestStartTime = Date.now();
-	const anthropicBody = await safeJsonBody(request);
+	const anthropicBody = await parseJSONBody(request);
 	if (!anthropicBody) return anthropicError('Request body too large (max 10MB).');
 
 	if (!anthropicBody.messages || !Array.isArray(anthropicBody.messages)) {
@@ -2168,7 +2168,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 
 // 向量嵌入
 async function handleEmbeddings(request, env, ctx) {
-	const body = await safeJsonBody(request);
+	const body = await parseJSONBody(request);
 	if (!body) return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
 
 	const requestStartTime = Date.now();
@@ -2219,7 +2219,7 @@ async function handleEmbeddings(request, env, ctx) {
 
 async function handleImageGenerations(request, env, ctx) {
 	const requestStartTime = Date.now();
-	const body = await safeJsonBody(request);
+	const body = await parseJSONBody(request);
 	if (!body) return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
 
 	const { model, prompt, response_format } = body;
@@ -2359,7 +2359,7 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 
 // 文本转语音 /v1/audio/speech
 async function handleAudioSpeech(request, env, ctx) {
-	const body = await safeJsonBody(request);
+	const body = await parseJSONBody(request);
 	if (!body) return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
 
 	const requestStartTime = Date.now();
@@ -2414,7 +2414,7 @@ async function handleAudioSpeech(request, env, ctx) {
 }
 
 async function handleCountTokens(request, env) {
-	const body = await safeJsonBody(request);
+	const body = await parseJSONBody(request);
 	if (!body) return anthropicError("Request body too large or invalid");
 
 	if (!body.messages || !Array.isArray(body.messages)) {
@@ -2599,12 +2599,20 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 	}
 }
 
-async function safeJsonBody(request, sizeLimitMB = 128) {
+const MAX_REQUEST_BODY_MB = 128;
+
+async function safeJsonBody(request) {
 	const ct = request.headers.get('Content-Type') || '';
 	if (!ct.includes('application/json') && !ct.includes('text/plain')) return null;
 	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
-	if (contentLength > sizeLimitMB * 1024 * 1024) return null;
+	if (contentLength > MAX_REQUEST_BODY_MB * 1024 * 1024) return null;
 	try { return await request.json(); } catch { return null; }
+}
+
+async function parseJSONBody(request) {
+	const cl = parseInt(request.headers.get('Content-Length') || '0', 10);
+	if (cl > 10 * 1024 * 1024) return null;
+	return safeJsonBody(request);
 }
 
 async function handleDashboardApi(request, env, ctx) {
