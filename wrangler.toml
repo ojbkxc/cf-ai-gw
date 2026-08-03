@@ -2,41 +2,11 @@
 # 将 Cloudflare Workers AI 转成 OpenAI / Anthropic 兼容 API。
 #
 # 支持两种部署模式，按需切换 main 字段即可：
+#   模式 A（推荐，规避检查）：main = "src/index.js"  → Dashboard 需添加 AI Binding
+#   模式 B（多账号 failover）：main = "_worker.js"    → Dashboard 无需 AI Binding
 #
-#   模式 A（推荐，规避检查）：Worker + AI Binding
-#     main = "src/index.js"   + 保留下方 [ai] binding
-#     调用路径：Worker → AI Binding RPC → Workers AI（内部 RPC，不经公网）
-#
-#   模式 B（多账号 failover）：Worker / Pages + REST API
-#     main = "_worker.js"     + 注释掉下方 [ai] binding
-#     调用路径：Worker → 公网 HTTPS → api.cloudflare.com（需在面板配置账号 Token）
-#
-# 两种模式的 API 端点完全一致，客户端无感切换。
+# KV 绑定、环境变量、AI Binding 均在 Cloudflare Dashboard 中配置。
 
 name = "cf-ai-gw"
 main = "src/index.js"
 compatibility_date = "2025-08-01"
-
-# === Workers AI 绑定（仅模式 A 需要，模式 B 请注释掉）===
-[ai]
-binding = "AI"
-
-# === KV 命名空间绑定（两种模式都需要）===
-# 建议命名空间名称为 cf-ai-gw；只有 id 需要填对，binding 必须是 "KV"
-[[kv_namespaces]]
-binding = "KV"
-id = "YOUR_KV_NAMESPACE_ID"
-
-# === 环境变量 ===
-[vars]
-ADMIN_PASSWORD = "YOUR_ADMIN_PASSWORD"
-# 可选覆盖：
-# DAILY_LIMIT = 10000
-# MONTHLY_LIMIT = 100000
-# USAGE_THRESHOLD = 0
-# OVERSIZE_TOKENS = 200000
-# CB_WINDOW_MS = 10000
-# CB_FAIL_THRESHOLD = 8
-# CB_COOLDOWN_MS = 4000
-# MODEL_DOWN_FAILS = 3
-# MODEL_DOWN_AFTER_MS = 60000
