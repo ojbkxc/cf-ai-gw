@@ -346,7 +346,7 @@ function accumulateFromUsage(env, ctx, usage, requestStartTime) {
 		input: usage.prompt_tokens || 0,
 		output: usage.completion_tokens || 0,
 		reasoning: usage.reasoning_tokens || 0,
-		cacheRead: pd.cached_tokens || usage.cache_read_tokens || 0,
+		cacheRead: pd.cached_tokens ?? usage.cache_read_tokens ?? 0,
 		cacheWrite: usage.cache_write_tokens || 0,
 		durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
 	});
@@ -576,17 +576,19 @@ async function sha256(message) {
 }
 
 // KV 工具函数：配置拆分为独立键，避免单键放大
-// 使用工厂函数减少重复代码，闭包内 _promise 做同请求内去重
-// 跨请求缓存由 KV 的 cacheTtl: 60 承担
+// 使用工厂函数减少重复代码，闭包内 _promise 做同请求内去重 + 60s 跨请求缓存
 function createKVGetter(kvKey, defaultValue) {
 	let _promise = null;
+	let _promiseTime = 0;
 	return async function(env) {
-		if (_promise) return _promise;
+		const now = Date.now();
+		if (_promise && (now - _promiseTime) < 60000) return _promise;
 		_promise = (async () => {
 			const raw = await env.KV.get(kvKey, { cacheTtl: 60 });
 			return safeJSONParse(raw, defaultValue);
 		})();
-		try { return await _promise; } finally { /* keep _promise for same-request dedup */ }
+		_promiseTime = now;
+		try { return await _promise; } finally { /* keep for 60s */ }
 	};
 }
 const getAccounts = createKVGetter('cfg_accounts', []);
@@ -732,14 +734,20 @@ function generateRequestId() {
 // cancelOnTimeout: true 时超时会取消 reader（用于初始预读校验），false 时抛出可重试错误（用于流式传输持续读取）。
 function readWithTimeout(reader, timeoutMs, { cancelOnTimeout = false } = {}) {
 	let timer;
+	let timedOut = false;
 	const read = reader.read();
 	const timeout = new Promise((_, reject) => {
 		timer = setTimeout(() => {
-			if (cancelOnTimeout) { try { reader.cancel(); } catch (_) {} }
+			timedOut = true;
 			reject(new Error(cancelOnTimeout ? 'Initial read timed out' : 'Stream read timed out'));
 		}, timeoutMs);
 	});
-	return Promise.race([read, timeout]).finally(() => clearTimeout(timer));
+	return Promise.race([read, timeout]).finally(() => {
+		clearTimeout(timer);
+		if (timedOut && cancelOnTimeout) {
+			try { reader.cancel(); } catch (_) {}
+		}
+	});
 }
 
 function getEnvNum(env, key, defaultVal, parseFn) {
@@ -1840,7 +1848,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 							buffer = processLines(buffer, controller);
 							// 流结束，剩余不完整行视为完整事件发送
 							if (buffer.trim()) {
-								controller.enqueue(encoder.encode(`data: ${buffer.trim()}\n\n`));
+								controller.enqueue(encoder.encode(`${buffer.trim()}\n\n`));
 							}
 						}
 						if (!finalEventSent) {
@@ -1871,6 +1879,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 						sendFinalEvent(controller);
 					}
 				} catch (e2) { console.error('anthropicStreamTransform secondary error:', e2?.message || e2); }
+				if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 				try { controller.close(); } catch (_) { }
 			}
 		},
@@ -1907,7 +1916,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 						inputTokens = chunk.usage.prompt_tokens || 0;
 						outputTokens = chunk.usage.completion_tokens || 0;
 						reasoningTokens = chunk.usage.reasoning_tokens || 0;
-						cacheReadTokens = (chunk.usage.prompt_tokens_details?.cached_tokens || chunk.usage.cache_read_tokens || 0);
+						cacheReadTokens = (chunk.usage.prompt_tokens_details?.cached_tokens ?? chunk.usage.cache_read_tokens ?? 0);
 						cacheWriteTokens = chunk.usage.cache_write_tokens || 0;
 					}
 
@@ -2479,7 +2488,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 							buffer = processLines(buffer, controller);
 							// 流结束，剩余不完整行视为完整事件发送
 							if (buffer.trim()) {
-								controller.enqueue(encoder.encode(`data: ${buffer.trim()}\n\n`));
+								controller.enqueue(encoder.encode(`${buffer.trim()}\n\n`));
 							}
 						}
 						controller.enqueue(encoder.encode('data: [DONE]\n\n'));
@@ -2505,6 +2514,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 					}
 					controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 				} catch (e2) { console.error('passthroughStream secondary error:', e2?.message || e2); }
+				if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 				try { controller.close(); } catch (_) { }
 			}
 		},
@@ -5845,7 +5855,7 @@ async function handleAdminPage(request, env, ctx) {
 					</td>
 					<td>\${dateStr}</td>
 					<td>
-						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey('\${attrEscape(k.id)}')">删除</button>
+						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey(${attrEscape(k.id)})">删除</button>
 					</td>
 				\`;
 			}, (hasData) => {
