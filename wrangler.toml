@@ -1,28 +1,14 @@
-# cf-ai-gw — Cloudflare Worker 部署配置
-# 将 Cloudflare Workers AI 转成 OpenAI / Anthropic 兼容 API。
-#
-# 支持两种部署模式，按需切换 main 字段即可：
-#
-#   模式 A（推荐，规避检查）：Worker + AI Binding
-#     main = "src/index.js"   + 保留下方 [ai] binding
-#     调用路径：Worker → AI Binding RPC → Workers AI（内部 RPC，不经公网）
-#
-#   模式 B（多账号 failover）：Worker / Pages + REST API
-#     main = "_worker.js"     + 注释掉下方 [ai] binding
-#     调用路径：Worker → 公网 HTTPS → api.cloudflare.com（需在面板配置账号 Token）
-#
-# 两种模式的 API 端点完全一致，客户端无感切换。
+# cf-ai-gw — 模式 B：REST API（多账号 failover）
+# 此分支由 create-deploy-rest-branch.sh 自动创建
+# 调用路径：Worker → 公网 HTTPS → api.cloudflare.com
 
 name = "cf-ai-gw"
-main = "src/index.js"
+main = "_worker.js"
 compatibility_date = "2025-08-01"
 
-# === Workers AI 绑定（仅模式 A 需要，模式 B 请注释掉）===
-[ai]
-binding = "AI"
+# 注意：模式 B 不需要 [ai] binding，通过 REST API 调用，需在面板配置账号 Token
 
-# === KV 命名空间绑定（两种模式都需要）===
-# KV 命名空间的创建名称可随意，只有 id 需要填对；binding 必须是 "KV"
+# === KV 命名空间绑定 ===
 [[kv_namespaces]]
 binding = "KV"
 id = "YOUR_KV_NAMESPACE_ID"
@@ -30,13 +16,3 @@ id = "YOUR_KV_NAMESPACE_ID"
 # === 环境变量 ===
 [vars]
 ADMIN_PASSWORD = "YOUR_ADMIN_PASSWORD"
-# 可选覆盖：
-# DAILY_LIMIT = 10000
-# MONTHLY_LIMIT = 100000
-# USAGE_THRESHOLD = 0
-# OVERSIZE_TOKENS = 200000
-# CB_WINDOW_MS = 10000
-# CB_FAIL_THRESHOLD = 8
-# CB_COOLDOWN_MS = 4000
-# MODEL_DOWN_FAILS = 3
-# MODEL_DOWN_AFTER_MS = 60000
