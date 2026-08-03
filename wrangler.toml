@@ -1,0 +1,44 @@
+# Managed relay —— Cloudflare Worker 部署配置
+# 说明：account_id / KV id / 域名 已改为占位符，其余与线上一字不差。
+
+name = "managed-relay"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+account_id = "PLACEHOLDER_CF_ACCOUNT_ID"
+
+# ↓↓↓ 这就是 Workers AI 的绑定声明，代码里的 env.AI 由它而来 ↓↓↓
+[ai]
+binding = "AI"
+
+[vars]
+SENTINEL_DATASET = "sentinel_relay_events"
+
+[[kv_namespaces]]
+binding = "STORE"
+id = "PLACEHOLDER_KV_NAMESPACE_ID"
+
+[[analytics_engine_datasets]]
+binding = "SENTINEL_AE"
+dataset = "sentinel_relay_events"
+
+[[routes]]
+pattern = "relay.example.com"
+custom_domain = true
+
+[[durable_objects.bindings]]
+name = "SENTINEL_ROLLUP"
+class_name = "SentinelRollup"
+
+[[durable_objects.bindings]]
+name = "GLOBAL_LIMITER"
+class_name = "GlobalLimiter"
+
+[[migrations]]
+tag = "sentinel_rollup_v1"
+new_sqlite_classes = ["SentinelRollup"]
+
+# 3021 根治：全局令牌桶 DO。默认不设 GLOBAL_RPM_LIMIT = 功能关(行为同旧版)；
+# soak 先设 GLOBAL_RPM_LIMIT 验证，再金丝雀、再全网。内存桶不写存储(new_sqlite_classes 仅为满足 CF 新账号的建仓要求)。
+[[migrations]]
+tag = "global_limiter_v1"
+new_sqlite_classes = ["GlobalLimiter"]
