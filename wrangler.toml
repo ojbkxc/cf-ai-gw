@@ -8,5 +8,5 @@
 # KV 绑定、环境变量、AI Binding 均在 Cloudflare Dashboard 中配置。
 
 name = "cf-ai-gw"
-main = "src/index.js"
+main = "_worker.js"
 compatibility_date = "2025-08-01"
