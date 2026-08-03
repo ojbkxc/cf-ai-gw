@@ -1,4 +1,4 @@
-/**
+﻿/**
  * cf-ai-gw (Binding Edition)
  * 使用 Workers AI Binding 的单账号版本，用 env.AI.run() 替代 REST API 调用。
  * 无多账号 failover，无账号管理，直接使用 Worker 绑定的 AI 服务。
