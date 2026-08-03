@@ -2039,3 +2039,3005 @@ async function handleDashboardApi(request, env, ctx) {
 
 	return new Response(JSON.stringify({ error: 'Endpoint not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
 }
+
+
+
+const SHARED_JS = `
+		function showToast(message, type = 'success') {
+			let container = document.querySelector('.toast-container');
+			if (!container) {
+				container = document.createElement('div');
+				container.className = 'toast-container';
+				document.body.appendChild(container);
+			}
+
+			const toast = document.createElement('div');
+			toast.className = \`toast toast-\${type}\`;
+			
+			let iconSvg = '';
+			if (type === 'success') {
+				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>\`;
+			} else if (type === 'error') {
+				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>\`;
+			} else {
+				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>\`;
+			}
+
+			toast.innerHTML = iconSvg;
+			const msgSpan = document.createElement('span');
+			msgSpan.textContent = message;
+			toast.appendChild(msgSpan);
+			container.appendChild(toast);
+
+			toast.offsetHeight; // trigger reflow
+			toast.classList.add('show');
+
+			setTimeout(() => {
+				toast.classList.remove('show');
+				setTimeout(() => toast.remove(), 400);
+			}, 3000);
+		}
+
+		function initTheme() {
+			const savedTheme = localStorage.getItem('theme');
+			if (savedTheme) {
+				document.documentElement.setAttribute('data-theme', savedTheme);
+			} else {
+				const systemPrefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+				const defaultTheme = systemPrefersDark ? 'dark' : 'light';
+				document.documentElement.setAttribute('data-theme', defaultTheme);
+			}
+			updateThemeIcons();
+		}
+
+		function updateThemeIcons() {
+			const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+			const sunIcons = document.querySelectorAll('.theme-icon-sun');
+			const moonIcons = document.querySelectorAll('.theme-icon-moon');
+			if (currentTheme === 'light') {
+				sunIcons.forEach(el => el.style.display = 'none');
+				moonIcons.forEach(el => el.style.display = 'block');
+			} else {
+				sunIcons.forEach(el => el.style.display = 'block');
+				moonIcons.forEach(el => el.style.display = 'none');
+			}
+		}
+
+		function escapeHtml(str) {
+			if (str === null || str === undefined) return '';
+			return String(str)
+				.replace(/&/g, '&amp;')
+				.replace(/</g, '&lt;')
+				.replace(/>/g, '&gt;')
+				.replace(/"/g, '&quot;')
+				.replace(/'/g, '&#39;');
+		}
+
+		function attrEscape(str) {
+			return escapeHtml(JSON.stringify(String(str)));
+		}
+
+		async function copyText(text, msg) {
+			try {
+				await navigator.clipboard.writeText(text);
+				showToast(msg || '已复制！');
+			} catch (_) {
+				showToast('复制失败，请手动复制', 'error');
+			}
+		}
+
+		async function deleteResource(apiPath, id, loadFn, successMsg, errorMsg) {
+			const res = await apiFetch(apiPath + encodeURIComponent(id), { method: 'DELETE' });
+			if (res.ok) { loadFn(); showToast(successMsg); }
+			else { showToast(errorMsg || '删除失败', 'error'); }
+		}
+
+		// 共享的 toggleTheme（通过回调参数在主题切换后触发页面特定的重渲染）
+		function toggleTheme(onThemeChange) {
+			const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+			const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+			document.documentElement.setAttribute('data-theme', newTheme);
+			localStorage.setItem('theme', newTheme);
+			updateThemeIcons();
+			if (typeof onThemeChange === 'function') onThemeChange();
+		}
+
+		// 共享的图表 Legend 渲染函数
+		const CHART_COLORS = ['#6366f1', '#a855f7', '#ec4899', '#10b981', '#f59e0b', '#3b82f6'];
+		function renderChartLegend(legendContainer, labels, data, fullLabels) {
+			if (!legendContainer) return;
+			legendContainer.innerHTML = '';
+			const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+			const textColor = isLight ? '#64748b' : '#94a3b8';
+			const total = data.reduce((a, b) => a + b, 0);
+
+			labels.forEach((label, index) => {
+				const val = data[index];
+				const color = CHART_COLORS[index % CHART_COLORS.length];
+				const pct = total > 0 ? ((val / total) * 100).toFixed(1) : '0.0';
+				const title = fullLabels ? fullLabels[index] : label;
+
+				const item = document.createElement('div');
+				item.style.display = 'flex';
+				item.style.alignItems = 'center';
+				item.style.gap = '8px';
+				item.style.fontSize = '12px';
+				item.style.color = textColor;
+				item.style.opacity = '0';
+				item.style.transform = 'translateX(10px)';
+				item.style.transition = 'all 0.4s cubic-bezier(0.16, 1, 0.3, 1)';
+
+				item.innerHTML = '<span style="width: 8px; height: 8px; border-radius: 50%; background-color: ' + color + '; flex-shrink: 0; margin-right: 2px;"></span>' +
+					'<span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; font-weight: 500;" title="' + escapeHtml(title) + '">' + escapeHtml(label) + '</span>' +
+					'<span style="color: var(--text-muted); font-family: monospace; font-size: 11px; flex-shrink: 0; margin-left: 4px;">' + pct + '%</span>';
+
+				legendContainer.appendChild(item);
+				setTimeout(() => {
+					item.style.opacity = '1';
+					item.style.transform = 'translateX(0)';
+				}, index * 80);
+			});
+		}
+
+		function createDoughnutChart(canvasId, labels, data, borderColor) {
+			const ctx = document.getElementById(canvasId).getContext('2d');
+			return new Chart(ctx, {
+				type: 'doughnut',
+				data: {
+					labels: labels,
+					datasets: [{
+						data: data,
+						backgroundColor: ['#6366f1', '#a855f7', '#ec4899', '#10b981', '#f59e0b', '#3b82f6'],
+						borderWidth: 2,
+						borderColor: borderColor
+					}]
+				},
+				options: {
+					responsive: true,
+					maintainAspectRatio: false,
+					cutout: '70%',
+					animation: {
+						animateRotate: true,
+						animateScale: true,
+						duration: 1000,
+						easing: 'easeOutQuart'
+					},
+					plugins: {
+						legend: { display: false }
+					}
+				}
+			});
+		}`;
+
+const SHARED_BG_CSS = `
+		.bg-orbs-container {
+			position: fixed;
+			top: 0;
+			left: 0;
+			width: 100%;
+			height: 100%;
+			z-index: -1;
+			overflow: hidden;
+			pointer-events: none;
+		}
+
+		.bg-orb {
+			position: absolute;
+			border-radius: 50%;
+			filter: blur(100px);
+		}
+
+		.bg-orb-1 { top: -10%; left: -10%; width: 50vw; height: 50vw; background: var(--orb-1-color); }
+		.bg-orb-2 { bottom: -10%; right: -10%; width: 60vw; height: 60vw; background: var(--orb-2-color); }`;
+
+// 两个页面共享的图表 wrapper CSS（含移动端响应式）
+const SHARED_CHART_CSS = `
+		.public-chart-wrapper {
+			position: relative;
+			height: 190px;
+			width: 100%;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			gap: 40px;
+			overflow: hidden;
+		}
+
+		.public-chart-wrapper canvas {
+			max-width: 100% !important;
+		}
+
+		.chart-legend {
+			scrollbar-width: none;
+			-ms-overflow-style: none;
+		}
+		.chart-legend::-webkit-scrollbar {
+			display: none;
+		}
+
+		@media (max-width: 768px) {
+			.public-chart-wrapper {
+				flex-direction: column !important;
+				height: auto !important;
+				padding: 10px 0;
+				gap: 20px !important;
+			}
+			.public-chart-wrapper > div:first-child {
+				width: 160px !important;
+				height: 160px !important;
+			}
+			.public-chart-wrapper > div:nth-child(2) {
+				width: 100% !important;
+				height: auto !important;
+				align-items: center !important;
+			}
+			.chart-legend {
+				width: 100%;
+				display: grid !important;
+				grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+				gap: 8px !important;
+				max-height: none !important;
+			}
+		}`;
+const SHARED_THEME_CSS = `
+		:root {
+			--bg-color: #0b0f19;
+			--card-bg: rgba(30, 41, 59, 0.45);
+			--border-color: rgba(255, 255, 255, 0.08);
+			--text-main: #f8fafc;
+			--text-muted: #94a3b8;
+			--primary-gradient: linear-gradient(135deg, #6366f1 0%, #a855f7 50%, #ec4899 100%);
+			--accent-color: #a855f7;
+			--input-bg: rgba(15, 23, 42, 0.6);
+			--input-border: rgba(255, 255, 255, 0.1);
+			--input-text: #f8fafc;
+			--btn-secondary-bg: rgba(255, 255, 255, 0.06);
+			--btn-secondary-hover: rgba(255, 255, 255, 0.12);
+			--btn-secondary-text: #f8fafc;
+			--modal-overlay-bg: rgba(8, 10, 18, 0.6);
+			--glass-blur: 20px;
+			--card-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+			--orb-1-color: rgba(99, 102, 241, 0.15);
+			--orb-2-color: rgba(236, 72, 153, 0.12);
+		}
+
+		:root[data-theme="light"] {
+			--bg-color: #f1f5f9;
+			--card-bg: rgba(255, 255, 255, 0.7);
+			--border-color: rgba(0, 0, 0, 0.06);
+			--text-main: #0f172a;
+			--text-muted: #64748b;
+			--primary-gradient: linear-gradient(135deg, #4f46e5 0%, #9333ea 50%, #db2777 100%);
+			--accent-color: #9333ea;
+			--input-bg: rgba(241, 245, 249, 0.8);
+			--input-border: rgba(0, 0, 0, 0.08);
+			--input-text: #0f172a;
+			--btn-secondary-bg: rgba(0, 0, 0, 0.04);
+			--btn-secondary-hover: rgba(0, 0, 0, 0.08);
+			--btn-secondary-text: #0f172a;
+			--modal-overlay-bg: rgba(241, 245, 249, 0.5);
+			--glass-blur: 20px;
+			--card-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.07);
+			--orb-1-color: rgba(99, 102, 241, 0.08);
+			--orb-2-color: rgba(236, 72, 153, 0.06);
+		}
+
+		* {
+			box-sizing: border-box;
+			margin: 0;
+			padding: 0;
+		}
+
+		.hidden {
+			display: none !important;
+		}
+`;
+
+const SHARED_TOAST_CSS = `
+		.toast-container {
+			position: fixed;
+			top: 24px;
+			right: 24px;
+			display: flex;
+			flex-direction: column;
+			gap: 10px;
+			z-index: 9999;
+			pointer-events: none;
+		}
+
+		.toast {
+			min-width: 260px;
+			padding: 14px 20px;
+			border-radius: 12px;
+			box-shadow: var(--card-shadow);
+			font-size: 14px;
+			font-weight: 600;
+			display: flex;
+			align-items: center;
+			gap: 12px;
+			backdrop-filter: blur(15px);
+			-webkit-backdrop-filter: blur(15px);
+			transform: translateY(-20px);
+			opacity: 0;
+			transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+			pointer-events: auto;
+		}
+
+		.toast.show {
+			transform: translateY(0);
+			opacity: 1;
+		}
+
+		.toast-icon {
+			width: 20px;
+			height: 20px;
+			flex-shrink: 0;
+		}
+
+		.toast-success {
+			background-color: #10b981 !important;
+			color: #ffffff !important;
+			border: none !important;
+		}
+		.toast-success .toast-icon, .toast-success span {
+			color: #ffffff !important;
+		}
+
+		.toast-error {
+			background-color: #ef4444 !important;
+			color: #ffffff !important;
+			border: none !important;
+		}
+		.toast-error .toast-icon, .toast-error span {
+			color: #ffffff !important;
+		}
+		
+		.toast-warning {
+			background-color: #f59e0b !important;
+			color: #ffffff !important;
+			border: none !important;
+		}
+		.toast-warning .toast-icon, .toast-warning span {
+			color: #ffffff !important;
+		}
+`;
+
+// 统计卡片骨架（.stat-value / .stat-desc 等字号差异在各页面内覆盖）
+const SHARED_STAT_CARD_CSS = `
+		.stat-card {
+			background-color: var(--card-bg);
+			border: 1px solid var(--border-color);
+			border-radius: 20px;
+			padding: 28px 26px;
+			display: flex;
+			flex-direction: column;
+			gap: 16px;
+			box-shadow: var(--card-shadow);
+			backdrop-filter: blur(var(--glass-blur));
+			-webkit-backdrop-filter: blur(var(--glass-blur));
+			transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.35s, border-color 0.35s;
+			min-width: 0;
+			overflow: hidden;
+			position: relative;
+		}
+
+		.stat-card::before {
+			content: '';
+			position: absolute;
+			top: 0;
+			left: 0;
+			right: 0;
+			height: 3px;
+			background: var(--primary-gradient);
+			opacity: 0;
+			transition: opacity 0.35s;
+		}
+
+		.stat-card:hover {
+			transform: translateY(-4px);
+			border-color: rgba(168, 85, 247, 0.35);
+			box-shadow: 0 16px 40px rgba(168, 85, 247, 0.12);
+		}
+
+		.stat-card:hover::before {
+			opacity: 1;
+		}
+
+		.stat-title {
+			font-size: 13px;
+			color: var(--text-muted);
+			font-weight: 600;
+			letter-spacing: 0.02em;
+			text-transform: uppercase;
+		}`;
+
+// 表单输入框（.form-group 因页面布局差异保留在各页面内）
+const SHARED_FORM_CSS = `
+		.form-group label {
+			font-size: 13px;
+			font-weight: 500;
+			color: var(--text-muted);
+		}
+
+		input {
+			background-color: var(--input-bg);
+			border: 1px solid var(--input-border);
+			color: var(--input-text);
+			padding: 12px 16px;
+			border-radius: 10px;
+			outline: none;
+			font-size: 14px;
+			transition: all 0.3s ease;
+			backdrop-filter: blur(10px);
+		}
+
+		input:focus {
+			border-color: var(--accent-color);
+			box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.2);
+			background-color: rgba(15, 23, 42, 0.8);
+		}
+
+		:root[data-theme="light"] input:focus {
+			background-color: rgba(255, 255, 255, 0.95);
+			box-shadow: 0 0 0 3px rgba(147, 51, 234, 0.15);
+		}`;
+
+// 按钮主/次态（.btn 基础因 padding/gap 差异保留在各页面内）
+const SHARED_BUTTON_CSS = `
+		.btn-primary {
+			background: var(--primary-gradient);
+			color: white;
+			box-shadow: 0 4px 14px rgba(168, 85, 247, 0.3);
+		}
+
+		.btn-primary:hover {
+			transform: translateY(-2px);
+			box-shadow: 0 6px 20px rgba(168, 85, 247, 0.5);
+			opacity: 0.95;
+		}
+
+		.btn-primary:active {
+			transform: translateY(0);
+		}
+
+		.btn-secondary {
+			background-color: var(--btn-secondary-bg);
+			color: var(--btn-secondary-text);
+			border: 1px solid var(--border-color);
+		}
+
+		.btn-secondary:hover {
+			background-color: var(--btn-secondary-hover);
+			transform: translateY(-1px);
+		}`;
+
+// 模态框骨架（.modal-card 的 max-width 差异在各页面内覆盖）
+const SHARED_MODAL_CSS = `
+		.modal-overlay {
+			position: fixed;
+			top: 0;
+			left: 0;
+			right: 0;
+			bottom: 0;
+			background-color: var(--modal-overlay-bg);
+			backdrop-filter: blur(0px);
+			-webkit-backdrop-filter: blur(0px);
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			z-index: 1000;
+			opacity: 0;
+			pointer-events: none;
+			transition: opacity 0.3s ease, backdrop-filter 0.3s ease, -webkit-backdrop-filter 0.3s ease;
+		}
+
+		.modal-overlay.active {
+			opacity: 1;
+			pointer-events: auto;
+			backdrop-filter: blur(8px);
+			-webkit-backdrop-filter: blur(8px);
+		}
+
+		.modal-card {
+			background-color: var(--card-bg);
+			border: 1px solid var(--border-color);
+			border-radius: 20px;
+			width: 100%;
+			padding: 32px;
+			box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
+			display: flex;
+			flex-direction: column;
+			gap: 20px;
+			transform: scale(0.9) translateY(20px);
+			transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.3s;
+			backdrop-filter: blur(var(--glass-blur));
+			-webkit-backdrop-filter: blur(var(--glass-blur));
+		}
+
+		.modal-overlay.active .modal-card {
+			transform: scale(1) translateY(0);
+		}
+
+		.modal-header {
+			display: flex;
+			justify-content: space-between;
+			align-items: center;
+			border-bottom: 1px solid var(--border-color);
+			padding-bottom: 16px;
+		}
+
+		.modal-header h3 {
+			font-size: 18px;
+			font-weight: 600;
+		}
+
+		.close-btn {
+			background: none;
+			border: none;
+			color: var(--text-muted);
+			cursor: pointer;
+			padding: 4px;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			outline: none;
+			transition: color 0.2s;
+		}
+
+		.close-btn:hover {
+			color: var(--text-main);
+		}`;
+
+// 模态框关闭按钮 SVG 图标
+const SVG_CLOSE = '<svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>';
+
+
+
+
+async function handleLandingPage(request, env, ctx) {
+	const isLoggedIn = await checkAdminAuth(request, env);
+
+	const html = `<!DOCTYPE html>
+<head>
+	<meta charset="UTF-8">
+	<meta name="robots" content="noindex, nofollow">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>cf-ai-gw - Cloudflare Workers AI Proxy</title>
+	<link rel="preconnect" href="https://fonts.googleapis.com">
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
+	<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+	<style>
+		${SHARED_THEME_CSS}
+
+		body {
+			font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+			background-color: var(--bg-color);
+			color: var(--text-main);
+			min-height: 100vh;
+			display: flex;
+			flex-direction: column;
+			justify-content: center;
+			align-items: center;
+			padding: 20px;
+			overflow-x: hidden;
+			position: relative;
+		}
+
+		h1, h2, h3 {
+			font-family: 'Outfit', sans-serif;
+		}
+
+		${SHARED_BG_CSS}
+
+		.action-btn-group {
+			position: fixed;
+			top: 20px;
+			right: 20px;
+			display: flex;
+			flex-direction: row;
+			gap: 12px;
+			z-index: 1000;
+		}
+
+		.floating-btn {
+			background-color: var(--card-bg);
+			border: 1px solid var(--border-color);
+			color: var(--text-main);
+			width: 44px;
+			height: 44px;
+			border-radius: 12px;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			cursor: pointer;
+			box-shadow: var(--card-shadow);
+			backdrop-filter: blur(var(--glass-blur));
+			-webkit-backdrop-filter: blur(var(--glass-blur));
+			transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+			z-index: 1000;
+			outline: none;
+		}
+		
+		.floating-btn:hover {
+			transform: translateY(-2px);
+			border-color: rgba(168, 85, 247, 0.4);
+			box-shadow: 0 8px 20px rgba(168, 85, 247, 0.15);
+		}
+
+		.dashboard-container {
+			max-width: 900px;
+			width: 100%;
+			display: flex;
+			flex-direction: column;
+			gap: 28px;
+			z-index: 10;
+		}
+
+		.dashboard-grid {
+			display: grid;
+			grid-template-columns: 1fr 2fr;
+			gap: 20px;
+			width: 100%;
+		}
+
+		${SHARED_CHART_CSS}
+
+		@media (max-width: 768px) {
+			.dashboard-grid {
+				grid-template-columns: 1fr !important;
+			}
+		}
+
+		@keyframes spinner-border {
+			to { transform: rotate(360deg); }
+		}
+
+		.spinner {
+			display: inline-block;
+			width: 16px;
+			height: 16px;
+			border: 2px solid rgba(168, 85, 247, 0.2);
+			border-radius: 50%;
+			border-top-color: var(--accent-color);
+			animation: spinner-border 1s linear infinite;
+		}
+
+		.login-header {
+			display: flex;
+			flex-direction: row;
+			align-items: center;
+			justify-content: center;
+			gap: 16px;
+			margin-bottom: 8px;
+		}
+
+		.logo-icon {
+			width: 46px;
+			height: 46px;
+			border-radius: 12px;
+			background: var(--primary-gradient);
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			font-weight: bold;
+			color: white;
+			font-size: 22px;
+			font-family: 'Outfit', sans-serif;
+			box-shadow: 0 4px 14px rgba(168, 85, 247, 0.25);
+		}
+
+		.logo-text {
+			font-size: 24px;
+			font-weight: 700;
+			letter-spacing: -0.5px;
+			background: var(--primary-gradient);
+			-webkit-background-clip: text;
+			-webkit-text-fill-color: transparent;
+		}
+
+		${SHARED_STAT_CARD_CSS}
+
+		.stat-value {
+			font-size: 36px;
+			font-weight: 700;
+			font-family: 'Outfit', sans-serif;
+		}
+
+		.section-title {
+			font-size: 18px;
+			font-weight: 600;
+			display: flex;
+			align-items: center;
+			gap: 8px;
+		}
+
+		.form-group {
+			display: flex;
+			flex-direction: column;
+			gap: 8px;
+		}
+
+		${SHARED_FORM_CSS}
+
+		.btn {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			padding: 12px 20px;
+			border-radius: 10px;
+			font-weight: 600;
+			font-size: 14px;
+			cursor: pointer;
+			border: none;
+			transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+			text-decoration: none;
+		}
+
+		${SHARED_BUTTON_CSS}
+
+		/* Modal Styling */
+		${SHARED_MODAL_CSS}
+
+		.modal-card {
+			max-width: 400px;
+		}
+
+		${SHARED_TOAST_CSS}
+	</style>
+</head>
+<body>
+
+	
+	<div class="bg-orbs-container">
+		<div class="bg-orb bg-orb-1"></div>
+		<div class="bg-orb bg-orb-2"></div>
+	</div>
+
+	
+	<div class="action-btn-group">
+		<button class="floating-btn" onclick="toggleTheme(onThemeChange)" title="切换日间/夜间模式">
+			<svg class="theme-icon-sun" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none; width: 20px; height: 20px;">
+				<circle cx="12" cy="12" r="4" />
+				<path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
+			</svg>
+			<svg class="theme-icon-moon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 20px; height: 20px;">
+				<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
+			</svg>
+		</button>
+		<button class="floating-btn" onclick="${isLoggedIn ? "window.location.href='/admin'" : 'openLoginModal()'}" title="${isLoggedIn ? '管理后台' : '管理员登录'}" style="background: var(--primary-gradient); color: white; border: none;">
+			${isLoggedIn ? `
+				<!-- User Check Icon -->
+				<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 20px; height: 20px;">
+					<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+					<circle cx="9" cy="7" r="4" />
+					<polyline points="16 11 18 13 22 9" />
+				</svg>
+			` : `
+				<!-- User Icon -->
+				<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 20px; height: 20px;">
+					<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" />
+					<circle cx="12" cy="7" r="4" />
+				</svg>
+			`}
+		</button>
+	</div>
+
+	<div class="dashboard-container">
+		<div class="login-header" style="margin-bottom: 8px;">
+			<div class="logo-icon">AI</div>
+			<span class="logo-text">cf-ai-gw</span>
+		</div>
+
+		<div class="dashboard-grid">
+			
+			<div class="stat-card" style="justify-content: space-between;">
+				<div>
+					<div class="stat-title" style="margin-bottom: 10px;">今日用量汇总</div>
+					<div style="display: flex; align-items: baseline; gap: 4px;">
+						<div class="stat-value" id="public-neurons" style="font-size: 42px; background: var(--primary-gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 800; display: inline-block;">0</div>
+						<span style="font-size: 14px; color: var(--text-muted); font-weight: 500; font-family: 'Outfit', sans-serif;">Neurons</span>
+					</div>
+				</div>
+				
+				<div style="margin-top: 16px;">
+					<div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted); margin-top: 8px;">
+						<span id="public-limit-desc">总限额: 0 Neurons</span>
+						<span id="public-percent-desc" style="font-weight: 600; color: var(--accent-color);">0.00%</span>
+					</div>
+				</div>
+			</div>
+			
+			<div class="stat-card" id="public-models-card" style="padding: 24px; display: flex; flex-direction: column; justify-content: center;">
+				
+				<div class="public-chart-wrapper" id="public-chart-wrapper" style="display: none; height: 190px; width: 100%; flex-direction: row; align-items: center; justify-content: space-between; gap: 40px;">
+					
+					<div style="position: relative; height: 190px; width: 190px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;">
+						<canvas id="publicModelsChart"></canvas>
+					</div>
+					
+					<div style="flex: 1; display: flex; flex-direction: column; justify-content: center; min-width: 0; align-self: stretch; height: 190px;">
+						<div id="public-chart-legend" class="chart-legend" style="flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; max-height: 180px; overflow-y: auto; padding-right: 4px;"></div>
+					</div>
+				</div>
+				
+				
+				<div id="public-chart-placeholder" style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 190px; width: 100%; color: var(--text-muted); font-size: 13px; gap: 12px;">
+					<span class="spinner" style="width: 24px; height: 24px; border-width: 2.5px;"></span>
+					<span>正在载入数据...</span>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<!-- 弹窗：管理员登录 / 后台快捷入口 -->
+	<div class="modal-overlay" id="login-modal">
+		<div class="modal-card">
+			<div class="modal-header">
+				<h3 id="modal-title">${isLoggedIn ? '管理面板入口' : '管理员登录'}</h3>
+				<button onclick="closeLoginModal()" class="close-btn">${SVG_CLOSE}</button>
+			</div>
+			
+			${isLoggedIn ? `
+				<div style="text-align: center; display: flex; flex-direction: column; gap: 16px; margin-top: 10px;">
+					<div style="font-size: 40px; margin-bottom: 8px;">🎉</div>
+					<p style="font-size: 14px; color: var(--text-muted); line-height: 1.5;">您当前已登录管理员身份。</p>
+					<a href="/admin" class="btn btn-primary" style="width: 100%; text-decoration: none; display: flex; align-items: center; justify-content: center; height: 42px;">进入后台管理面板</a>
+					<button class="btn btn-secondary" onclick="submitLogout()" style="width: 100%; height: 42px;">安全退出</button>
+				</div>
+			` : `
+				<div class="form-group" style="margin-top: 10px;">
+					<label for="login-password">管理员密码</label>
+					<input type="password" id="login-password" placeholder="请输入管理员密码" onkeydown="if(event.key==='Enter')submitLogin()">
+				</div>
+				<div class="modal-footer" style="margin-top: 10px; display: flex; gap: 12px; justify-content: flex-end; width: 100%;">
+					<button class="btn btn-secondary" onclick="closeLoginModal()" style="height: 38px;">取消</button>
+					<button class="btn btn-primary" onclick="submitLogin()" style="height: 38px;">登录</button>
+				</div>
+			`}
+		</div>
+	</div>
+
+	<script>
+		${SHARED_JS}
+
+		let publicModelsChartInstance = null;
+		let lastPublicSummaryData = null;
+
+		function onThemeChange() {
+			if (lastPublicSummaryData) renderPublicSummary(lastPublicSummaryData);
+		}
+
+		function openLoginModal() {
+			document.getElementById('login-modal').classList.add('active');
+			const pwdInput = document.getElementById('login-password');
+			if (pwdInput) {
+				pwdInput.value = '';
+				setTimeout(() => pwdInput.focus(), 100);
+			}
+		}
+
+		function closeLoginModal() {
+			document.getElementById('login-modal').classList.remove('active');
+		}
+
+		initTheme();
+
+		window.onload = function() {
+			loadPublicSummary();
+		};
+
+		async function loadPublicSummary() {
+			try {
+				const res = await fetch('/api/usage/summary');
+				if (res.status === 401) {
+					// 未登录：隐藏用量卡片和模型图表，不显示 spinner
+					const publicCard = document.querySelector('.dashboard-grid .stat-card');
+					if (publicCard) publicCard.style.display = 'none';
+					const modelsCard = document.getElementById('public-models-card');
+					if (modelsCard) modelsCard.style.display = 'none';
+					return;
+				}
+				const data = await res.json();
+				renderPublicSummary(data);
+			} catch (e) {
+				console.error(e);
+				// 网络错误时隐藏 spinner，显示空状态
+				const placeholder = document.getElementById('public-chart-placeholder');
+				if (placeholder) {
+					placeholder.innerHTML = '<span style="font-size: 13px;">数据加载失败</span>';
+				}
+			}
+		}
+
+		function animateNumber(id, end, duration = 1200) {
+			const obj = document.getElementById(id);
+			if (!obj) return;
+			let start = parseInt(obj.innerText.replace(/,/g, ''), 10);
+			if (isNaN(start) || start <= 0) {
+				start = end > 100 ? 100 : 0;
+			}
+			const range = end - start;
+			if (range === 0) {
+				obj.innerText = end.toLocaleString();
+				return;
+			}
+			const startTime = performance.now();
+			function update(currentTime) {
+				const elapsed = currentTime - startTime;
+				const progress = Math.min(elapsed / duration, 1);
+				const easeProgress = 1 - Math.pow(2, -10 * progress);
+				const current = Math.ceil(start + range * easeProgress);
+				obj.innerText = current.toLocaleString();
+				if (progress < 1) {
+					requestAnimationFrame(update);
+				} else {
+					obj.innerText = end.toLocaleString();
+				}
+			}
+			requestAnimationFrame(update);
+		}
+
+		function renderPublicSummary(data) {
+			lastPublicSummaryData = data;
+			const percent = Number(data.usagePercentage).toFixed(2);
+			const roundedNeurons = Math.ceil(data.totalNeuronsToday);
+			
+			// 触发数字滚动的动效
+			animateNumber('public-neurons', roundedNeurons, 1000);
+			
+			document.getElementById('public-limit-desc').innerText = '总限额: ' + Number(data.totalLimit).toLocaleString() + ' Neurons';
+			document.getElementById('public-percent-desc').innerText = percent + '%';
+
+			const wrapper = document.getElementById('public-chart-wrapper');
+			const placeholder = document.getElementById('public-chart-placeholder');
+			const legendContainer = document.getElementById('public-chart-legend');
+
+			if (data.modelsToday && data.modelsToday.length > 0) {
+				if (wrapper) wrapper.style.display = 'flex';
+				if (placeholder) placeholder.style.display = 'none';
+
+				// 按 Neurons 消耗数从大到小排序
+				const sortedModelsToday = [...data.modelsToday].sort((a, b) => b.neurons - a.neurons);
+
+				const labels = sortedModelsToday.map(m => m.model.split('/').pop());
+				const chartData = sortedModelsToday.map(m => m.neurons);
+				
+				const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+				const borderColor = isLight ? '#ffffff' : '#1e293b';
+				
+				if (publicModelsChartInstance) {
+					publicModelsChartInstance.destroy();
+				}
+
+				publicModelsChartInstance = createDoughnutChart('publicModelsChart', labels, chartData, borderColor);
+
+				// 动态且逐个淡入渲染模型说明 ID
+				renderChartLegend(legendContainer, labels, chartData);
+			} else {
+				if (wrapper) wrapper.style.display = 'none';
+				if (placeholder) {
+					placeholder.style.display = 'flex';
+					placeholder.innerHTML = '<svg style="width: 32px; height: 32px; opacity: 0.5;" fill="none" stroke="currentColor" viewBox="0 0 24 24">' +
+						'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z"></path>' +
+						'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"></path>' +
+						'</svg><span>今日暂无消耗数据</span>';
+				}
+				if (publicModelsChartInstance) {
+					publicModelsChartInstance.destroy();
+					publicModelsChartInstance = null;
+				}
+			}
+		}
+
+		async function submitLogin() {
+			const password = document.getElementById('login-password').value;
+			const res = await fetch('/api/auth/login', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ password })
+			});
+			if (res.ok) {
+				showToast('登录成功！跳转中...');
+				setTimeout(() => {
+					window.location.href = '/admin';
+				}, 600);
+			} else {
+				const data = await res.json();
+				showToast('登录失败: ' + (data.error || '密码不正确！'), 'error');
+			}
+		}
+
+		async function submitLogout() {
+			const res = await fetch('/api/auth/logout', { method: 'POST' });
+			if (res.ok) {
+				showToast('安全退出成功');
+				setTimeout(() => {
+					window.location.reload();
+				}, 600);
+			}
+		}
+	</script>
+	<footer style="text-align: center; padding: 24px 0 20px; font-size: 12px; color: var(--text-muted); opacity: 0.6; z-index: 10;">
+		由 <a href="https://github.com/ojbkxc/cf-ai-gw" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">cf-ai-gw</a> 强力驱动
+	</footer>
+</body>
+</html>`;
+
+	return new Response(html, {
+		headers: { 'Content-Type': 'text/html; charset=utf-8' }
+	});
+}
+
+
+
+
+	</footer>
+</body>
+</html>`;
+
+	return new Response(html, {
+		headers: { 'Content-Type': 'text/html; charset=utf-8' }
+	});
+}
+
+// 2. 后台管理控制台页面
+async function handleAdminPage(request, env, ctx) {
+	// 生成 CSRF Token：同时写入 cookie（JS 可读）和 meta 标签，前端请求时通过 X-CSRF-Token 头回传
+	const csrfToken = await sha256(env.ADMIN_PASSWORD + '_csrf_v1');
+	const csrfCookie = `csrf_token=${csrfToken}; Path=/; SameSite=Strict; Max-Age=86400`;
+
+	const html = `<!DOCTYPE html>
+<head>
+	<meta charset="UTF-8">
+	<meta name="csrf-token" content="${csrfToken}">
+	<meta name="robots" content="noindex, nofollow">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>cf-ai-gw Dashboard</title>
+	<link rel="preconnect" href="https://fonts.googleapis.com">
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+	<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+	<style>
+		${SHARED_THEME_CSS}
+
+		/* Admin 页面特有变量 */
+		:root {
+			--sidebar-bg: rgba(15, 23, 42, 0.6);
+			--success-color: #10b981;
+			--warning-color: #f59e0b;
+			--danger-color: #ef4444;
+			--sidebar-width: 260px;
+			--sidebar-menu-hover: rgba(255, 255, 255, 0.04);
+			--table-header-bg: rgba(0, 0, 0, 0.2);
+			--section-item-bg: rgba(255, 255, 255, 0.02);
+			--orb-1-color: rgba(99, 102, 241, 0.12);
+			--orb-2-color: rgba(236, 72, 153, 0.08);
+			--code-bg: rgba(0, 0, 0, 0.25);
+			--code-color: #e9d5ff;
+			--code-border: rgba(255, 255, 255, 0.04);
+		}
+
+		:root[data-theme="light"] {
+			--sidebar-bg: rgba(255, 255, 255, 0.6);
+			--sidebar-menu-hover: rgba(0, 0, 0, 0.04);
+			--table-header-bg: rgba(0, 0, 0, 0.03);
+			--section-item-bg: rgba(0, 0, 0, 0.01);
+			--orb-1-color: rgba(99, 102, 241, 0.06);
+			--orb-2-color: rgba(236, 72, 153, 0.04);
+			--code-bg: rgba(79, 70, 229, 0.07);
+			--code-color: #4f46e5;
+			--code-border: rgba(79, 70, 229, 0.15);
+		}
+
+		body {
+			font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+			background-color: var(--bg-color);
+			color: var(--text-main);
+			min-height: 100vh;
+			display: flex;
+			flex-direction: column;
+			overflow-x: hidden;
+			position: relative;
+		}
+
+		/* Tab Content Transition */
+		.tab-content { display: none; }
+		.tab-content.active { display: block; }
+
+		/* Nav item — gradient bottom border */
+		.nav-item::after {
+			content: '';
+			position: absolute;
+			left: 0; right: 0; bottom: 0;
+			height: 2px;
+			background: linear-gradient(90deg, #6366f1, #a855f7 20%, #ec4899 50%, #a855f7 80%, #6366f1);
+			background-size: 200% 100%;
+			transform: scaleX(0);
+			transform-origin: center;
+			transition: transform 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+		}
+		.nav-item.active::after { transform: scaleX(1); }
+		:root[data-theme="light"] .nav-item::after {
+			background: linear-gradient(90deg, #4f46e5, #7c3aed 20%, #db2777 50%, #7c3aed 80%, #4f46e5);
+			background-size: 200% 100%;
+		}
+
+		/* Dynamic Background Orbs */
+		${SHARED_BG_CSS}
+
+		/* Sidebar Layout */
+		.app-container {
+			display: flex;
+			min-height: 100vh;
+			position: relative;
+		}
+
+		aside {
+			width: var(--sidebar-width);
+			background-color: var(--sidebar-bg);
+			border-right: 1px solid var(--border-color);
+			display: flex;
+			flex-direction: column;
+			padding: 30px 20px;
+			position: fixed;
+			top: 0;
+			bottom: 0;
+			left: 0;
+			z-index: 100;
+			backdrop-filter: blur(var(--glass-blur));
+			-webkit-backdrop-filter: blur(var(--glass-blur));
+			transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+		}
+
+		.logo-area {
+			display: flex;
+			align-items: center;
+			gap: 12px;
+			margin-bottom: 40px;
+			padding-left: 8px;
+		}
+
+		.logo-icon {
+			width: 38px;
+			height: 38px;
+			border-radius: 10px;
+			background: var(--primary-gradient);
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			font-weight: bold;
+			color: white;
+			font-size: 18px;
+			font-family: 'Outfit', sans-serif;
+			box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
+		}
+
+		.logo-text {
+			font-size: 18px;
+			font-weight: 700;
+			font-family: 'Outfit', sans-serif;
+			letter-spacing: -0.5px;
+			background: var(--primary-gradient);
+			-webkit-background-clip: text;
+			-webkit-text-fill-color: transparent;
+		}
+
+		.nav-menu {
+			display: flex;
+			flex-direction: column;
+			gap: 8px;
+			flex: 1;
+		}
+
+		.nav-item {
+			display: flex;
+			align-items: center;
+			gap: 12px;
+			padding: 12px 16px;
+			border-radius: 10px;
+			cursor: pointer;
+			font-size: 14px;
+			font-weight: 500;
+			color: var(--text-muted);
+			transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+			position: relative;
+			overflow: hidden;
+		}
+
+		.nav-item:hover {
+			color: var(--text-main);
+			background-color: var(--sidebar-menu-hover);
+			transform: translateX(4px);
+		}
+
+		.nav-item.active {
+			color: white;
+			background: var(--primary-gradient);
+			box-shadow:
+				0 0 18px rgba(168, 85, 247, 0.35),
+				0 0 40px rgba(99, 102, 241, 0.15),
+				inset 0 1px 0 rgba(255, 255, 255, 0.1);
+		}
+
+		.aside-footer {
+			display: flex;
+			flex-direction: column;
+			gap: 12px;
+			border-top: 1px solid var(--border-color);
+			padding-top: 20px;
+		}
+
+		/* Main Content Area */
+		main {
+			flex: 1;
+			margin-left: var(--sidebar-width);
+			padding: 40px;
+			min-width: 0;
+			z-index: 10;
+		}
+
+		header {
+			display: flex;
+			justify-content: space-between;
+			align-items: center;
+			margin-bottom: 30px;
+		}
+
+		/* Card Grid & Stats */
+		.card-grid {
+			display: grid;
+			grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+			gap: 20px;
+			grid-auto-rows: 1fr;
+		}
+
+		${SHARED_STAT_CARD_CSS}
+
+		.stat-value {
+			font-size: 38px;
+			font-weight: 700;
+			font-family: 'Outfit', sans-serif;
+			letter-spacing: -0.02em;
+			line-height: 1;
+		}
+
+		.stat-desc {
+			font-size: 12px;
+			color: var(--text-muted);
+			line-height: 1.6;
+		}
+
+		.stat-metrics-row {
+			display: flex;
+			gap: 28px;
+			align-items: flex-start;
+		}
+
+		.stat-metric {
+			flex: 1;
+			min-width: 0;
+		}
+
+		.stat-metric-divider {
+			width: 1px;
+			background: var(--border-color);
+			align-self: stretch;
+			margin: 4px 0;
+		}
+
+		.stat-icon-badge {
+			width: 36px;
+			height: 36px;
+			border-radius: 10px;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			flex-shrink: 0;
+		}
+
+		.usage-progress-container {
+			width: 100%;
+			height: 8px;
+			background: linear-gradient(135deg, rgba(255,255,255,0.04), rgba(255,255,255,0.08));
+			border-radius: 4px;
+			overflow: hidden;
+			margin: 10px 0 6px;
+			box-shadow: inset 0 1px 3px rgba(0,0,0,0.2);
+			position: relative;
+		}
+		.usage-progress-container::after {
+			content: '';
+			position: absolute;
+			top: 0; left: 0; right: 0;
+			height: 50%;
+			background: linear-gradient(180deg, rgba(255,255,255,0.15), transparent);
+			border-radius: 4px 4px 0 0;
+			pointer-events: none;
+		}
+
+		:root[data-theme="light"] .usage-progress-container {
+			background: linear-gradient(135deg, rgba(0,0,0,0.03), rgba(0,0,0,0.06));
+		}
+		:root[data-theme="light"] .usage-progress-container::after {
+			background: linear-gradient(180deg, rgba(255,255,255,0.5), transparent);
+		}
+
+		.usage-progress-bar {
+			height: 100%;
+			border-radius: 4px;
+			transition: width 1.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+			position: relative;
+			overflow: hidden;
+			background: var(--primary-gradient);
+			box-shadow: 0 0 8px rgba(168,85,247,0.35);
+		}
+
+		/* Section Cards */
+		.section-card {
+			background-color: var(--card-bg);
+			border: 1px solid var(--border-color);
+			border-radius: 18px;
+			padding: 30px;
+			box-shadow: var(--card-shadow);
+			backdrop-filter: blur(var(--glass-blur));
+			-webkit-backdrop-filter: blur(var(--glass-blur));
+			margin-bottom: 24px;
+		}
+
+		.section-note {
+			margin-top: 6px;
+			font-size: 13px;
+			color: var(--text-muted);
+			line-height: 1.5;
+		}
+
+		.access-endpoint-grid {
+			display: grid;
+			grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+			gap: 14px;
+		}
+
+		.access-endpoint-card {
+			appearance: none;
+			width: 100%;
+			text-align: left;
+			border: 1px solid var(--border-color);
+			border-radius: 16px;
+			padding: 18px 20px;
+			background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.015));
+			box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+			backdrop-filter: blur(14px);
+			-webkit-backdrop-filter: blur(14px);
+			transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.25s, box-shadow 0.25s, background 0.25s;
+			cursor: default;
+			color: inherit;
+		}
+
+		.access-endpoint-card:hover {
+			transform: translateY(-2px);
+			border-color: rgba(168, 85, 247, 0.28);
+			box-shadow: 0 12px 30px rgba(168, 85, 247, 0.08);
+		}
+
+		.endpoint-badge {
+			display: inline-flex;
+			align-items: center;
+			padding: 4px 10px;
+			border-radius: 999px;
+			background: rgba(168, 85, 247, 0.12);
+			color: var(--accent-color);
+			font-size: 12px;
+			font-weight: 600;
+			letter-spacing: 0.01em;
+		}
+
+		.endpoint-url {
+			display: block;
+			margin-top: 12px;
+			font-size: 14px;
+			line-height: 1.55;
+			word-break: break-all;
+			color: var(--text-main);
+			text-decoration: underline;
+			text-decoration-color: rgba(168, 85, 247, 0.5);
+			text-underline-offset: 3px;
+			cursor: pointer;
+			background: transparent;
+			border: none;
+			padding: 0;
+		}
+
+		.endpoint-url:hover {
+			color: var(--accent-color);
+		}
+
+		.endpoint-hint {
+			margin-top: 10px;
+			font-size: 12px;
+			color: var(--text-muted);
+		}
+
+		.section-header {
+			display: flex;
+			justify-content: space-between;
+			align-items: center;
+			margin-bottom: 20px;
+		}
+
+		.section-title {
+			font-size: 18px;
+			font-weight: 600;
+			font-family: 'Outfit', sans-serif;
+			display: flex;
+			align-items: center;
+			gap: 8px;
+		}
+
+		/* Forms & Inputs */
+		.form-group {
+			display: flex;
+			flex-direction: column;
+			gap: 8px;
+			margin-bottom: 16px;
+		}
+
+		${SHARED_FORM_CSS}
+
+		/* Buttons */
+		.btn {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			padding: 10px 18px;
+			border-radius: 10px;
+			font-weight: 600;
+			font-size: 14px;
+			cursor: pointer;
+			border: none;
+			transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+			gap: 8px;
+		}
+
+		${SHARED_BUTTON_CSS}
+
+		.btn-success {
+			background-color: var(--success-color);
+			color: white;
+			box-shadow: 0 4px 14px rgba(16, 185, 129, 0.3);
+		}
+
+		.btn-success:hover {
+			background-color: #059669;
+			transform: translateY(-2px);
+			box-shadow: 0 6px 20px rgba(16, 185, 129, 0.5);
+			opacity: 0.95;
+		}
+
+		.btn:disabled {
+			opacity: 0.6;
+			cursor: not-allowed;
+			transform: none !important;
+			box-shadow: none !important;
+		}
+
+		.spinner {
+			display: inline-block;
+			width: 12px;
+			height: 12px;
+			vertical-align: text-bottom;
+			border: 2px solid currentColor;
+			border-right-color: transparent;
+			border-radius: 50%;
+			animation: spinner-border .75s linear infinite;
+		}
+
+		/* 倒计时样式 */
+		.refresh-countdown {
+			font-size: 11px;
+			color: var(--text-muted);
+			font-family: monospace;
+			min-width: 28px;
+			text-align: center;
+			opacity: 0.7;
+		}
+
+		/* Tables */
+		table {
+			width: 100%;
+			border-collapse: collapse;
+			text-align: left;
+			font-size: 14px;
+		}
+
+		th {
+			background-color: var(--table-header-bg);
+			font-weight: 600;
+			color: var(--text-muted);
+			padding: 16px 20px;
+			border-bottom: 1px solid var(--border-color);
+		}
+
+		td {
+			padding: 16px 20px;
+			border-bottom: 1px solid var(--border-color);
+			color: var(--text-main);
+		}
+
+		tr:hover td {
+			background-color: rgba(255, 255, 255, 0.01);
+		}
+
+		code {
+			font-family: monospace;
+			background-color: var(--code-bg);
+			padding: 4px 8px;
+			border-radius: 6px;
+			font-size: 13px;
+			color: var(--code-color);
+			border: 1px solid var(--code-border);
+			transition: all 0.2s ease;
+		}
+
+		/* Badges */
+		.badge {
+			display: inline-flex;
+			padding: 4px 8px;
+			border-radius: 6px;
+			font-size: 11px;
+			font-weight: 600;
+			white-space: nowrap;
+		}
+
+		.badge-success { background-color: rgba(16, 185, 129, 0.15); color: #10b981; }
+		.badge-warning { background-color: rgba(245, 158, 11, 0.15); color: #f59e0b; }
+		.badge-danger { background-color: rgba(239, 68, 68, 0.15); color: #ef4444; }
+		.badge-info { background-color: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+
+		/* Charts */
+		.charts-grid {
+			display: grid;
+			grid-template-columns: 1.5fr 1fr;
+			gap: 20px;
+		}
+
+		.chart-container {
+			position: relative;
+			height: 300px;
+			width: 100%;
+		}
+
+		@media (max-width: 900px) {
+			.charts-grid {
+				grid-template-columns: 1fr;
+			}
+		}
+
+		/* Modals */
+		${SHARED_MODAL_CSS}
+
+		.modal-card {
+			max-width: 500px;
+		}
+
+		.modal-footer {
+			display: flex;
+			justify-content: flex-end;
+			gap: 12px;
+			border-top: 1px solid var(--border-color);
+			padding-top: 20px;
+			margin-top: 10px;
+		}
+
+		${SHARED_TOAST_CSS}
+
+		/* Mobile Responsiveness */
+		.mobile-header {
+			display: none !important;
+		}
+
+		@media (max-width: 768px) {
+			aside {
+				transform: translateX(-100%);
+			}
+			aside.active {
+				transform: translateX(0);
+			}
+			main {
+				margin-left: 0;
+				padding: 20px;
+			}
+			.mobile-header {
+				display: flex !important;
+			}
+			.mobile-nav-toggle {
+				background: none;
+				border: none;
+				color: var(--text-main);
+				display: flex;
+				align-items: center;
+				gap: 6px;
+				cursor: pointer;
+				font-size: 14px;
+				font-weight: 500;
+			}
+		}
+
+		${SHARED_CHART_CSS}
+	</style>
+</head>
+<body>
+	
+	<div class="bg-orbs-container">
+		<div class="bg-orb bg-orb-1"></div>
+		<div class="bg-orb bg-orb-2"></div>
+	</div>
+
+	<!-- App Header for Mobile Toggle -->
+	<div style="display: flex; justify-content: space-between; align-items: center; padding: 15px 20px; background-color: var(--sidebar-bg); border-bottom: 1px solid var(--border-color); z-index: 90;" class="mobile-header">
+		<div class="logo-area" style="margin-bottom: 0;">
+			<div class="logo-icon">AI</div>
+			<span class="logo-text">cf-ai-gw</span>
+		</div>
+		<div style="display: flex; align-items: center; gap: 12px;">
+			<button class="mobile-nav-toggle" onclick="toggleSidebar()">
+				<svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
+				<span>菜单</span>
+			</button>
+		</div>
+	</div>
+
+	<div class="app-container">
+		<!-- Sidebar -->
+		<aside id="sidebar">
+			<div class="logo-area">
+				<div class="logo-icon">AI</div>
+				<span class="logo-text">cf-ai-gw</span>
+			</div>
+			
+			<div class="nav-menu">
+				<div class="nav-item active" id="menu-overview" onclick="switchTab('overview')">
+					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
+					数据看板
+				</div>
+				
+				<div class="nav-item" id="menu-keys" onclick="switchTab('keys')">
+					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path></svg>
+					API 密钥
+				</div>
+				<div class="nav-item" id="menu-limits" onclick="switchTab('limits')">
+					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+					限额配置
+				</div>
+				<div class="nav-item" id="menu-settings" onclick="switchTab('settings')">
+					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+					模型映射
+				</div>
+			</div>
+
+			<div class="aside-footer">
+				<button class="btn btn-secondary" onclick="toggleTheme(onAdminThemeChange)" title="切换日间/夜间模式" style="width: 100%; display: flex; justify-content: center; gap: 8px; align-items: center;">
+					<svg class="theme-icon-sun" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none; width: 18px; height: 18px;">
+						<circle cx="12" cy="12" r="4" />
+						<path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
+					</svg>
+					<svg class="theme-icon-moon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 18px; height: 18px;">
+						<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
+					</svg>
+					<span>切换主题</span>
+				</button>
+				<button class="btn btn-secondary" onclick="logout()">退出登录</button>
+				<div style="text-align: center; font-size: 11px; color: var(--text-muted); opacity: 0.55; padding-top: 4px;">
+					由 <a href="https://github.com/ojbkxc/cf-ai-gw" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">cf-ai-gw</a> 强力驱动
+				</div>
+			</div>
+		</aside>
+
+		<!-- Main Workspace -->
+		<main>
+			<div id="auth-views" style="display: flex; flex-direction: column; gap: 30px; width: 100%;">
+				
+				<!-- Header -->
+				<header>
+					<div>
+						<h1 style="font-size: 26px; font-weight: 700;" id="view-title">数据看板</h1>
+						<p style="color: var(--text-muted); font-size: 14px; margin-top: 4px;">实时监控 Cloudflare AI 账号及接口 status</p>
+					</div>
+					<div class="user-profile">
+						<span class="badge badge-success">系统正常运行</span>
+					</div>
+				</header>
+
+				<!-- TAB: Overview -->
+				<div id="tab-overview" class="tab-content active">
+
+					<!-- Account Usage Details -->
+					<div class="section-card" style="padding: 30px 24px;">
+						<div class="section-title" style="display: flex; align-items: center; justify-content: space-between;">
+							<span>账号用量明细</span>
+							<div style="display: flex; align-items: center; gap: 16px;">
+								<div style="display: flex; align-items: center; gap: 14px; font-size: 12px; color: var(--text-muted);">
+									<span>账号 <strong id="stat-accounts-count" style="font-size: 14px; color: var(--text-color);">0</strong></span>
+									<span>密钥 <strong id="stat-keys-count" style="font-size: 14px; color: var(--text-color);">0</strong></span>
+								</div>
+								<div style="width: 1px; height: 16px; background: var(--border-color);"></div>
+								<div style="display: flex; align-items: center; gap: 8px;">
+									<span id="txt-last-updated" style="font-size: 11px; color: var(--text-muted); font-family: monospace; background: rgba(168, 85, 247, 0.08); padding: 2px 8px; border-radius: 8px; min-width: 28px; text-align: center;"></span>
+									<button class="btn btn-secondary" id="btn-refresh-usage" onclick="loadUsageDetails(true)" style="padding: 5px 12px; font-size: 11px;">刷新</button>
+								</div>
+							</div>
+						</div>
+						<div id="accounts-usage-list" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(560px, 1fr)); gap: 12px; margin-top: 16px;">
+						</div>
+					</div>
+
+					<div class="card-grid">
+						<div class="stat-card">
+							<div class="stat-title-row" style="display: flex; align-items: center; justify-content: space-between;">
+								<div class="stat-title">今日用量</div>
+								<span id="stat-total-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap; background: rgba(168, 85, 247, 0.08); padding: 3px 10px; border-radius: 12px;">0</span>
+							</div>
+							<div style="display: flex; align-items: baseline; gap: 4px;">
+								<div class="stat-value" id="stat-total-neurons" style="font-size: 42px;">0</div>
+								<span style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Neurons</span>
+							</div>
+							<div class="stat-desc" id="stat-neurons-desc" style="margin-top: auto; display: flex; justify-content: space-between; align-items: center;">
+								<span>0 / <span id="stat-neurons-limit">1w</span> Neurons</span>
+								<span id="stat-neurons-pct" style="font-weight: 600; color: var(--primary-color);">0%</span>
+							</div>
+							<div class="stat-desc" id="stat-cost-saving" style="font-size: 11px; color: #22c55e;">$0.00 节省成本</div>
+						</div>
+
+						<div class="stat-card">
+							<div class="stat-title-row" style="display: flex; align-items: center; justify-content: space-between;">
+								<div class="stat-title">Token 统计</div>
+								<div class="stat-icon-badge" style="background: linear-gradient(135deg, rgba(59, 130, 246, 0.15), rgba(16, 185, 129, 0.15)); color: var(--accent-color);">
+									<svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+								</div>
+							</div>
+							<div style="display: flex; align-items: baseline; gap: 4px;">
+								<div class="stat-value" id="stat-tokens-total" style="font-size: 36px;">0</div>
+								<span style="font-size: 12px; color: var(--text-muted); font-weight: 500;">tokens</span>
+							</div>
+							<div class="stat-desc" style="margin-top: 4px; font-size: 11px; color: var(--text-muted);">↑上传 <span id="stat-tokens-input">0</span></div>
+							<div class="stat-desc" style="font-size: 11px; color: var(--text-muted);">↓下载 <span id="stat-tokens-output">0</span></div>
+							<div class="stat-desc" id="stat-tokens-speed" style="font-size: 11px; color: var(--text-muted);">0 tok/s</div>
+							<div class="stat-desc" id="stat-tokens-reasoning" style="margin-top: auto; font-size: 10px; opacity: 0.65;">推理 0 / 缓存读 0</div>
+						</div>
+
+						<div class="stat-card">
+							<div class="stat-title-row" style="display: flex; align-items: center; justify-content: space-between;">
+								<div class="stat-title">本月用量限额</div>
+								<span id="stat-monthly-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap; background: rgba(168, 85, 247, 0.08); padding: 3px 10px; border-radius: 12px;">0</span>
+							</div>
+							<div style="display: flex; align-items: baseline; gap: 4px;">
+								<div class="stat-value" id="stat-monthly-usage" style="font-size: 42px;">0</div>
+								<span style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Neurons</span>
+							</div>
+							<div class="stat-desc" id="stat-monthly-desc" style="margin-top: auto; display: flex; justify-content: space-between;">
+								<span>0 / 100K Neurons</span>
+								<span id="stat-monthly-pct" style="font-weight: 600; color: var(--text-muted);">0%</span>
+							</div>
+						</div>
+					</div>
+
+					<!-- Charts -->
+					<div class="charts-grid" style="margin-top: 24px;">
+						<div class="section-card">
+							<div class="section-title">过去 7 日消耗走势 (Neurons)</div>
+							<div class="chart-container">
+								<canvas id="historyChart"></canvas>
+							</div>
+						</div>
+						<div class="section-card">
+							<div class="section-title">今日模型消耗占比</div>
+							<div class="chart-container public-chart-wrapper" id="admin-chart-wrapper" style="display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 30px; height: 300px; padding: 10px 0;">
+								<!-- Left: Chart -->
+								<div id="admin-canvas-wrapper" style="position: relative; height: 220px; width: 220px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;">
+									<canvas id="modelsChart"></canvas>
+								</div>
+								<!-- Right: Legend -->
+								<div id="admin-legend-wrapper" style="flex: 1; display: flex; flex-direction: column; justify-content: center; min-width: 0; align-self: stretch; height: 100%;">
+									<div id="admin-chart-legend" class="chart-legend" style="flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; max-height: 260px; overflow-y: auto; padding-right: 4px;"></div>
+								</div>
+								<!-- Empty Placeholder -->
+								<div id="admin-chart-placeholder" style="display: none; flex-direction: column; align-items: center; justify-content: center; height: 100%; width: 100%; color: var(--text-muted); font-size: 13px; gap: 12px; margin: auto;">
+									<svg style="width: 32px; height: 32px; opacity: 0.5;" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+										<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z"></path>
+										<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"></path>
+									</svg>
+									<span>今日暂无消耗数据</span>
+								</div>
+							</div>
+						</div>
+					</div>
+
+
+				</div>
+
+				
+
+				<!-- TAB: API Keys -->
+				<div id="tab-keys" class="tab-content">
+					<!-- Proxy URL Info -->
+					<div class="section-card" style="margin-bottom: 24px;">
+						<div class="section-title">接入信息</div>
+						<div class="section-note">OpenAI SDK 和 Anthropic Messages 都可直接接入，点击 URL 即可复制。</div>
+						<div class="access-endpoint-grid" style="margin-top: 18px;">
+							<div class="access-endpoint-card">
+								<div class="endpoint-badge">OpenAI 兼容格式</div>
+								<button type="button" class="endpoint-url" id="openai-endpoint-url" data-endpoint-url="" onclick="copyEndpointUrl(this.dataset.endpointUrl)">https://domain/v1/chat/completions</button>
+							</div>
+							<div class="access-endpoint-card">
+								<div class="endpoint-badge">Anthropic 兼容格式</div>
+								<button type="button" class="endpoint-url" id="anthropic-endpoint-url" data-endpoint-url="" onclick="copyEndpointUrl(this.dataset.endpointUrl)">https://domain/v1/messages</button>
+							</div>
+						</div>
+					</div>
+
+					<div class="section-card">
+						<div class="section-header">
+							<div class="section-title">API 密钥管理</div>
+							<button class="btn btn-primary" onclick="openAddKeyModal()">
+								<svg style="width: 16px; height: 16px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+								生成新密钥
+							</button>
+						</div>
+						
+						<div style="background-color: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.2); padding: 16px; border-radius: 12px; font-size: 13px; color: var(--warning-color); line-height: 1.5; margin-bottom: 10px;" id="no-key-warning" class="hidden">
+							<strong>提示：</strong> 目前未配置任何 API 密钥。反代 API (/v1/...) 处于公开可被任何人调用的状态。建议点击“生成新密钥”为您的接口加上调用凭证鉴权。
+						</div>
+
+						<table>
+							<thead>
+								<tr>
+									<th>密钥描述</th>
+									<th>API Key</th>
+									<th>创建时间</th>
+									<th>操作</th>
+								</tr>
+							</thead>
+							<tbody id="keys-table-body">
+								<!-- Keys rows -->
+							</tbody>
+						</table>
+					</div>
+				</div>
+
+				<!-- TAB: Settings (Model Mapping) -->
+				<div id="tab-settings" class="tab-content">
+					<div class="section-card">
+						<div class="section-title">模型映射 (Model Mappings)</div>
+						<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">您可以设置请求中的模型名字（例如 gpt-3.5-turbo）应该被反向代理路由去哪一个具体的 Cloudflare AI 对应模型。若请求的模型以 @cf/ 开头，则默认透传不会经过映射。</p>
+						
+						<div style="display: grid; grid-template-columns: 1fr 1.5fr auto; gap: 15px; background-color: var(--section-item-bg); padding: 20px; border-radius: 12px; border: 1px solid var(--border-color); margin-top: 10px;">
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>请求模型名称 (OpenAI ID/别名)</label>
+								<input type="text" id="map-source" placeholder="如: gpt-3.5-turbo">
+							</div>
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>CF 目标模型路径 (Cloudflare Model Path)</label>
+								<input type="text" id="map-target" placeholder="如: @cf/meta/llama-3.1-8b-instruct">
+							</div>
+							<div style="display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;">
+								<button class="btn btn-primary" onclick="addMapping()" style="height: 45px;">添加/修改</button>
+								<button class="btn btn-secondary" onclick="restorePresetMappings()" style="height: 45px;">预设映射</button>
+							</div>
+						</div>
+
+						<table style="margin-top: 20px;">
+							<thead>
+								<tr>
+									<th>客户端请求模型</th>
+									<th>映射后 Cloudflare 目标模型</th>
+									<th>类型</th>
+									<th style="width: 100px;">操作</th>
+								</tr>
+							</thead>
+							<tbody id="mappings-table-body">
+								<!-- Mapping rows -->
+							</tbody>
+						</table>
+					</div>
+				</div>
+
+				<div id="tab-limits" class="tab-content">
+					<div class="section-card">
+						<div class="section-title">用量限额配置</div>
+						<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">
+							配置每日/每月用量限额和拦截阈值。阈值设为 0 表示关闭限额拦截（仅统计不拦截）。<br>
+							环境变量 <code>DAILY_LIMIT</code>、<code>MONTHLY_LIMIT</code>、<code>USAGE_THRESHOLD</code> 优先级高于此处配置。
+						</p>
+
+						<div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 20px;">
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>每日限额 (Neurons)</label>
+								<input type="number" id="limits-daily" min="0" step="1" placeholder="10000">
+							</div>
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>每月限额 (Neurons)</label>
+								<input type="number" id="limits-monthly" min="0" step="1" placeholder="100000">
+							</div>
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>拦截阈值 (0-1)</label>
+								<input type="number" id="limits-threshold" min="0" max="1" step="0.05" placeholder="0.9">
+								<span style="font-size: 11px; color: var(--text-muted);">0 = 关闭限额拦截</span>
+							</div>
+						</div>
+
+						<button class="btn btn-primary" onclick="saveLimits()" style="align-self: flex-start;">保存配置</button>
+						<span id="limits-save-msg" style="font-size: 13px; margin-left: 12px; display: none;"></span>
+					</div>
+
+					<div class="section-card" style="margin-top: 20px;">
+						<div class="section-title">环境变量说明</div>
+						<p style="font-size: 13px; color: var(--text-muted); line-height: 1.8; margin-top: 8px;">
+							以下配置优先级：<strong>环境变量 > 面板配置 > 默认值</strong><br><br>
+							<code>DAILY_LIMIT</code> — 每日 Neurons 限额（默认 10000）<br>
+							<code>MONTHLY_LIMIT</code> — 每月 Neurons 限额（默认 100000）<br>
+							<code>USAGE_THRESHOLD</code> — 拦截阈值（0-1，默认 0，即关闭拦截）<br><br>
+							在 Cloudflare Workers 仪表盘的 Settings → Variables 中添加上述环境变量即可覆盖面板配置。
+						</p>
+					</div>
+				</div>
+
+			</div>
+		</main>
+	</div>
+
+	<!-- Modal: Add Cloudflare Account -->
+	<div class="modal-overlay" id="account-modal">
+		<div class="modal-card">
+			<div class="modal-header">
+				<h3 id="account-modal-title">添加 Cloudflare 账号</h3>
+				<button onclick="closeAccountModal()" class="close-btn">${SVG_CLOSE}</button>
+			</div>
+			<input type="hidden" id="account-id-edit">
+			<div class="form-group">
+				<label for="account-name">账号别名 (如: 主账号 A)</label>
+				<input type="text" id="account-name" placeholder="请输入备注名">
+			</div>
+			<div class="form-group">
+				<label for="account-id">Account ID</label>
+				<input type="text" id="account-id" placeholder="获取于 CF 控制台 Workers AI 页面" oninput="onAccountInfoChange()">
+			</div>
+			<div class="form-group">
+				<label for="account-token">API Token (需要创建并赋予以下 3 个权限):</label>
+				<div style="font-size: 12px; color: var(--text-muted); background: rgba(0,0,0,0.15); padding: 8px 12px; border-radius: 6px; margin-top: 4px; margin-bottom: 4px; line-height: 1.5; font-family: monospace;">
+					• Workers AI &gt; Read <span id="perm-wa-read" style="margin-left: 8px;"></span><br>
+					• Workers AI &gt; Edit <span id="perm-wa-edit" style="margin-left: 8px;"></span><br>
+					• Account Analytics &gt; Read <span id="perm-aa-read" style="margin-left: 8px;"></span>
+				</div>
+				<input type="text" id="account-token" placeholder="CF 账号 API Token (会安全遮蔽保存)" oninput="onAccountInfoChange()">
+			</div>
+			
+			<div id="test-result-alert" style="display: none; padding: 12px 16px; border-radius: 8px; font-size: 13px; font-weight: 500; word-break: break-word; overflow-wrap: break-word; max-height: 200px; overflow-y: auto; line-height: 1.6; border: 1px solid transparent;"></div>
+
+			<div class="modal-footer">
+				<button class="btn btn-success" onclick="testConnection()" id="btn-test-conn">测试连接</button>
+				<button class="btn btn-primary" onclick="saveAccount()" id="btn-save-account" disabled>保存账号</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- Modal: Add API Key -->
+	<div class="modal-overlay" id="key-modal">
+		<div class="modal-card">
+			<div class="modal-header">
+				<h3 id="key-modal-title">生成新 API 密钥</h3>
+				<button onclick="closeKeyModal()" class="close-btn">${SVG_CLOSE}</button>
+			</div>
+			<div id="key-modal-form">
+				<div class="form-group" style="margin-bottom: 16px;">
+					<label for="key-name">密钥描述/使用客户端 (如: Cursor / NextChat)</label>
+					<input type="text" id="key-name" placeholder="请输入描述名" style="width: 100%;">
+				</div>
+				<div class="form-group" style="margin-bottom: 16px;">
+					<label for="key-val">API 密钥值 (可选，为空则随机生成 sk-wa-...)</label>
+					<input type="text" id="key-val" placeholder="留空则随机生成密钥" style="width: 100%;">
+				</div>
+				<div class="modal-footer" style="margin-top: 10px; display: flex; gap: 12px; justify-content: flex-end; width: 100%;">
+					<button class="btn btn-secondary" onclick="closeKeyModal()">取消</button>
+					<button class="btn btn-primary" onclick="saveKey()">生成密钥</button>
+				</div>
+			</div>
+			<div id="key-modal-success" class="hidden" style="display: flex; flex-direction: column; gap: 16px;">
+				<div style="text-align: center; color: var(--success-color); font-size: 40px; margin-bottom: 8px;">🎉</div>
+				<p style="font-size: 14px; text-align: center; line-height: 1.6; color: var(--text-main);">
+					密钥生成成功！请务必复制保存此密钥，关闭后将无法再次完整查看。
+				</p>
+				<div class="form-group">
+					<label>API Key</label>
+					<div style="display: flex; gap: 10px;">
+						<input type="text" id="generated-key-val" readonly style="flex: 1; font-family: monospace;">
+						<button class="btn btn-primary" onclick="copyGeneratedKey()">复制</button>
+					</div>
+				</div>
+				<div class="modal-footer" style="margin-top: 10px; width: 100%;">
+					<button class="btn btn-secondary" onclick="closeKeyModal()" style="width: 100%;">我已保存，关闭</button>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<script>
+		${SHARED_JS}
+
+		function fmtTok(n) {
+			if (n < 1000) return String(n);
+			if (n < 1000000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
+			if (n < 1000000000) return (n / 1000000).toFixed(2).replace(/\.?0+$/, '') + 'M';
+			return (n / 1000000000).toFixed(2).replace(/\.?0+$/, '') + 'B';
+		}
+
+		let currentTab = 'overview';
+		let historyChart = null;
+		let modelsChart = null;
+		const defaultMappings = ${JSON.stringify(DEFAULT_MODEL_MAP)};
+		let customMappings = {};
+
+		function renderUsageDetails(data) {
+			// localStorage 向后兼容：旧格式是数组，新格式是 { accounts, limits }
+			if (Array.isArray(data)) {
+				data = { accounts: data, limits: { dailyUsage: 0, dailyRequests: 0, dailyLimit: 10000, monthlyUsage: 0, monthlyRequests: 0, monthlyLimit: 100000, threshold: 0.9 } };
+			}
+			const { accounts, limits } = data;
+
+			let totalUsageToday = 0;
+			let totalRequestsToday = 0;
+			const totalLimit = limits.dailyLimit;
+			let historyData = {};
+			let modelsToday = {};
+
+			const usageList = document.getElementById('accounts-usage-list');
+
+			// 增量更新：复用已有卡片，避免 innerHTML='' 导致全量闪烁
+			const existingCards = new Map();
+			usageList.querySelectorAll('[data-account-id]').forEach(card => {
+				existingCards.set(card.dataset.accountId, card);
+			});
+			const newAccountIds = new Set();
+
+			if (accounts.length === 0) {
+				usageList.innerHTML = '<div style="color: var(--text-muted); font-size:14px; text-align:center; padding: 20px; width: 100%;">没有绑定的账号，请前往\u201c账号管理\u201d添加账号。</div>';
+				updateLimitCards(limits);
+				return;
+			}
+
+			accounts.forEach(account => {
+				totalUsageToday += account.usageToday;
+				totalRequestsToday += account.usageTodayRequests || 0;
+
+			const percentage = limits.dailyLimit > 0 ? Number(((account.usageToday / limits.dailyLimit) * 100).toFixed(2)) : 0;
+				// ≥100% 红色，≥90% 橙色，其余绿色
+				const level = percentage >= 100 ? 'danger' : (percentage >= 90 ? 'warn' : 'ok');
+				const warningClass = account.status === 'error' ? 'badge-danger' : (account.status === 'pending' ? 'badge-info' : (level === 'danger' ? 'badge-danger' : (level === 'warn' ? 'badge-warning' : 'badge-success')));
+				const statusText = account.status === 'error' ? '连接异常' : (account.status === 'pending' ? '待刷新' : (percentage >= 100 ? '已用尽' : '正常运行'));
+				const roundedUsage = Math.ceil(account.usageToday);
+				newAccountIds.add(account.id);
+
+				// 7天历史总量
+				const history7d = (account.history || []).reduce((sum, h) => sum + (h.neurons || 0), 0);
+				// 本月用量（从 history 中提取当月）
+				const now = new Date();
+				const monthPrefix = now.toISOString().slice(0, 7); // "YYYY-MM"
+				const monthUsage = (account.history || []).filter(h => h.date && h.date.startsWith(monthPrefix)).reduce((sum, h) => sum + (h.neurons || 0), 0);
+				// 模型数量
+				const modelCount = (account.modelsToday || []).length;
+				// 7天请求次数
+				const requests7d = (account.history || []).reduce((sum, h) => sum + (h.requests || 0), 0);
+				// 账号ID 短格式
+				const shortId = account.accountId.length > 14
+					? account.accountId.substring(0, 8) + '...' + account.accountId.substring(account.accountId.length - 4)
+					: account.accountId;
+
+				let item = existingCards.get(account.id);
+				const isRefreshed = item && parseInt(item.dataset.lastUpdated || '0', 10) !== (account.lastUpdated || 0);
+
+				if (!item) {
+					item = document.createElement('div');
+					item.dataset.accountId = account.id;
+					item.style.padding = '16px 20px';
+					item.style.borderRadius = '14px';
+					item.style.border = '1px solid var(--border-color)';
+					item.style.backgroundColor = 'var(--card-bg)';
+					item.style.backdropFilter = 'blur(var(--glass-blur))';
+					usageList.appendChild(item);
+				} else {
+					item.className = '';
+					void item.offsetHeight;
+				}
+				if (isRefreshed) item.classList.add('refreshed');
+				item.dataset.lastUpdated = account.lastUpdated || 0;
+				item.innerHTML = \`
+					<div style="display:flex; justify-content:space-between; align-items:center; gap: 12px; margin-bottom: 10px;">
+						<div style="min-width: 0; flex: 1; display: flex; align-items: center; gap: 8px;">
+							<strong style="font-size:14px; font-weight:600; word-break: break-all; flex: 1 1 auto; min-width: 0;" title="\${escapeHtml(account.name)}">\${escapeHtml(account.name)}</strong>
+							<span style="font-size:10px; color: var(--text-muted); font-family: monospace; white-space: nowrap; flex-shrink: 0;">\${escapeHtml(shortId)}</span>
+						</div>
+						<span class="badge \${warningClass}" style="flex-shrink: 0; font-size: 10px; padding: 3px 8px;">\${statusText} · \${percentage.toFixed(2)}%</span>
+					</div>
+					<div class="usage-progress-container">
+						<div class="usage-progress-bar" style="width: \${Math.min(100, percentage)}%;"></div>
+					</div>
+					<div style="display:grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px 12px; font-size:11px; color: var(--text-muted); margin-top: 10px;">
+						<div><span style="opacity:0.6;">今日</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtTok(roundedUsage)}</strong> <span style="opacity:0.5;">Neurons</span></div>
+						<div><span style="opacity:0.6;">今日请求</span><br><strong style="color: var(--text-color); font-size: 13px;">\${(account.usageTodayRequests || 0).toLocaleString()}</strong></div>
+						<div><span style="opacity:0.6;">7日总量</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtTok(history7d)}</strong> <span style="opacity:0.5;">Neurons</span></div>
+						<div><span style="opacity:0.6;">7日请求</span><br><strong style="color: var(--text-color); font-size: 13px;">\${requests7d.toLocaleString()}</strong></div>
+						<div><span style="opacity:0.6;">本月用量</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtTok(monthUsage)}</strong> <span style="opacity:0.5;">Neurons</span></div>
+						<div><span style="opacity:0.6;">日限额</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtTok(limits.dailyLimit)}</strong> <span style="opacity:0.5;">Neurons</span></div>
+						<div><span style="opacity:0.6;">模型数</span><br><strong style="color: var(--text-color); font-size: 13px;">\${modelCount}</strong></div>
+						<div><span style="opacity:0.6;">状态</span><br><strong style="color: \${level === 'danger' ? '#ef4444' : (level === 'warn' ? '#f59e0b' : '#22c55e')}; font-size: 13px;">\${statusText}</strong></div>
+					</div>
+					\${account.error ? \`<div style="color: var(--danger-color); font-size:11px; margin-top: 8px; background: rgba(239,68,68,0.08); padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(239,68,68,0.12);">错误信息: \${escapeHtml(account.error)}</div>\` : ''}
+				\`;
+
+				if (account.history) {
+					account.history.forEach(h => {
+						historyData[h.date] = (historyData[h.date] || 0) + h.neurons;
+					});
+				}
+
+				if (account.modelsToday) {
+					account.modelsToday.forEach(m => {
+						modelsToday[m.model] = (modelsToday[m.model] || 0) + m.neurons;
+					});
+				}
+			});
+
+			// 清理已不存在的账号卡片
+			existingCards.forEach((card, id) => {
+				if (!newAccountIds.has(id)) card.remove();
+			});
+
+			// Top stats formatting
+			const roundedTotalUsageToday = Math.ceil(totalUsageToday);
+			document.getElementById('stat-total-neurons').innerText = fmtTok(roundedTotalUsageToday);
+			document.getElementById('stat-accounts-count').innerText = accounts.length;
+			document.getElementById('stat-total-requests').innerText = totalRequestsToday.toLocaleString();
+			
+			const overallPercentage = totalLimit > 0 ? Number(((totalUsageToday / totalLimit) * 100).toFixed(2)) : 0;
+			const neuronsDesc = document.getElementById('stat-neurons-desc');
+			if (neuronsDesc) {
+				const leftSpan = neuronsDesc.querySelector('span:first-child');
+				const rightSpan = neuronsDesc.querySelector('#stat-neurons-pct');
+				if (leftSpan) {
+					leftSpan.innerHTML = fmtTok(roundedTotalUsageToday) + ' / ' + fmtTok(totalLimit) + ' Neurons';
+				}
+				if (rightSpan) {
+					const pctText = overallPercentage > 100 ? '+' + (overallPercentage - 100).toFixed(2) + '%' : overallPercentage.toFixed(2) + '%';
+					rightSpan.innerText = pctText;
+					rightSpan.style.color = overallPercentage > 100 ? '#ef4444' : 'var(--primary-color)';
+				}
+			}
+			
+			const costSaved = (totalUsageToday / 1000) * 0.011;
+			document.getElementById('stat-cost-saving').innerText = '$' + costSaved.toFixed(2) + ' 节省成本';
+
+			updateLimitCards(limits);
+
+			const dates = Object.keys(historyData).sort();
+			const neuronsData = dates.map(d => historyData[d]);
+			renderHistoryChart(dates, neuronsData);
+
+			const models = Object.keys(modelsToday);
+			const modelsNeurons = models.map(m => modelsToday[m]);
+			renderModelsChart(models, modelsNeurons);
+		}
+
+		function updateLimitCards(limits) {
+			const { monthlyUsage = 0, monthlyRequests = 0, monthlyLimit = 100000, threshold = 0.9 } = limits || {};
+			const limitDisabled = threshold <= 0;
+
+			// 本月限额
+		const monthlyPct = monthlyLimit > 0 ? Number(((monthlyUsage / monthlyLimit) * 100).toFixed(2)) : 0;
+		document.getElementById('stat-monthly-usage').innerText = fmtTok(Math.ceil(monthlyUsage));
+		const monthlyDesc = document.getElementById('stat-monthly-desc');
+		if (monthlyDesc) {
+			const leftSpan = monthlyDesc.querySelector('span:first-child');
+			const rightSpan = monthlyDesc.querySelector('#stat-monthly-pct');
+			if (leftSpan) {
+				leftSpan.innerText = limitDisabled
+					? fmtTok(Math.ceil(monthlyUsage)) + ' Neurons · 限额关闭'
+					: fmtTok(Math.ceil(monthlyUsage)) + ' / ' + fmtTok(monthlyLimit) + ' Neurons';
+			}
+			if (rightSpan) {
+				if (limitDisabled) {
+					rightSpan.style.display = 'none';
+				} else {
+					rightSpan.style.display = '';
+					rightSpan.innerText = monthlyPct.toFixed(1) + '%';
+					rightSpan.style.color = '';
+				}
+			}
+		}
+			document.getElementById('stat-monthly-requests').innerText = monthlyRequests.toLocaleString();
+			
+		}
+
+		let isRefreshingUsage = false;
+		async function loadTokenStats() {
+			try {
+				const res = await fetch("/api/tokens/today");
+				if (!res.ok) return;
+				const data = await res.json();
+				const totalEl = document.getElementById("stat-tokens-total");
+				if (totalEl) totalEl.innerText = data.totalFmt || "0";
+				const inputEl = document.getElementById("stat-tokens-input");
+				if (inputEl) inputEl.innerText = data.inputFmt || "0";
+				const outputEl = document.getElementById("stat-tokens-output");
+				if (outputEl) outputEl.innerText = data.outputFmt || "0";
+				const speedEl = document.getElementById("stat-tokens-speed");
+				if (speedEl) speedEl.innerText = (data.avgTokPerSec || 0) + " tok/s";
+				const reasoningEl = document.getElementById("stat-tokens-reasoning");
+			if (reasoningEl) {
+				const reasoningVal = data.reasoningFmt || "0";
+				const cacheReadVal = data.cacheReadFmt || "0";
+				if (reasoningVal === "0" && cacheReadVal === "0") {
+					reasoningEl.style.display = "none";
+				} else {
+					reasoningEl.style.display = "";
+					reasoningEl.innerText = "推理 " + reasoningVal + " / 缓存读 " + cacheReadVal;
+				}
+			}
+			} catch (e) { console.error("Failed to load token stats:", e); }
+		}
+
+
+		let refreshTimer = null;
+
+		async function loadUsageDetails(isManual = false) {
+			if (isRefreshingUsage) return;
+
+			const now = Date.now();
+			const lastFetchedRaw = localStorage.getItem('cache_usage_details_last_fetched');
+			let lastFetched = lastFetchedRaw ? parseInt(lastFetchedRaw, 10) : 0;
+
+			// 优先从浏览器 localStorage 读取并渲染上次缓存的数据
+			const cachedDataRaw = localStorage.getItem('cache_accounts_usage');
+			if (cachedDataRaw) {
+				try {
+					const cachedData = JSON.parse(cachedDataRaw);
+					renderUsageDetails(cachedData);
+				} catch (e) {
+					console.error('Error parsing cached usage details:', e);
+				}
+			}
+			const cachedKeysCount = localStorage.getItem('cache_keys_count');
+			if (cachedKeysCount) {
+				document.getElementById('stat-keys-count').innerText = cachedKeysCount;
+			}
+
+			// 更新文字显示
+			updateLastUpdatedText(lastFetched);
+
+			// 防抖：距上次刷新不到 60s 则跳过（手动刷新除外）
+			if (!isManual && lastFetched && (now - lastFetched) < 60000) {
+				return;
+			}
+
+			const btn = document.getElementById('btn-refresh-usage');
+			let originalBtnText = '';
+			if (btn) {
+				originalBtnText = btn.innerHTML;
+				btn.disabled = true;
+				btn.innerHTML = '<span class="spinner"></span> 刷新中...';
+			}
+
+			isRefreshingUsage = true;
+
+			try {
+				// 并行请求账号用量和 API 密钥数
+				const [usageRes, keysRes] = await Promise.all([
+					apiFetch('/api/accounts/usage'),
+					apiFetch('/api/keys')
+				]);
+				const data = await usageRes.json();
+				const keys = await keysRes.json();
+
+				// 渲染最新的实时数据
+				renderUsageDetails(data);
+				document.getElementById('stat-keys-count').innerText = keys.length;
+
+				// 保存/更新本地缓存
+				localStorage.setItem('cache_accounts_usage', JSON.stringify(data));
+				localStorage.setItem('cache_keys_count', keys.length);
+				localStorage.setItem('cache_usage_details_last_fetched', now);
+				updateLastUpdatedText(now);
+
+			} catch (e) {
+				console.error(e);
+			} finally {
+				isRefreshingUsage = false;
+				if (btn) {
+					btn.disabled = false;
+					btn.innerHTML = originalBtnText;
+				}
+			}
+		}
+
+		function updateLastUpdatedText(timestamp) {
+			const label = document.getElementById('txt-last-updated');
+			if (!label) return;
+			if (!timestamp) {
+				label.innerText = '';
+				label.style.display = 'none';
+				return;
+			}
+			const diff = Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000);
+			let text;
+			if (diff < 10) text = 'now';
+			else if (diff < 60) text = diff + 's';
+			else if (diff < 3600) text = Math.floor(diff / 60) + 'm';
+			else if (diff < 86400) text = Math.floor(diff / 3600) + 'h';
+			else text = Math.floor(diff / 86400) + 'd';
+			label.innerText = text;
+		}
+
+		function onAdminThemeChange() {
+			if (currentTab === 'overview') loadUsageDetails();
+			loadTokenStats();
+		}
+
+		initTheme();
+
+		window.onload = function() {
+			const openaiUrl = window.location.origin + '/v1/chat/completions';
+			const anthropicUrl = window.location.origin + '/v1/messages';
+			const openaiUrlEl = document.getElementById('openai-endpoint-url');
+			const anthropicUrlEl = document.getElementById('anthropic-endpoint-url');
+			if (openaiUrlEl) {
+				openaiUrlEl.dataset.endpointUrl = openaiUrl;
+				openaiUrlEl.textContent = openaiUrl;
+			}
+			if (anthropicUrlEl) {
+				anthropicUrlEl.dataset.endpointUrl = anthropicUrl;
+				anthropicUrlEl.textContent = anthropicUrl;
+			}
+			loadUsageDetails();
+			loadTokenStats();
+			// 每秒更新"距上次刷新"的相对时间，并在每天 0:03 触发自动刷新
+			let _midnightRefreshed = false;
+			refreshTimer = setInterval(() => {
+				const lastFetchedRaw = localStorage.getItem('cache_usage_details_last_fetched');
+				const lastFetched = lastFetchedRaw ? parseInt(lastFetchedRaw, 10) : 0;
+				if (lastFetched) {
+					updateLastUpdatedText(lastFetched);
+				}
+				// 每天 UTC 0:02~0:05 之间强制刷新（跨天数据重置）
+				const h = new Date().getUTCHours();
+				const m = new Date().getUTCMinutes();
+				if (h === 0 && m >= 2 && m <= 5) {
+					if (!_midnightRefreshed) {
+						_midnightRefreshed = true;
+						loadUsageDetails(true);
+						loadTokenStats();
+					}
+				} else {
+					_midnightRefreshed = false;
+				}
+			}, 1000);
+		};
+
+		function toggleSidebar() {
+			document.getElementById('sidebar').classList.toggle('active');
+		}
+
+		async function logout() {
+			const res = await fetch('/api/auth/logout', { method: 'POST' });
+			if (res.ok) {
+				showToast('已安全退出登录');
+				setTimeout(() => {
+					window.location.href = '/';
+				}, 800);
+			}
+		}
+
+		function switchTab(tabName) {
+			if (tabName === currentTab) return;
+			currentTab = tabName;
+			document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+			document.getElementById('menu-' + tabName).classList.add('active');
+
+			document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+			document.getElementById('tab-' + tabName).classList.add('active');
+
+			const titles = {
+				overview: '数据看板',
+				accounts: '账号管理',
+				keys: 'API 密钥',
+				limits: '限额配置',
+				settings: '模型映射'
+			};
+			document.getElementById('view-title').innerText = titles[tabName];
+			document.getElementById('sidebar').classList.remove('active');
+
+			if (tabName === 'overview') {
+				loadUsageDetails();
+				loadTokenStats();
+			} else if (tabName === 'accounts') {
+				loadAccounts();
+			} else if (tabName === 'keys') {
+				loadKeys();
+			} else if (tabName === 'limits') {
+				loadLimits();
+			} else if (tabName === 'settings') {
+				loadSettings();
+			}
+		}
+
+		async function apiFetch(path, options = {}) {
+			// 对 POST/PUT/PATCH/DELETE 请求自动附加 CSRF Token（从 meta 标签读取）
+			const method = (options.method || 'GET').toUpperCase();
+			if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+				const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+				if (csrfMeta) {
+					options.headers = { ...options.headers, 'X-CSRF-Token': csrfMeta.getAttribute('content') };
+				}
+			}
+			const res = await fetch(path, options);
+			if (res.status === 401) {
+				window.location.href = '/';
+				throw new Error('Unauthorized');
+			}
+			return res;
+		}
+
+
+		function renderHistoryChart(labels, data) {
+			if (historyChart) historyChart.destroy();
+			const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+			const gridColor = isLight ? 'rgba(0, 0, 0, 0.05)' : 'rgba(255, 255, 255, 0.05)';
+			const textColor = isLight ? '#64748b' : '#94a3b8';
+			const ctx = document.getElementById('historyChart').getContext('2d');
+			const gradient = ctx.createLinearGradient(0, 0, 0, 300);
+			gradient.addColorStop(0, 'rgba(168, 85, 247, 0.35)');
+			gradient.addColorStop(1, 'rgba(168, 85, 247, 0.00)');
+			historyChart = new Chart(ctx, {
+				type: 'line',
+				data: {
+					labels: labels,
+					datasets: [{
+						label: 'Neuron 消耗数',
+						data: data,
+						borderColor: '#a855f7',
+						backgroundColor: gradient,
+						borderWidth: 3,
+						tension: 0.3,
+						fill: true,
+						pointBackgroundColor: '#a855f7',
+						pointBorderColor: 'rgba(255, 255, 255, 0.8)',
+						pointBorderWidth: 1.5,
+						pointRadius: 4,
+						pointHoverRadius: 6,
+						pointHoverBorderWidth: 3
+					}]
+				},
+				options: {
+					responsive: true,
+					maintainAspectRatio: false,
+					plugins: { legend: { display: false } },
+					scales: {
+						y: {
+							grid: { color: gridColor },
+							ticks: {
+								color: textColor,
+								callback: function(value) { return fmtTok(value); }
+							}
+						},
+						x: {
+							grid: { display: false },
+							ticks: {
+								color: textColor,
+								maxTicksLimit: 7,
+								callback: function(value, index) {
+									const d = new Date(labels[index]);
+									const month = String(d.getMonth() + 1).padStart(2, '0');
+									const day = String(d.getDate()).padStart(2, '0');
+									return month + '/' + day;
+								}
+							}
+						}
+					}
+				}
+			});
+		}
+
+		function renderModelsChart(labels, data) {
+			if (modelsChart) modelsChart.destroy();
+			
+			const legendContainer = document.getElementById('admin-chart-legend');
+			const canvasWrapper = document.getElementById('admin-canvas-wrapper');
+			const legendWrapper = document.getElementById('admin-legend-wrapper');
+			const placeholder = document.getElementById('admin-chart-placeholder');
+
+			if (legendContainer) legendContainer.innerHTML = '';
+
+			if (labels.length === 0) {
+				if (canvasWrapper) canvasWrapper.style.display = 'none';
+				if (legendWrapper) legendWrapper.style.display = 'none';
+				if (placeholder) placeholder.style.display = 'flex';
+				return;
+			} else {
+				if (canvasWrapper) canvasWrapper.style.display = 'flex';
+				if (legendWrapper) legendWrapper.style.display = 'flex';
+				if (placeholder) placeholder.style.display = 'none';
+			}
+
+			// Sort the model data descending by neurons
+			const combined = labels.map((label, idx) => ({
+				fullLabel: label,
+				cleanLabel: label.split('/').pop(),
+				value: data[idx]
+			})).sort((a, b) => b.value - a.value);
+
+			const sortedLabels = combined.map(x => x.cleanLabel);
+			const sortedData = combined.map(x => x.value);
+
+			const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+			const borderColor = isLight ? '#ffffff' : '#1e293b';
+			
+			if (modelsChart) modelsChart.destroy();
+			modelsChart = createDoughnutChart('modelsChart', sortedLabels, sortedData, borderColor);
+
+			// Render Custom HTML Legend for Admin Page
+			renderChartLegend(legendContainer, sortedLabels, sortedData, combined.map(x => x.fullLabel));
+		}
+
+		async function copyEndpointUrl(url) {
+			if (!url) return;
+			await copyText(url, '已复制接入地址！');
+		}
+
+		// 通用表格数据加载函数
+		async function loadTableData(url, tbodyId, emptyMsg, renderFn, onEmpty) {
+			try {
+				const res = await apiFetch(url);
+				const items = await res.json();
+				const tbody = document.getElementById(tbodyId);
+				tbody.innerHTML = '';
+				if (items.length === 0) {
+					tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-muted); padding: 30px;">' + emptyMsg + '</td></tr>';
+					if (onEmpty) onEmpty();
+					return;
+				}
+				if (onEmpty) onEmpty(items.length > 0);
+				items.forEach(item => {
+					const tr = document.createElement('tr');
+					tr.innerHTML = renderFn(item);
+					tbody.appendChild(tr);
+				});
+			} catch (e) {
+				console.error(e);
+			}
+		}
+
+		async function loadAccounts() {
+			await loadTableData('/api/accounts', 'accounts-table-body', '暂无配置的 Cloudflare 账号', (acc) => {
+				const maskedToken = acc.apiToken.length > 8 ? acc.apiToken.substring(0, 4) + '...' + acc.apiToken.substring(acc.apiToken.length - 4) : '********';
+				return \`
+					<td><strong style="font-weight:600;">\${escapeHtml(acc.name)}</strong></td>
+					<td><code>\${escapeHtml(acc.accountId)}</code></td>
+					<td><code>\${escapeHtml(maskedToken)}</code></td>
+					<td>
+						<div style="display:flex; gap:8px;">
+							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" onclick="editAccount(\${attrEscape(acc.id)}, \${attrEscape(acc.name)}, \${attrEscape(acc.accountId)}, \${attrEscape(acc.apiToken)})">编辑</button>
+							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteAccount(\${attrEscape(acc.id)})">删除</button>
+						</div>
+					</td>
+				\`;
+			});
+		}
+
+		function openAddAccountModal() {
+			document.getElementById('account-modal-title').innerText = '添加 Cloudflare 账号';
+			document.getElementById('account-id-edit').value = '';
+			document.getElementById('account-name').value = '';
+			document.getElementById('account-id').value = '';
+			document.getElementById('account-token').value = '';
+			document.getElementById('test-result-alert').style.display = 'none';
+			document.getElementById('perm-wa-read').innerHTML = '';
+			document.getElementById('perm-wa-edit').innerHTML = '';
+			document.getElementById('perm-aa-read').innerHTML = '';
+			document.getElementById('btn-save-account').disabled = true;
+			document.getElementById('account-modal').classList.add('active');
+		}
+
+		function closeAccountModal() {
+			document.getElementById('account-modal').classList.remove('active');
+		}
+
+		function editAccount(id, name, accountId, apiToken) {
+			document.getElementById('account-modal-title').innerText = '编辑 Cloudflare 账号';
+			document.getElementById('account-id-edit').value = id;
+			document.getElementById('account-name').value = name;
+			document.getElementById('account-id').value = accountId;
+			document.getElementById('account-token').value = apiToken;
+			document.getElementById('test-result-alert').style.display = 'none';
+			document.getElementById('perm-wa-read').innerHTML = '';
+			document.getElementById('perm-wa-edit').innerHTML = '';
+			document.getElementById('perm-aa-read').innerHTML = '';
+			document.getElementById('btn-save-account').disabled = true;
+			document.getElementById('account-modal').classList.add('active');
+		}
+
+		function onAccountInfoChange() {
+			document.getElementById('btn-save-account').disabled = true;
+			document.getElementById('test-result-alert').style.display = 'none';
+			document.getElementById('perm-wa-read').innerHTML = '';
+			document.getElementById('perm-wa-edit').innerHTML = '';
+			document.getElementById('perm-aa-read').innerHTML = '';
+		}
+
+		function updatePermissionStatus(elementId, statusObj) {
+			const el = document.getElementById(elementId);
+			if (!el) return;
+			if (statusObj && statusObj.success) {
+				el.innerHTML = '<span style="color: #10b981; font-weight: bold; margin-left: 6px;">✅ 有效</span>';
+			} else {
+				const err = (statusObj && statusObj.error) ? statusObj.error : '测试失败';
+			el.innerHTML = '<span style="color: #ef4444; font-weight: bold; margin-left: 6px;" title="' + escapeHtml(err) + '">🔴 无效</span>';
+			}
+		}
+
+		function setAlertStyle(el, type) {
+			const styles = {
+				warning: { bg: 'rgba(245, 158, 11, 0.12)', color: '#f59e0b', border: 'rgba(245, 158, 11, 0.3)' },
+				success: { bg: 'rgba(16, 185, 129, 0.12)', color: '#10b981', border: 'rgba(16, 185, 129, 0.3)' },
+				danger:  { bg: 'rgba(239, 68, 68, 0.12)', color: '#ef4444', border: 'rgba(239, 68, 68, 0.3)' }
+			};
+			const s = styles[type] || styles.danger;
+			el.style.backgroundColor = s.bg;
+			el.style.color = s.color;
+			el.style.borderColor = s.border;
+		}
+
+		const ALERT_ICONS = {
+			spinner: '<svg style="width:16px;height:16px;animation:spinner-border 1s linear infinite;flex-shrink:0;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>',
+			check:    '<svg style="width:18px;height:18px;flex-shrink:0;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>',
+			warning: '<svg style="width:18px;height:18px;flex-shrink:0;margin-top:1px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>'
+		};
+
+		async function testConnection() {
+			const accountId = document.getElementById('account-id').value;
+			const apiToken = document.getElementById('account-token').value;
+			const id = document.getElementById('account-id-edit').value;
+			const alertEl = document.getElementById('test-result-alert');
+			alertEl.style.display = 'block';
+			setAlertStyle(alertEl, 'warning');
+			alertEl.innerHTML = '<div style="display:flex;align-items:center;gap:8px;">' + ALERT_ICONS.spinner + '<span>测试中...</span></div>';
+
+			document.getElementById('perm-wa-read').innerHTML = '';
+			document.getElementById('perm-wa-edit').innerHTML = '';
+			document.getElementById('perm-aa-read').innerHTML = '';
+			document.getElementById('btn-save-account').disabled = true;
+
+			try {
+				const res = await apiFetch('/api/accounts/test', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ id, accountId, apiToken })
+				});
+				const data = await res.json();
+				if (data.permissions) {
+					updatePermissionStatus('perm-wa-read', data.permissions.workersAiRead);
+					updatePermissionStatus('perm-wa-edit', data.permissions.workersAiEdit);
+					updatePermissionStatus('perm-aa-read', data.permissions.accountAnalyticsRead);
+				}
+				if (data.success) {
+					setAlertStyle(alertEl, 'success');
+					alertEl.innerHTML = '<div style="display:flex;align-items:center;gap:8px;">' + ALERT_ICONS.check + '<span>连接成功！API 权限全部有效</span></div>';
+					showToast('连接测试成功！');
+					document.getElementById('btn-save-account').disabled = false;
+				} else {
+					setAlertStyle(alertEl, 'danger');
+
+					// Build structured error details from permissions data
+					let errorDetailHtml = '';
+					if (data.permissions) {
+						const permList = [
+							{ key: 'workersAiRead',       label: 'Workers AI > Read' },
+							{ key: 'workersAiEdit',       label: 'Workers AI > Edit' },
+							{ key: 'accountAnalyticsRead', label: 'Account Analytics > Read' }
+						];
+						const failedItems = permList.filter(p => {
+							const perm = data.permissions[p.key];
+							return perm && !perm.success;
+						});
+						if (failedItems.length > 0) {
+							errorDetailHtml = failedItems.map(p => {
+								const perm = data.permissions[p.key];
+								const errMsg = escapeHtml(perm.error || '未知错误');
+								return '<div style="padding:3px 0;word-break:break-all;overflow-wrap:break-word;"><span style="opacity:0.6;">●</span> <strong>' + p.label + '</strong>: ' + errMsg + '</div>';
+							}).join('');
+						}
+					}
+					if (!errorDetailHtml) {
+						errorDetailHtml = '<div style="padding:3px 0;word-break:break-all;overflow-wrap:break-word;">' + escapeHtml(data.error || '部分权限验证未通过') + '</div>';
+					}
+
+					alertEl.innerHTML = '<div style="display:flex;align-items:flex-start;gap:8px;">' +
+						ALERT_ICONS.warning +
+						'<div style="flex:1;min-width:0;">' +
+						'<div style="font-weight:700;margin-bottom:4px;">连接失败 — 以下权限验证未通过：</div>' +
+						'<div style="font-size:12px;opacity:0.85;line-height:1.7;">' + errorDetailHtml + '</div>' +
+						'</div>' +
+						'</div>';
+
+					showToast('测试连接失败，请检查 Token 权限', 'error');
+					document.getElementById('btn-save-account').disabled = true;
+				}
+			} catch (e) {
+				setAlertStyle(alertEl, 'danger');
+				alertEl.innerHTML = '<div style="display:flex;align-items:center;gap:8px;">' + ALERT_ICONS.warning + '<span>连接超时或异常，请重试</span></div>';
+				showToast('连接异常，请重试', 'error');
+				document.getElementById('btn-save-account').disabled = true;
+			}
+		}
+
+		async function saveAccount() {
+			const id = document.getElementById('account-id-edit').value;
+			const name = document.getElementById('account-name').value;
+			const accountId = document.getElementById('account-id').value;
+			const apiToken = document.getElementById('account-token').value;
+			if (!accountId || !apiToken) {
+				showToast('Account ID 和 API Token 均为必填项！', 'warning');
+				return;
+			}
+			const isEdit = id && id.trim();
+			const apiUrl = isEdit ? '/api/accounts/' + encodeURIComponent(id) : '/api/accounts';
+			const res = await apiFetch(apiUrl, {
+				method: isEdit ? 'PUT' : 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ name, accountId, apiToken })
+			});
+			if (res.ok) {
+				closeAccountModal();
+				loadAccounts();
+				showToast(isEdit ? '账号更新成功！' : '账号创建成功！');
+			} else {
+				showToast('保存失败！', 'error');
+			}
+		}
+
+		async function deleteAccount(id) {
+			if (!confirm('确定要删除这个 Cloudflare 账号吗？')) return;
+			await deleteResource('/api/accounts/', id, loadAccounts, '账号已成功删除', '删除失败');
+		}
+
+		async function loadKeys() {
+			await loadTableData('/api/keys', 'keys-table-body', '暂无配置的 API 密钥', (k) => {
+				const dateStr = new Date(k.createdAt).toLocaleString();
+				return \`
+					<td><strong style="font-weight:600;">\${escapeHtml(k.name)}</strong></td>
+					<td>
+						<div style="display:flex; align-items:center; gap:8px;">
+							<code id="key-val-\${k.id}">\${k.key.length > 6 ? k.key.substring(0, 5) + '...' + k.key.substring(k.key.length - 1) : k.key.substring(0, Math.min(3, k.key.length)) + '...'}</code>
+							<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" onclick="copyKeyText(\${attrEscape(k.key)})">复制</button>
+						</div>
+					</td>
+					<td>\${dateStr}</td>
+					<td>
+						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey(${attrEscape(k.id)})">删除</button>
+					</td>
+				\`;
+			}, (hasData) => {
+				const el = document.getElementById('no-key-warning');
+				if (el) el.classList.toggle('hidden', !!hasData);
+			});
+		}
+
+		async function copyKeyText(val) {
+			await copyText(val, 'API Key 复制成功！');
+		}
+
+		function openAddKeyModal() {
+			document.getElementById('key-name').value = '';
+			document.getElementById('key-val').value = '';
+			document.getElementById('key-modal-title').innerText = '生成新 API 密钥';
+			document.getElementById('key-modal-form').classList.remove('hidden');
+			document.getElementById('key-modal-success').classList.add('hidden');
+			document.getElementById('key-modal').classList.add('active');
+		}
+
+		function closeKeyModal() {
+			document.getElementById('key-modal').classList.remove('active');
+		}
+
+		async function saveKey() {
+			const name = document.getElementById('key-name').value;
+			const key = document.getElementById('key-val').value;
+			if (!name) {
+				showToast('请输入描述名称！', 'warning');
+				return;
+			}
+			const res = await apiFetch('/api/keys', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ name, key })
+			});
+			if (res.ok) {
+				const data = await res.json();
+				loadKeys();
+				document.getElementById('key-modal-title').innerText = '密钥已生成';
+				document.getElementById('key-modal-form').classList.add('hidden');
+				document.getElementById('key-modal-success').classList.remove('hidden');
+				document.getElementById('generated-key-val').value = data.key;
+			} else {
+				showToast('保存密钥失败！', 'error');
+			}
+		}
+
+		async function copyGeneratedKey() {
+			await copyText(document.getElementById('generated-key-val').value, 'API Key 复制成功！');
+		}
+
+		async function deleteKey(id) {
+			if (!confirm('确定要删除这个 API 密钥吗？')) return;
+			await deleteResource('/api/keys/', id, loadKeys, '密钥已成功删除', '删除密钥失败');
+		}
+
+		async function copyModelId(val) {
+			if (typeof val === 'string' && val.length >= 2 && val.charCodeAt(0) === 0x22 && val.charCodeAt(val.length - 1) === 0x22) {
+				val = val.slice(1, -1);
+			}
+			await copyText(val, \`已复制模型: \${val}\`);
+		}
+
+		async function loadSettings() {
+			try {
+				const res = await apiFetch('/api/settings');
+				const data = await res.json();
+				customMappings = data.customModelMap || {};
+				const items = Object.keys(customMappings).map(source => ({ source, target: customMappings[source] }));
+				const tbody = document.getElementById('mappings-table-body');
+				tbody.innerHTML = '';
+				if (items.length === 0) {
+					tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-muted); padding: 30px;">暂无模型映射</td></tr>';
+					return;
+				}
+				items.forEach(({ source, target }) => {
+					const isPreset = Object.prototype.hasOwnProperty.call(defaultMappings, source) && defaultMappings[source] === target;
+					const typeText = isPreset ? '<span class="badge badge-success">预设映射</span>' : '<span class="badge badge-warning">自定义</span>';
+					const tr = document.createElement('tr');
+					tr.innerHTML = \`
+					<td><code style="cursor: pointer;" title="点击复制" onclick="copyModelId(\${attrEscape(source)})">\${escapeHtml(source)}</code></td>
+					<td><code style="cursor: pointer;" title="点击复制" onclick="copyModelId(\${attrEscape(target)})">\${escapeHtml(target)}</code></td>
+					<td>\${typeText}</td>
+					<td>
+							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteMapping(\${attrEscape(source)})">删除</button>
+						</td>
+					\`;
+					tbody.appendChild(tr);
+				});
+			} catch(e) {
+				console.error(e);
+			}
+		}
+
+		async function addMapping() {
+			const source = document.getElementById('map-source').value.trim();
+			const target = document.getElementById('map-target').value.trim();
+			if (!source || !target) {
+				showToast('请求模型名称和目标模型路径不能为空！', 'warning');
+				return;
+			}
+			customMappings[source] = target;
+			const res = await apiFetch('/api/settings', {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ customModelMap: customMappings })
+			});
+			if (res.ok) {
+				document.getElementById('map-source').value = '';
+				document.getElementById('map-target').value = '';
+				loadSettings();
+				showToast('映射配置成功！');
+			} else {
+				showToast('添加映射失败！', 'error');
+			}
+		}
+
+		async function restorePresetMappings() {
+			const mergedMappings = { ...customMappings, ...defaultMappings };
+			const hasChanges = Object.keys(defaultMappings).some(source => customMappings[source] !== defaultMappings[source]);
+
+			if (!hasChanges) {
+				showToast('预设映射已存在，无需重复添加');
+				return;
+			}
+
+			const res = await apiFetch('/api/settings', {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ customModelMap: mergedMappings })
+			});
+			if (res.ok) {
+				customMappings = mergedMappings;
+				loadSettings();
+				showToast('已恢复预设映射');
+			} else {
+				showToast('恢复预设映射失败！', 'error');
+			}
+		}
+
+		async function deleteMapping(source) {
+			if (!confirm('确定要删除此映射吗？')) return;
+			delete customMappings[source];
+			const res = await apiFetch('/api/settings', {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ customModelMap: customMappings })
+			});
+			if (res.ok) {
+				loadSettings();
+				showToast('已删除映射');
+			} else {
+				showToast('删除映射失败！', 'error');
+			}
+		}
+
+		async function loadLimits() {
+			try {
+				const res = await apiFetch('/api/limits');
+				const data = await res.json();
+				document.getElementById('limits-daily').value = data.dailyLimit;
+				document.getElementById('limits-monthly').value = data.monthlyLimit;
+				document.getElementById('limits-threshold').value = data.threshold;
+			} catch (e) {
+				console.error(e);
+				showToast('加载限额配置失败', 'error');
+			}
+		}
+
+		async function saveLimits() {
+			const daily = parseInt(document.getElementById('limits-daily').value, 10);
+			const monthly = parseInt(document.getElementById('limits-monthly').value, 10);
+			const threshold = parseFloat(document.getElementById('limits-threshold').value);
+
+			if (isNaN(daily) || daily < 0) {
+				showToast('每日限额必须是非负整数', 'error');
+				return;
+			}
+			if (isNaN(monthly) || monthly < 0) {
+				showToast('每月限额必须是非负整数', 'error');
+				return;
+			}
+			if (isNaN(threshold) || threshold < 0 || threshold > 1) {
+				showToast('阈值必须在 0-1 之间', 'error');
+				return;
+			}
+
+			const res = await apiFetch('/api/limits', {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ dailyLimit: daily, monthlyLimit: monthly, threshold })
+			});
+
+			const msgEl = document.getElementById('limits-save-msg');
+			if (res.ok) {
+				msgEl.style.display = 'inline';
+				msgEl.style.color = 'var(--success-color)';
+				msgEl.textContent = '保存成功';
+				showToast('限额配置已保存');
+			} else {
+				msgEl.style.display = 'inline';
+				msgEl.style.color = 'var(--danger-color)';
+				msgEl.textContent = '保存失败';
+				showToast('保存失败', 'error');
+			}
+			setTimeout(() => { msgEl.style.display = 'none'; }, 3000);
+		}
+	</script>
+</body>
+</html>`;
+
+	return new Response(html, {
+		headers: {
+			'Content-Type': 'text/html; charset=utf-8',
+			'Set-Cookie': csrfCookie
+		}
+	});
+}
+
