@@ -1,271 +1,128 @@
 # cf-ai-gw
 
-一个反向代理:把 Cloudflare Workers AI 转换成 OpenAI / Anthropic 兼容的接口格式,支持多账号负载均衡、故障自动切换重试,并自带一个可视化管理面板(数据看板)。
+将 Cloudflare Workers AI 转成 OpenAI / Anthropic 兼容 API 的网关，单账号 AI Binding 直连，自带管理面板。
 
-仓库仅包含一个 `_worker.js` 文件,可直接部署到 **Cloudflare Pages**(Pages 高级模式,根目录放置 `_worker.js`)。
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YOUR_GITHUB_USERNAME/cf-ai-gw)
 
-## 功能特性
+## 一键部署
 
-- OpenAI 兼容接口(`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/models`、`/v1/images/generations`、`/v1/audio/transcriptions`)
-- Anthropic Messages API 兼容接口(`/v1/messages`、`/v1/messages/count_tokens`),支持流式与非流式
-- 多 Cloudflare 账号绑定,负载均衡 + 故障自动切换重试
-- 内置可视化管理面板(`/admin`),查看今日/本月用量、历史趋势、模型分布、各账号用量明细
-- 可配置每日/每月 Neurons 限额及拦截阈值
-- 代理 API Key 管理(可随机生成或自定义)
-- 模型名称映射:客户端模型名自动映射到 Cloudflare `@cf/` 模型,找不到映射时回退到默认模型并返回 `X-Model-Fallback-Warning` 响应头
-- 跨域(CORS)支持
-- 安全加固:异常日志不泄露 token、前端 XSS 防护、CSRF 防护,所有响应携带 `X-Request-Id` 请求追踪头
+1. 点击上方的 **Deploy to Cloudflare Workers** 按钮
+2. 授权 GitHub 登录 Cloudflare
+3. 仓库会自动 fork 到你账号下，Workers 会自动部署
+4. 部署完成后，在 Cloudflare Dashboard 中配置以下两项：
+   - **KV 命名空间**：创建一个 KV，绑定名为 `KV`
+   - **环境变量**：修改 `ADMIN_PASSWORD` 为你的密码
 
-## 部署到 Cloudflare Pages
-
-### 1. 创建 Pages 项目
-
-1. 进入 Cloudflare 控制台 → **Workers & Pages** → **创建应用** → 选择 **Pages**。
-2. 选择 **直接上传(Direct Upload)** 或连接 Git 仓库。
-3. 构建产物目录保持为根目录(确保 `_worker.js` 位于输出根目录,即 Pages 高级模式生效)。
-4. 部署完成后,会得到一个 `xxx.pages.dev` 域名。
-
-> Pages 高级模式要求:输出目录根下存在 `_worker.js`,它会接管所有请求路由(相当于 Pages Functions 的整站入口)。
-
-### 2. 创建一个 KV 命名空间
-
-1. 进入 Cloudflare 控制台 → **Workers & Pages** → **KV** → **创建命名空间**。
-2. 给命名空间取个名字(例如 `CF_AI_GW_KV`),创建完成。
-3. 记住这个名字,下一步绑定时要选它。
-
-### 3. 配置环境变量与绑定
-
-进入 Pages 项目 → **设置(Settings)** → **Functions** 区域,依次添加:
-
-- **环境变量**
-  - `ADMIN_PASSWORD`:后台管理面板与接口的访问密码(必填,未配置则拦截所有访问)。请使用强密码。
-  - 可选:`DAILY_LIMIT`(默认 10000)、`MONTHLY_LIMIT`(默认 100000)、`USAGE_THRESHOLD`(默认 0,即关闭限额拦截,仅统计)。
-
-- **KV 命名空间绑定(KV namespace bindings)**
-  - **变量名称(Variable name)**:填大写 `KV`(必须为 `KV`,代码中通过 `env.KV` 读取)。
-  - **KV 命名空间**:选择第 2 步创建的 KV 命名空间。
-
-- **Workers AI 绑定(Workers AI bindings)**(可选)
-  - **变量名称(Variable name)**:填 `AI`(即 Workers AI 绑定的标识)。
-  - 选择对应账号即可。
-  > 说明:当前代码实际通过 Cloudflare REST API 调用 Workers AI(使用面板中配置的账号 `Account ID` + `API Token`),并未直接使用 `env.AI` 绑定。此绑定可暂时不配,保留以备后续接入原生 Workers AI 绑定调用。
-
-> 绑定名称区分大小写,务必按上述大写填写 `KV`(必填)。`AI` 为可选项。
-
-### 4. 重新部署并验证
-
-1. 配置完环境变量与绑定后,触发一次重新部署(新增/修改绑定通常需要重新部署生效)。
-2. 打开 `https://<你的项目>.pages.dev/`,进入后台管理面板 `/admin`,使用 `ADMIN_PASSWORD` 登录。
-3. 在"账号管理"中添加 Cloudflare 账号(填入 `Account ID` 与 `API Token`,Token 需具备 Workers AI 的读/写权限)。
-4. 即可通过 `https://<你的项目>.pages.dev/v1/chat/completions` 调用 OpenAI 兼容接口,`Authorization` 头填代理 API Key(在面板中创建)。
-
-## 接口一览
-
-### OpenAI 兼容端点
-
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/v1/chat/completions` | POST | Chat 对话补全,支持流式 |
-| `/v1/completions` | POST | Text 文本补全,返回 `text_completion` 格式 |
-| `/v1/embeddings` | POST | 文本向量化 |
-| `/v1/models` | GET | 可用模型列表 |
-| `/v1/models/{model}` | GET | 查询单个模型详情 |
-| `/v1/images/generations` | POST | 图片生成(基于 Flux 模型) |
-| `/v1/audio/transcriptions` | POST | 音频转文字(基于 Whisper 模型) |
-| `/v1/audio/translations` | POST | 音频翻译为英文(基于 Whisper 模型) |
-| `/v1/audio/speech` | POST | 文字转语音(TTS) |
-
-### Anthropic 兼容端点
-
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/v1/messages` | POST | Messages API,支持流式与非流式 |
-| `/v1/messages/count_tokens` | POST | Token 计数估算 |
-
-### 管理面板端点
-
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/admin` | GET | 管理面板页面 |
-| `/api/auth/login` | POST | 登录认证 |
-| `/api/auth/logout` | POST | 退出登录 |
-| `/api/usage/summary` | GET/POST | 用量汇总(需认证) |
-| `/api/accounts` | GET/POST | 账号管理(需认证 + CSRF) |
-| `/api/accounts/:id` | PUT/DELETE | 更新/删除账号(需认证 + CSRF) |
-| `/api/accounts/test` | POST | 测试账号连接与 Token 权限(需认证 + CSRF) |
-| `/api/accounts/usage` | GET | 各账号用量明细(需认证) |
-| `/api/keys` | GET/POST | API Key 管理(需认证 + CSRF) |
-| `/api/keys/:id` | PUT/DELETE | 更新/删除 API Key(需认证 + CSRF) |
-| `/api/tokens/today` | GET | 今日 Token 统计(上传/下载/速度/推理/缓存) |
-| `/api/settings` | GET/PUT | 模型映射配置(需认证 + CSRF) |
-| `/api/limits` | GET/PUT | 限额配置(需认证 + CSRF) |
-
-## 接口调用示例
-
-### OpenAI Chat Completions
+## 手动部署
 
 ```bash
-curl https://<你的项目>.pages.dev/v1/chat/completions \
+# 1. 安装 wrangler
+npm install -g wrangler
+
+# 2. 登录
+wrangler login
+
+# 3. 创建 KV 命名空间
+wrangler kv:namespace create KV
+
+# 4. 将返回的 id 填入 wrangler.toml 的 YOUR_KV_NAMESPACE_ID
+
+# 5. 修改 wrangler.toml 中的 ADMIN_PASSWORD
+
+# 6. 部署
+wrangler deploy
+```
+
+## 配置说明
+
+| 配置项 | 位置 | 说明 |
+|--------|------|------|
+| `ADMIN_PASSWORD` | wrangler.toml `[vars]` | 管理面板登录密码（必填） |
+| `KV` | wrangler.toml `[[kv_namespaces]]` | KV 命名空间绑定，名称必须为 `KV` |
+| `AI` | wrangler.toml `[ai]` | Workers AI 绑定，自动生效 |
+
+### 可选环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DAILY_LIMIT` | 10000 | 每日 token 限额 |
+| `MONTHLY_LIMIT` | 100000 | 每月 token 限额 |
+| `USAGE_THRESHOLD` | 0 | 限额拦截阈值（0=仅统计不拦截） |
+| `OVERSIZE_TOKENS` | 200000 | 请求过大 token 闸（0=关闭） |
+| `CB_WINDOW_MS` | 10000 | 熔断器窗口（毫秒） |
+| `CB_FAIL_THRESHOLD` | 8 | 熔断器失败阈值 |
+| `CB_COOLDOWN_MS` | 4000 | 熔断器冷却时间（毫秒） |
+| `MODEL_DOWN_FAILS` | 3 | 模型断供判死连续失败数 |
+| `MODEL_DOWN_AFTER_MS` | 60000 | 模型断供判死持续时间（毫秒） |
+
+## API 端点
+
+### OpenAI 兼容
+
+| 端点 | 方法 |
+|------|------|
+| `/v1/chat/completions` | POST |
+| `/v1/completions` | POST |
+| `/v1/embeddings` | POST |
+| `/v1/models` | GET |
+| `/v1/models/{model}` | GET |
+| `/v1/images/generations` | POST |
+| `/v1/audio/transcriptions` | POST |
+| `/v1/audio/translations` | POST |
+| `/v1/audio/speech` | POST |
+
+### Anthropic 兼容
+
+| 端点 | 方法 |
+|------|------|
+| `/v1/messages` | POST |
+| `/v1/messages/count_tokens` | POST |
+
+### 管理面板
+
+| 端点 | 说明 |
+|------|------|
+| `/admin` | 可视化管理面板 |
+| `/api/auth/login` | 登录 |
+| `/api/tokens/today` | 今日 Token 统计 |
+| `/api/usage/summary` | 用量汇总 |
+| `/api/keys` | API Key 管理 |
+| `/api/settings` | 模型映射配置 |
+| `/api/limits` | 限额配置 |
+
+## 调用示例
+
+```bash
+curl https://cf-ai-gw.YOUR_SUBDOMAIN.workers.dev/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <你在面板中创建的代理APIKey>" \
-  -d '
-    "model": "llama-3.1-8b",
-    "messages": [{"role": "user", "content": "你好"}]
-  }'
-```
-
-### OpenAI Text Completions
-
-```bash
-curl https://<你的项目>.pages.dev/v1/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <代理APIKey>" \
-  -d '
-    "model": "llama-3.1-8b",
-    "prompt": "从前有座山"
-  }'
-```
-
-### OpenAI Embeddings
-
-```bash
-curl https://<你的项目>.pages.dev/v1/embeddings \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <代理APIKey>" \
-  -d '
-    "model": "text-embedding-3-small",
-    "input": ["你好", "世界"]
-  }'
-```
-
-### OpenAI Images Generations
-
-```bash
-curl https://<你的项目>.pages.dev/v1/images/generations \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <代理APIKey>" \
-  -d '
-    "model": "flux-1-schnell",
-    "prompt": "a cat in a hat",
-    "size": "1024x1024"
-  }'
-```
-
-> Cloudflare 图片生成端点单次调用只返回 1 张图片,不支持 `n>1`。即使客户端传入 `n>1`,也只返回 1 张,不重复同一张图。
-
-### OpenAI Audio Transcriptions
-
-```bash
-curl https://<你的项目>.pages.dev/v1/audio/transcriptions \
-  -H "Authorization: Bearer <代理APIKey>" \
-  -F "file=@audio.mp3" \
-  -F "model=whisper-1"
-```
-
-### OpenAI Audio Translations
-
-```bash
-curl https://<你的项目>.pages.dev/v1/audio/translations \
-  -H "Authorization: Bearer <代理APIKey>" \
-  -F "file=@audio.mp3" \
-  -F "model=whisper-1"
-```
-
-### OpenAI Audio Speech
-
-```bash
-curl https://<你的项目>.pages.dev/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <代理APIKey>" \
+  -H "Authorization: Bearer <面板中创建的API Key>" \
   -d '{
-    "model": "tts-1",
-    "input": "你好，世界",
-    "voice": "alloy"
-  }'
-```
-
-### Anthropic Messages
-
-```bash
-curl https://<你的项目>.pages.dev/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: <你在面板中创建的代理APIKey>" \
-  -d '
-    "model": "llama-3.1-8b",
-    "max_tokens": 1024,
+    "model": "glm-5.2",
     "messages": [{"role": "user", "content": "你好"}]
   }'
 ```
 
-### Anthropic Count Tokens
+## 内置模型
 
-```bash
-curl https://<你的项目>.pages.dev/v1/messages/count_tokens \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: <代理APIKey>" \
-  -d '
-    "model": "llama-3.1-8b",
-    "messages": [{"role": "user", "content": "你好"}]
-  }'
-```
+管理面板中可自定义模型映射，内置默认映射：
 
-## 流式调用(Stream)
+| 模型名 | Cloudflare 模型 |
+|--------|----------------|
+| `glm-5.2` | `@cf/zai-org/glm-5.2` |
+| `glm-4.7-flash` | `@cf/zai-org/glm-4.7-flash` |
+| `kimi-k2.7-code` | `@cf/moonshotai/kimi-k2.7-code` |
+| `kimi-k2.6` | `@cf/moonshotai/kimi-k2.6` |
+| `gemma-4-26b-a4b-it` | `@cf/google/gemma-4-26b-a4b-it` |
+| `deepseek-r1-distill-qwen-32b` | `@cf/deepseek-ai/deepseek-r1-distill-qwen-32b` |
+| `llama-3.1-8b` | `@cf/meta/llama-3.1-8b-instruct` |
+| ... | 更多见 `src/index.js` DEFAULT_MODEL_MAP |
 
-### OpenAI 格式流式
+## 特性
 
-在请求体中加入 `"stream": true` 即可开启 SSE 流式响应:
-
-```bash
-curl https://<你的项目>.pages.dev/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <代理APIKey>" \
-  -N \
-  -d '
-    "model": "llama-3.1-8b",
-    "stream": true,
-    "messages": [{"role": "user", "content": "你好"}]
-  }'
-```
-
-返回格式为标准 OpenAI SSE 流,每个 chunk 的 `data:` 行包含一段 JSON,末尾以 `data: [DONE]` 结束。`tool_calls`、`finish_reason`、`usage`、`reasoning_content` 等字段均原样透传。
-
-### Anthropic 格式流式
-
-```bash
-curl https://<你的项目>.pages.dev/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: <代理APIKey>" \
-  -N \
-  -d '
-    "model": "llama-3.1-8b",
-    "max_tokens": 1024,
-    "stream": true,
-    "messages": [{"role": "user", "content": "你好"}]
-  }'
-```
-
-返回格式为 Anthropic SSE 流,包含 `message_start`、`content_block_start`、`content_block_delta`(含 `text_delta` 和 `input_json_delta`)、`content_block_stop`、`message_delta`、`message_stop` 等事件。支持 `tool_use` 流式输出。
-
-> **注意:** 流式响应由 Cloudflare Workers AI 上游直接透传(OpenAI 格式仅替换模型名)或实时转换(Anthropic 格式)。如果上游在流式传输中途断开,客户端会收到截断的流,不会触发账号切换重试——这是 SSE 流式的设计特性。
->
-> 内置**可恢复流(Resumable Stream)**机制:当流式连接意外断开时,会自动尝试重连(最多 5 次,间隔递增 1s→5s),并通过 `skipCount` 跳过已发送的事件,确保不丢不重。
-
-## 模型映射
-
-客户端可使用简短模型名(如 `llama-3.1-8b`)或完整 Cloudflare 模型名(如 `@cf/meta/llama-3.1-8b-instruct`)。简短名通过内置映射表转换为 Cloudflare 实际模型路径。
-
-- 如果请求的模型名不在映射表中,将自动回退到默认模型(`@cf/meta/llama-3.1-8b-instruct`),并在响应头中添加 `X-Model-Fallback-Warning` 提示。
-- 可在管理面板"模型映射"中自定义映射关系,覆盖内置默认映射。
-
-## 关于数据看板"今日总消耗量"百分比
-
-看板百分比按真实用量计算,不再封顶到 100.00%,用量超过限额时会显示超过 100% 的真实值。为避免 UI 溢出,进度条宽度仍限制在最大 100%。
-
-### 数据看板功能
-
-- **账号用量明细**:顶部展示各账号用量、额度及进度条,每账号卡片显示状态、百分比、用量/限额
-- **今日用量**:实时显示今日 Neurons/Token 消耗、请求次数、输入/输出量,带自动刷新(30s)
-- **Token 统计**:上传/下载/速度/推理/缓存读数据
-- **本月用量限额**:月度累计用量及限额,支持进度条展示
-- **过去 7 日消耗走势**:折线图展示每日 Neurons 消耗趋势
-- **今日模型消耗占比**:环形图展示各模型消耗比例
+- **AI Binding 直连**：通过 `env.AI.run()` 内部 RPC 调用，无 HTTP/TLS 开销
+- **熔断器**：短时间内容量失败过多自动开闸快速失败
+- **模型断供闩**：连续 4006 错误自动跳过重试
+- **过大闸**：CJK 感知的 token 估算，拒绝超大请求
+- **友好报错**：将 Workers AI 错误码翻译为中文提示
+- **SSE 流式**：OpenAI / Anthropic 双协议流式支持，10 秒 ping 保活
+- **管理面板**：用量统计、API Key 管理、模型映射配置
