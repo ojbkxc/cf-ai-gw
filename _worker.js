@@ -607,7 +607,7 @@ function createKVGetter(kvKey, defaultValue) {
 			const raw = await env.KV.get(kvKey, { cacheTtl: 60 });
 			return safeJSONParse(raw, defaultValue);
 		})();
-		try { return await _promise; } finally { _promise = null; }
+		try { return await _promise; } finally { /* keep _promise for same-request dedup */ }
 	};
 }
 const getAccounts = createKVGetter('cfg_accounts', []);
@@ -1676,7 +1676,7 @@ function convertOpenAIToAnthropic(openaiResponse, originalModel) {
 			input_tokens: openaiResponse.usage?.prompt_tokens || 0,
 			output_tokens: openaiResponse.usage?.completion_tokens || 0,
 			cache_creation_input_tokens: openaiResponse.usage?.cache_creation_input_tokens || 0,
-			cache_read_input_tokens: (openaiResponse.usage?.prompt_tokens_details?.cached_tokens || openaiResponse.usage?.cache_read_input_tokens || 0)
+			cache_read_input_tokens: (openaiResponse.usage?.prompt_tokens_details?.cached_tokens ?? openaiResponse.usage?.cache_read_input_tokens ?? 0)
 		}
 	};
 
@@ -1859,6 +1859,10 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 					if (result.done) {
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
+							// 流结束，剩余不完整行视为完整事件发送
+							if (buffer.trim()) {
+								controller.enqueue(encoder.encode(`data: ${buffer.trim()}\n\n`));
+							}
 						}
 						if (!finalEventSent) {
 							sendFinalEvent(controller);
@@ -1890,11 +1894,10 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				} catch (e2) { console.error('anthropicStreamTransform secondary error:', e2?.message || e2); }
 				try { controller.close(); } catch (_) { }
 			}
-			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 		},
 		cancel() {
 			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-			reader.cancel();
+			return reader.cancel();
 		},
 	});
 
@@ -2334,7 +2337,7 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 		if (actualFallbackWarning) audioHeaders['X-Model-Fallback-Warning'] = actualFallbackWarning;
 		return new Response(JSON.stringify(result.data), { headers: audioHeaders });
 	} catch (e) {
-		return jsonError(`Failed to process audio${isTranslation ? ' translation' : ''}: ${e.message}`, 400, "invalid_request_error");
+		return jsonError(`Failed to process audio${isTranslation ? ' translation' : ''}: ${e?.message || e}`, 400, "invalid_request_error");
 	}
 }
 
@@ -2495,6 +2498,10 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 					if (result.done) {
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
+							// 流结束，剩余不完整行视为完整事件发送
+							if (buffer.trim()) {
+								controller.enqueue(encoder.encode(`data: ${buffer.trim()}\n\n`));
+							}
 						}
 						controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 						controller.close();
@@ -2521,11 +2528,10 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 				} catch (e2) { console.error('passthroughStream secondary error:', e2?.message || e2); }
 				try { controller.close(); } catch (_) { }
 			}
-			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 		},
 		cancel() {
 			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-			reader.cancel();
+			return reader.cancel();
 		},
 	});
 
@@ -2590,7 +2596,10 @@ async function handleDashboardApi(request, env, ctx) {
 	// 登录
 	if (url.pathname === '/api/auth/login' && method === 'POST') {
 		const { password } = await safeJsonBody(request) || {};
-		const expectedPassword = env.ADMIN_PASSWORD ? env.ADMIN_PASSWORD.trim() : '';
+		if (!env.ADMIN_PASSWORD || !env.ADMIN_PASSWORD.trim()) {
+			return new Response(JSON.stringify({ error: 'ADMIN_PASSWORD not configured' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+		}
+		const expectedPassword = env.ADMIN_PASSWORD.trim();
 		if (password === expectedPassword) {
 			const token = await sha256(password);
 			return new Response(JSON.stringify({ success: true }), {
@@ -3041,6 +3050,8 @@ async function handleDashboardApi(request, env, ctx) {
 			outputFmt: _ft(stats.output),
 			reasoningFmt: _ft(stats.reasoning),
 			totalFmt: _ft(stats.total),
+			cacheReadFmt: _ft(stats.cacheRead),
+			cacheWriteFmt: _ft(stats.cacheWrite),
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
@@ -5855,7 +5866,7 @@ async function handleAdminPage(request, env, ctx) {
 					</td>
 					<td>\${dateStr}</td>
 					<td>
-						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey('\${k.id}')">删除</button>
+						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey('\${attrEscape(k.id)}')">删除</button>
 					</td>
 				\`;
 			}, (hasData) => {
