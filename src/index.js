@@ -318,13 +318,16 @@ async function sha256(message) {
 // KV 工具函数
 function createKVGetter(kvKey, defaultValue) {
 	let _promise = null;
+	let _promiseTime = 0;
 	return async function(env) {
-		if (_promise) return _promise;
+		const now = Date.now();
+		if (_promise && (now - _promiseTime) < 60000) return _promise;
 		_promise = (async () => {
 			const raw = await env.KV.get(kvKey, { cacheTtl: 60 });
 			return safeJSONParse(raw, defaultValue);
 		})();
-		try { return await _promise; } finally { /* keep _promise for same-request dedup */ }
+		_promiseTime = now;
+		try { return await _promise; } finally { /* keep for 60s */ }
 	};
 }
 const getApiKeys = createKVGetter('cfg_api_keys', []);
@@ -442,12 +445,7 @@ function anthropicError(message, status = 400) {
 }
 
 function generateRequestId() {
-	const chars = 'abcdef0123456789';
-	let id = 'req_';
-	for (let i = 0; i < 24; i++) {
-		id += chars[Math.floor(Math.random() * chars.length)];
-	}
-	return id;
+	return 'req_' + crypto.randomUUID();
 }
 
 function readWithTimeout(reader, timeoutMs, { cancelOnTimeout = false } = {}) {
@@ -1317,22 +1315,10 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				enqueuedAny = true;
 				originalEnqueue(chunk);
 			};
-			let timeoutRetries = 0;
 
 			try {
 				while (true) {
-					let result;
-					try {
-						result = await readWithTimeout(reader, 120000);
-					} catch (e) {
-						if (e.message === 'Stream read timed out' && timeoutRetries < MAX_TIMEOUT_RETRIES) {
-							timeoutRetries++;
-							await new Promise(r => setTimeout(r, Math.min(1000 * timeoutRetries, 5000)));
-							continue;
-						}
-						throw e;
-					}
-					timeoutRetries = 0;
+					const result = await readWithTimeout(reader, 120000);
 					if (result.done) {
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
@@ -1906,21 +1892,16 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 			}, 10000);
 		},
 		async pull(controller) {
-			let timeoutRetries = 0;
+			let enqueuedAny = false;
+			const originalEnqueue = controller.enqueue.bind(controller);
+			controller.enqueue = (chunk) => {
+				enqueuedAny = true;
+				originalEnqueue(chunk);
+			};
+
 			try {
 				while (true) {
-					let result;
-					try {
-						result = await readWithTimeout(reader, 120000);
-					} catch (e) {
-						if (e.message === 'Stream read timed out' && timeoutRetries < MAX_TIMEOUT_RETRIES) {
-							timeoutRetries++;
-							await new Promise(r => setTimeout(r, Math.min(1000 * timeoutRetries, 5000)));
-							continue;
-						}
-						throw e;
-					}
-					timeoutRetries = 0;
+					const result = await readWithTimeout(reader, 120000);
 					if (result.done) {
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
@@ -1938,9 +1919,10 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 					buffer += decoder.decode(result.value, { stream: true });
 					buffer = processLines(buffer, controller);
 
-					if (buffer.indexOf('\n') === -1) {
+					if (buffer.indexOf('\n') === -1 && enqueuedAny) {
 						break;
 					}
+					enqueuedAny = false;
 				}
 			} catch (e) {
 				console.error(`passthroughStream upstream error: ${e?.message || e}`);
@@ -2034,7 +2016,9 @@ async function handleDashboardApi(request, env, ctx) {
 			return new Response(JSON.stringify({ error: 'ADMIN_PASSWORD not configured' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
 		}
 		const expectedPassword = env.ADMIN_PASSWORD.trim();
-		if (password === expectedPassword) {
+		const providedHash = await sha256(password || '');
+		const expectedHash = await sha256(expectedPassword);
+		if (timingSafeEqual(providedHash, expectedHash)) {
 			const token = await sha256(password);
 			return new Response(JSON.stringify({ success: true }), {
 				headers: {
@@ -2057,13 +2041,13 @@ async function handleDashboardApi(request, env, ctx) {
 	}
 
 	// 用量汇总（简化版：从 token 统计 KV 获取）
-	if (url.pathname === '/api/usage/summary') {
+	if (url.pathname === '/api/usage/summary' && method === 'GET') {
 		const isAuthorized = await checkAdminAuth(request, env);
 		if (!isAuthorized) {
 			return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
 		}
 
-		if (method === 'GET' || method === 'POST') {
+		{
 			const limits = await getUsageLimits(env);
 			const stats = await getTodayTokenStats(env);
 			const monthlyUsage = await getMonthlyUsage(env);

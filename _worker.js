@@ -272,6 +272,10 @@ function createResumableStream(reader, options) {
 							controller.error(new Error('Resume fetch returned no stream.'));
 							return;
 						}
+						// 取消旧 reader 防止内存泄漏
+						if (currentReader) {
+							currentReader.cancel().catch(() => {});
+						}
 						currentReader = newStream.getReader();
 					} catch (fetchErr) {
 						controller.error(fetchErr);
@@ -722,12 +726,7 @@ function anthropicError(message, status = 400) {
 
 // 生成唯一请求 ID（OpenAI 标准 X-Request-Id 格式）
 function generateRequestId() {
-	const chars = 'abcdef0123456789';
-	let id = 'req_';
-	for (let i = 0; i < 24; i++) {
-		id += chars[Math.floor(Math.random() * chars.length)];
-	}
-	return id;
+	return 'req_' + crypto.randomUUID();
 }
 
 // 带超时的流读取。
@@ -1826,23 +1825,10 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				enqueuedAny = true;
 				originalEnqueue(chunk);
 			};
-			let timeoutRetries = 0;
 
 			try {
 				while (true) {
-					let result;
-					try {
-						result = await readWithTimeout(reader, 120000);
-					} catch (e) {
-						// 流读取超时：模型可能正在思考，重试
-						if (e.message === 'Stream read timed out' && timeoutRetries < MAX_TIMEOUT_RETRIES) {
-							timeoutRetries++;
-							await new Promise(r => setTimeout(r, Math.min(1000 * timeoutRetries, 5000)));
-							continue;
-						}
-						throw e;
-					}
-					timeoutRetries = 0;
+					const result = await readWithTimeout(reader, 120000);
 					if (result.done) {
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
@@ -2467,22 +2453,16 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 			}, 10000);
 		},
 		async pull(controller) {
-			let timeoutRetries = 0;
+			let enqueuedAny = false;
+			const originalEnqueue = controller.enqueue.bind(controller);
+			controller.enqueue = (chunk) => {
+				enqueuedAny = true;
+				originalEnqueue(chunk);
+			};
+
 			try {
 				while (true) {
-					let result;
-					try {
-						result = await readWithTimeout(reader, 120000);
-					} catch (e) {
-						// 流读取超时：模型可能正在思考，重试
-						if (e.message === 'Stream read timed out' && timeoutRetries < MAX_TIMEOUT_RETRIES) {
-							timeoutRetries++;
-							await new Promise(r => setTimeout(r, Math.min(1000 * timeoutRetries, 5000)));
-							continue;
-						}
-						throw e;
-					}
-					timeoutRetries = 0; // 成功读取到数据，重置重试计数
+					const result = await readWithTimeout(reader, 120000);
 					if (result.done) {
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
@@ -2501,9 +2481,10 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 					buffer += decoder.decode(result.value, { stream: true });
 					buffer = processLines(buffer, controller);
 
-					if (buffer.indexOf('\n') === -1) {
+					if (buffer.indexOf('\n') === -1 && enqueuedAny) {
 						break;
 					}
+					enqueuedAny = false;
 				}
 			} catch (e) {
 				// 上游异常时兜底发送 [DONE]
@@ -2589,7 +2570,9 @@ async function handleDashboardApi(request, env, ctx) {
 			return new Response(JSON.stringify({ error: 'ADMIN_PASSWORD not configured' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
 		}
 		const expectedPassword = env.ADMIN_PASSWORD.trim();
-		if (password === expectedPassword) {
+		const providedHash = await sha256(password || '');
+		const expectedHash = await sha256(expectedPassword);
+		if (timingSafeEqual(providedHash, expectedHash)) {
 			const token = await sha256(password);
 			return new Response(JSON.stringify({ success: true }), {
 				headers: {
@@ -2612,14 +2595,14 @@ async function handleDashboardApi(request, env, ctx) {
 	}
 
 	// 用量汇总
-	if (url.pathname === '/api/usage/summary') {
-		// GET 和 POST 均需要登录认证
+	if (url.pathname === '/api/usage/summary' && method === 'GET') {
+		// GET 需要登录认证
 		const isAuthorized = await checkAdminAuth(request, env);
 		if (!isAuthorized) {
 			return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
 		}
 
-		if (method === 'GET') {
+		{
 			const cached = await getCachedSummary(env);
 			const todayStr = getTodayStr();
 			if (cached && cached.summaryDate === todayStr) {
@@ -2656,20 +2639,6 @@ async function handleDashboardApi(request, env, ctx) {
 				try { cacheMap = JSON.parse(cachedDetailsRaw) || {}; } catch (e) { console.error('Failed to parse cache_usage_details:', e); }
 			}
 
-			const summary = await buildUsageSummary(env, accounts, cacheMap);
-			ctx.waitUntil(setCachedSummary(env, summary)); // 后台写缓存，不阻塞响应
-			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
-		}
-
-		if (method === 'POST') {
-			const accounts = await getAccounts(env);
-			const limits = await getUsageLimits(env);
-
-			if (accounts.length === 0) {
-				return new Response(JSON.stringify(emptyUsageResponse(limits)), { headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
-			}
-
-			const cacheMap = await refreshAccountsUsage(env, accounts);
 			const summary = await buildUsageSummary(env, accounts, cacheMap);
 			ctx.waitUntil(setCachedSummary(env, summary)); // 后台写缓存，不阻塞响应
 			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
