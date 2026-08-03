@@ -5855,7 +5855,7 @@ async function handleAdminPage(request, env, ctx) {
 					</td>
 					<td>\${dateStr}</td>
 					<td>
-						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey(${attrEscape(k.id)})">删除</button>
+						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey(\${attrEscape(k.id)})">删除</button>
 					</td>
 				\`;
 			}, (hasData) => {
