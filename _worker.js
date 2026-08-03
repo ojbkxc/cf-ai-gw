@@ -1070,7 +1070,7 @@ async function queryGraphQL(accountId, apiToken, startDateTime) {
 				start: startDateTime
 			}
 		}),
-		signal: AbortSignal.timeout(60000),
+		signal: AbortSignal.timeout(20000),
 	});
 
 	if (!response.ok) {
@@ -1270,7 +1270,7 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 		if (attempt > 0) {
 			console.warn(`[Retry] Retrying account ${accountIndex} (attempt ${attempt + 1}/3)...`);
 		}
-		const timeoutMs = stream ? 600000 : 300000;
+		const timeoutMs = stream ? 600000 : 120000;
 		const apiUrl = buildCFUrl(account, 'v1/chat/completions');
 		const cfResponse = await fetch(apiUrl, {
 			method: 'POST',
@@ -1379,7 +1379,7 @@ async function callCFRunAPI(cfModel, buildPayload, processResult, env) {
 		const apiUrl = buildCFUrl(account, `run/${cfModel}`);
 		const cfResponse = await fetch(apiUrl, {
 			...cfPayload,
-			signal: AbortSignal.timeout(300000),
+			signal: AbortSignal.timeout(120000),
 		});
 
 		if (cfResponse.ok) {
@@ -1751,8 +1751,8 @@ function convertOpenAIErrorToAnthropic(openaiError) {
 
 async function handleMessages(request, env, ctx) {
 	const requestStartTime = Date.now();
-	const anthropicBody = await safeJsonBody(request);
-	if (!anthropicBody) return anthropicError('Request body too large (max 10MB).');
+	const anthropicBody = await safeJsonBody(request, 32);
+	if (!anthropicBody) return anthropicError('Request body too large (max 32MB).');
 
 	if (!anthropicBody.messages || !Array.isArray(anthropicBody.messages)) {
 		return anthropicError('messages field is required and must be an array.');
@@ -1854,7 +1854,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				while (true) {
 					let result;
 					try {
-						result = await readStreamWithTimeout(reader, 240000);
+						result = await readStreamWithTimeout(reader, 120000);
 					} catch (e) {
 						// 流读取超时：模型可能正在思考，重试
 						if (e.message === 'Stream read timed out' && timeoutRetries < MAX_TIMEOUT_RETRIES) {
@@ -2321,7 +2321,7 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 					method: 'POST',
 					headers: { 'Authorization': `Bearer ${account.apiToken}` },
 					body: cfFormData,
-					signal: AbortSignal.timeout(300000),
+					signal: AbortSignal.timeout(120000),
 				};
 			},
 			(cfResult) => ({ text: cfResult.text || '' }),
@@ -2369,7 +2369,7 @@ async function handleAudioSpeech(request, env, ctx) {
 			method: 'POST',
 			headers: browserHeaders(account.apiToken),
 			body: JSON.stringify(cfPayload),
-			signal: AbortSignal.timeout(300000),
+			signal: AbortSignal.timeout(120000),
 		});
 
 		if (cfResponse.ok) {
@@ -2487,7 +2487,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 				while (true) {
 					let result;
 					try {
-						result = await readStreamWithTimeout(reader, 240000);
+						result = await readStreamWithTimeout(reader, 120000);
 					} catch (e) {
 						// 流读取超时：模型可能正在思考，重试
 						if (e.message === 'Stream read timed out' && timeoutRetries < MAX_TIMEOUT_RETRIES) {
