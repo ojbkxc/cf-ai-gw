@@ -1,15 +1,28 @@
 # cf-ai-gw — Cloudflare Worker 部署配置
-# 将 Cloudflare Workers AI 转成 OpenAI / Anthropic 兼容 API，单账号 AI Binding 直连。
+# 将 Cloudflare Workers AI 转成 OpenAI / Anthropic 兼容 API。
+#
+# 支持两种部署模式，按需切换 main 字段即可：
+#
+#   模式 A（推荐，规避检查）：Worker + AI Binding
+#     main = "src/index.js"   + 保留下方 [ai] binding
+#     调用路径：Worker → AI Binding RPC → Workers AI（内部 RPC，不经公网）
+#
+#   模式 B（多账号 failover）：Worker / Pages + REST API
+#     main = "_worker.js"     + 注释掉下方 [ai] binding
+#     调用路径：Worker → 公网 HTTPS → api.cloudflare.com（需在面板配置账号 Token）
+#
+# 两种模式的 API 端点完全一致，客户端无感切换。
 
 name = "cf-ai-gw"
 main = "src/index.js"
 compatibility_date = "2025-08-01"
 
-# === Workers AI 绑定 ===
+# === Workers AI 绑定（仅模式 A 需要，模式 B 请注释掉）===
 [ai]
 binding = "AI"
 
-# === KV 命名空间绑定 ===
+# === KV 命名空间绑定（两种模式都需要）===
+# KV 命名空间的创建名称可随意，只有 id 需要填对；binding 必须是 "KV"
 [[kv_namespaces]]
 binding = "KV"
 id = "YOUR_KV_NAMESPACE_ID"
