@@ -54,13 +54,6 @@ function getTodayStr() {
 	return new Date().toISOString().split('T')[0];
 }
 
-function trackUsage(env, ctx, tokens, requestStartTime) {
-	accumulateTokens(env, ctx, {
-		...tokens,
-		durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
-	});
-}
-
 // 多账号 failover 通用函数：遍历账号列表，每账号最多重试一次
 // onAccount(account, attempt, accountIndex) 返回:
 //   { retry: false, ... }  → 成功或不可重试错误，直接返回
@@ -315,13 +308,6 @@ function createResumableStream(reader, options) {
 			}
 		},
 	});
-}
-
-function fmtTok(n) {
-	if (n < 1000) return String(n);
-	if (n < 1000000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
-	if (n < 1000000000) return (n / 1000000).toFixed(2).replace(/\.?0+$/, '') + 'M';
-	return (n / 1000000000).toFixed(2).replace(/\.?0+$/, '') + 'B';
 }
 
 const TOKEN_KV_TTL_SEC = 86400 * 2;    // KV 键保留 2 天
@@ -1413,13 +1399,6 @@ async function callCFRunAPI(cfModel, buildPayload, processResult, env) {
 	});
 }
 
-// 统一的模型名解析 + fallback warning 构造
-async function resolveModelWithFallback(model, env) {
-	const { cfModel, isFallback } = await resolveModelName(model, env);
-	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
-	return { cfModel, isFallback, fallbackWarning };
-}
-
 async function handleCompletions(request, env, ctx, pathname) {
 	const body = await safeJsonBody(request, 10);
 	if (!body) return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
@@ -1435,7 +1414,8 @@ async function handleCompletions(request, env, ctx, pathname) {
 		return jsonError("prompt field is required", 400, "invalid_request_error");
 	}
 
-	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model, env);
+	const { cfModel, isFallback } = await resolveModelName(model, env);
+	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
 
 	const cfPayload = {
 		model: cfModel,
@@ -1475,12 +1455,13 @@ async function handleCompletions(request, env, ctx, pathname) {
 	if (cfJson.model !== undefined) cfJson.model = model;
 	if (ctx && cfJson.usage) {
 		const _u = cfJson.usage, _pd = _u.prompt_tokens_details || {};
-		trackUsage(env, ctx, {
+		accumulateTokens(env, ctx, {
 			input: _u.prompt_tokens || 0, output: _u.completion_tokens || 0,
 			reasoning: _u.reasoning_tokens || 0,
 			cacheRead: _pd.cached_tokens || _u.cache_read_tokens || 0,
 			cacheWrite: _u.cache_write_tokens || 0,
-		}, requestStartTime);
+			durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
+		});
 	}
 	if (pathname === '/v1/completions') {
 		const textChoices = (cfJson.choices || []).map(c => ({
@@ -1778,7 +1759,8 @@ async function handleMessages(request, env, ctx) {
 	}
 
 	const model = anthropicBody.model;
-	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model, env);
+	const { cfModel, isFallback } = await resolveModelName(model, env);
+	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
 
 	const openaiBody = convertAnthropicToOpenAI(anthropicBody);
 	openaiBody.model = cfModel;
@@ -1819,12 +1801,13 @@ async function handleMessages(request, env, ctx) {
 	const openaiResponse = result.data;
 	if (ctx && openaiResponse.usage) {
 		const _u = openaiResponse.usage, _pd = _u.prompt_tokens_details || {};
-		trackUsage(env, ctx, {
+		accumulateTokens(env, ctx, {
 			input: _u.prompt_tokens || 0, output: _u.completion_tokens || 0,
 			reasoning: _u.reasoning_tokens || 0,
 			cacheRead: _pd.cached_tokens || _u.cache_read_tokens || 0,
 			cacheWrite: _u.cache_write_tokens || 0,
-		}, requestStartTime);
+			durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
+		});
 	}
 	return jsonResponse(convertOpenAIToAnthropic(openaiResponse, model), fallbackWarning);
 }
@@ -2155,13 +2138,14 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 
 		// 流结束时累加 token 统计
 		if (env && ctx && (inputTokens > 0 || outputTokens > 0)) {
-			trackUsage(env, ctx, {
+			accumulateTokens(env, ctx, {
 				input: inputTokens,
 				output: outputTokens,
 				reasoning: reasoningTokens,
 				cacheRead: cacheReadTokens,
 				cacheWrite: cacheWriteTokens,
-			}, requestStartTime);
+				durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
+			});
 		}
 	}
 }
@@ -2178,7 +2162,8 @@ async function handleEmbeddings(request, env, ctx) {
 		return jsonError("input is required", 400, "invalid_request_error");
 	}
 
-	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model, env);
+	const { cfModel, isFallback } = await resolveModelName(model, env);
+	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
 	const textArray = Array.isArray(input) ? input : [input];
 
 	const result = await callCFRunAPI(
@@ -2209,7 +2194,7 @@ async function handleEmbeddings(request, env, ctx) {
 	}
 
 	if (result.data?.usage?.prompt_tokens) {
-		trackUsage(env, ctx, { input: result.data.usage.prompt_tokens }, requestStartTime);
+		accumulateTokens(env, ctx, { input: result.data.usage.prompt_tokens, durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0 });
 	}
 
 	const embHeaders = { 'Content-Type': 'application/json' };
@@ -2228,7 +2213,8 @@ async function handleImageGenerations(request, env, ctx) {
 	}
 
 	// 模型映射：默认使用 flux-1-schnell
-	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model || 'flux-1-schnell', env);
+	const { cfModel, isFallback } = await resolveModelName(model || 'flux-1-schnell', env);
+	const fallbackWarning = isFallback ? `Model "${model || 'flux-1-schnell'}" not found in mapping, fell back to ${cfModel}` : null;
 
 	// 解析尺寸参数 (e.g. "1024x1024") → CF 的 width/height
 	let width = 1024, height = 1024;
@@ -2284,7 +2270,7 @@ async function handleImageGenerations(request, env, ctx) {
 	const imgHeaders = { 'Content-Type': 'application/json' };
 	if (fallbackWarning) imgHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
 	if (ctx && prompt) {
-		trackUsage(env, ctx, { input: Math.ceil(prompt.length / 3) }, requestStartTime);
+		accumulateTokens(env, ctx, { input: Math.ceil(prompt.length / 3), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0 });
 	}
 	return new Response(JSON.stringify(result.data), { headers: imgHeaders });
 }
@@ -2312,7 +2298,8 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 			return jsonError("file is required", 400, "invalid_request_error");
 		}
 
-		const { cfModel, fallbackWarning } = await resolveModelWithFallback(model, env);
+		const { cfModel, isFallback } = await resolveModelName(model, env);
+		const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
 
 		// 非 whisper 模型强制回退，避免音频发给文字模型导致 "Invalid input"
 		const WHISPER_MODEL = '@cf/openai/whisper-large-v3-turbo';
@@ -2346,7 +2333,7 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 		}
 
 		if (ctx && result.data?.text) {
-			trackUsage(env, ctx, { output: Math.ceil(result.data.text.length / 3) }, requestStartTime);
+			accumulateTokens(env, ctx, { output: Math.ceil(result.data.text.length / 3), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0 });
 		}
 
 		const audioHeaders = { 'Content-Type': 'application/json' };
@@ -2368,7 +2355,8 @@ async function handleAudioSpeech(request, env, ctx) {
 		return jsonError("input is required", 400, "invalid_request_error");
 	}
 
-	const { cfModel, fallbackWarning } = await resolveModelWithFallback(model || 'tts', env);
+	const { cfModel, isFallback } = await resolveModelName(model || 'tts', env);
+	const fallbackWarning = isFallback ? `Model "${model || 'tts'}" not found in mapping, fell back to ${cfModel}` : null;
 
 	const cfPayload = { prompt: input };
 	if (voice) cfPayload.voice = voice;
@@ -2388,7 +2376,7 @@ async function handleAudioSpeech(request, env, ctx) {
 			const audioBuffer = await cfResponse.arrayBuffer();
 			const contentType = cfResponse.headers.get('Content-Type') || 'audio/wav';
 			if (ctx) {
-				trackUsage(env, ctx, { input: Math.ceil(input.length / 4) }, requestStartTime);
+				accumulateTokens(env, ctx, { input: Math.ceil(input.length / 4), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0 });
 			}
 			return { success: true, data: { audioBuffer, contentType } };
 		}
@@ -2518,13 +2506,14 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 						controller.close();
 						if (streamUsage && env && ctx) {
 							const promptDetails = streamUsage.prompt_tokens_details || {};
-							trackUsage(env, ctx, {
+							accumulateTokens(env, ctx, {
 								input: streamUsage.prompt_tokens || 0,
 								output: streamUsage.completion_tokens || 0,
 								reasoning: streamUsage.reasoning_tokens || 0,
 								cacheRead: promptDetails.cached_tokens || streamUsage.cache_read_tokens || 0,
 								cacheWrite: streamUsage.cache_write_tokens || 0,
-							}, requestStartTime);
+								durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
+							});
 						}
 						break;
 					}
@@ -3051,6 +3040,7 @@ async function handleDashboardApi(request, env, ctx) {
 	// 今日 Token 统计（公开）
 	if (url.pathname === '/api/tokens/today' && method === 'GET') {
 		const stats = await getTodayTokenStats(env);
+		const _ft = n => n < 1000 ? String(n) : n < 1000000 ? (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K' : n < 1000000000 ? (n / 1000000).toFixed(2).replace(/\.?0+$/, '') + 'M' : (n / 1000000000).toFixed(2).replace(/\.?0+$/, '') + 'B';
 		return new Response(JSON.stringify({
 			input: stats.input,
 			output: stats.output,
@@ -3060,10 +3050,10 @@ async function handleDashboardApi(request, env, ctx) {
 			total: stats.total,
 			requests: stats.requests,
 			avgTokPerSec: stats.avgTokPerSec,
-			inputFmt: fmtTok(stats.input),
-			outputFmt: fmtTok(stats.output),
-			reasoningFmt: fmtTok(stats.reasoning),
-			totalFmt: fmtTok(stats.total),
+			inputFmt: _ft(stats.input),
+			outputFmt: _ft(stats.output),
+			reasoningFmt: _ft(stats.reasoning),
+			totalFmt: _ft(stats.total),
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
@@ -3256,16 +3246,10 @@ const SHARED_BG_CSS = `
 			position: absolute;
 			border-radius: 50%;
 			filter: blur(100px);
-			animation: float 25s infinite alternate ease-in-out;
 		}
 
-		.bg-orb-1 { top: -10%; left: -10%; width: 50vw; height: 50vw; background: var(--orb-1-color); animation-duration: 20s; }
-		.bg-orb-2 { bottom: -10%; right: -10%; width: 60vw; height: 60vw; background: var(--orb-2-color); animation-duration: 30s; animation-delay: -5s; }
-
-		@keyframes float {
-			0% { transform: translate(0, 0) scale(1); }
-			100% { transform: translate(5%, 5%) scale(1.1); }
-		}`;
+		.bg-orb-1 { top: -10%; left: -10%; width: 50vw; height: 50vw; background: var(--orb-1-color); }
+		.bg-orb-2 { bottom: -10%; right: -10%; width: 60vw; height: 60vw; background: var(--orb-2-color); }`;
 
 // 两个页面共享的图表 wrapper CSS（含移动端响应式）
 const SHARED_CHART_CSS = `
@@ -3738,31 +3722,7 @@ async function handleLandingPage(request, env, ctx) {
 			}
 		}
 
-		@keyframes fadeInUp {
-			from {
-				opacity: 0;
-				transform: translateY(24px);
-			}
-			to {
-				opacity: 1;
-				transform: translateY(0);
-			}
-		}
-
-		.animate-fade-in-up {
-			opacity: 0;
-			animation: fadeInUp 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-		}
-
-		.delay-1 {
-			animation-delay: 0.15s;
-		}
-
-		.delay-2 {
-			animation-delay: 0.3s;
-		}
-
-		@keyframes spin {
+		@keyframes spinner-border {
 			to { transform: rotate(360deg); }
 		}
 
@@ -3773,7 +3733,7 @@ async function handleLandingPage(request, env, ctx) {
 			border: 2px solid rgba(168, 85, 247, 0.2);
 			border-radius: 50%;
 			border-top-color: var(--accent-color);
-			animation: spin 1s linear infinite;
+			animation: spinner-border 1s linear infinite;
 		}
 
 		.login-header {
@@ -3897,14 +3857,14 @@ async function handleLandingPage(request, env, ctx) {
 	</div>
 
 	<div class="dashboard-container">
-		<div class="login-header animate-fade-in-up" style="margin-bottom: 8px;">
+		<div class="login-header" style="margin-bottom: 8px;">
 			<div class="logo-icon">AI</div>
 			<span class="logo-text">cf-ai-gw</span>
 		</div>
 
 		<div class="dashboard-grid">
 			
-			<div class="stat-card animate-fade-in-up delay-1" style="justify-content: space-between;">
+			<div class="stat-card" style="justify-content: space-between;">
 				<div>
 					<div class="stat-title" style="margin-bottom: 10px;">今日用量汇总</div>
 					<div style="display: flex; align-items: baseline; gap: 4px;">
@@ -3921,7 +3881,7 @@ async function handleLandingPage(request, env, ctx) {
 				</div>
 			</div>
 			
-			<div class="stat-card animate-fade-in-up delay-2" id="public-models-card" style="padding: 24px; display: flex; flex-direction: column; justify-content: center;">
+			<div class="stat-card" id="public-models-card" style="padding: 24px; display: flex; flex-direction: column; justify-content: center;">
 				
 				<div class="public-chart-wrapper" id="public-chart-wrapper" style="display: none; height: 190px; width: 100%; flex-direction: row; align-items: center; justify-content: space-between; gap: 40px;">
 					
@@ -4204,14 +4164,7 @@ async function handleAdminPage(request, env, ctx) {
 
 		/* Tab Content Transition */
 		.tab-content { display: none; }
-		.tab-content.active {
-			display: block;
-			animation: fadeIn 0.3s ease both;
-		}
-		@keyframes fadeIn {
-			from { opacity: 0; transform: translateY(8px); }
-			to { opacity: 1; transform: translateY(0); }
-		}
+		.tab-content.active { display: block; }
 
 		/* Nav item — gradient bottom border */
 		.nav-item::after {
@@ -4440,17 +4393,6 @@ async function handleAdminPage(request, env, ctx) {
 			background: var(--primary-gradient);
 			box-shadow: 0 0 8px rgba(168,85,247,0.35);
 		}
-		.usage-progress-bar::after {
-			content: '';
-			position: absolute;
-			top: 0; left: -100%; width: 100%; height: 100%;
-			background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
-			animation: progressShine 3s ease-in-out infinite;
-		}
-		@keyframes progressShine {
-			0% { left: -100%; }
-			100% { left: 200%; }
-		}
 
 		/* Section Cards */
 		.section-card {
@@ -4600,10 +4542,6 @@ async function handleAdminPage(request, env, ctx) {
 			box-shadow: none !important;
 		}
 
-		@keyframes spinner-border {
-			to { transform: rotate(360deg); }
-		}
-
 		.spinner {
 			display: inline-block;
 			width: 12px;
@@ -4613,21 +4551,6 @@ async function handleAdminPage(request, env, ctx) {
 			border-right-color: transparent;
 			border-radius: 50%;
 			animation: spinner-border .75s linear infinite;
-		}
-
-		@keyframes flash-green {
-			0% {
-				border-color: rgba(16, 185, 129, 0.8);
-				box-shadow: 0 0 20px rgba(16, 185, 129, 0.35);
-			}
-			100% {
-				border-color: var(--border-color);
-				box-shadow: var(--card-shadow);
-			}
-		}
-
-		.card-update-flash {
-			animation: flash-green 2s cubic-bezier(0.25, 1, 0.5, 1);
 		}
 
 		/* 倒计时样式 */
@@ -5273,7 +5196,7 @@ async function handleAdminPage(request, env, ctx) {
 					item.className = '';
 					void item.offsetHeight;
 				}
-				if (isRefreshed) item.classList.add('card-update-flash');
+				if (isRefreshed) item.classList.add('refreshed');
 				item.dataset.lastUpdated = account.lastUpdated || 0;
 				item.innerHTML = \`
 					<div style="display:flex; justify-content:space-between; align-items:center; gap: 12px; margin-bottom: 10px;">
@@ -5729,7 +5652,11 @@ async function handleAdminPage(request, env, ctx) {
 					return;
 				}
 				if (onEmpty) onEmpty(items.length > 0);
-				items.forEach(renderFn);
+				items.forEach(item => {
+					const tr = document.createElement('tr');
+					tr.innerHTML = renderFn(item);
+					tbody.appendChild(tr);
+				});
 			} catch (e) {
 				console.error(e);
 			}
@@ -5738,8 +5665,7 @@ async function handleAdminPage(request, env, ctx) {
 		async function loadAccounts() {
 			await loadTableData('/api/accounts', 'accounts-table-body', '暂无配置的 Cloudflare 账号', (acc) => {
 				const maskedToken = acc.apiToken.length > 8 ? acc.apiToken.substring(0, 4) + '...' + acc.apiToken.substring(acc.apiToken.length - 4) : '********';
-				const tr = document.createElement('tr');
-				tr.innerHTML = \`
+				return \`
 					<td><strong style="font-weight:600;">\${escapeHtml(acc.name)}</strong></td>
 					<td><code>\${escapeHtml(acc.accountId)}</code></td>
 					<td><code>\${escapeHtml(maskedToken)}</code></td>
@@ -5750,7 +5676,6 @@ async function handleAdminPage(request, env, ctx) {
 						</div>
 					</td>
 				\`;
-				document.getElementById('accounts-table-body').appendChild(tr);
 			});
 		}
 
@@ -5932,9 +5857,8 @@ async function handleAdminPage(request, env, ctx) {
 
 		async function loadKeys() {
 			await loadTableData('/api/keys', 'keys-table-body', '暂无配置的 API 密钥', (k) => {
-				const tr = document.createElement('tr');
 				const dateStr = new Date(k.createdAt).toLocaleString();
-				tr.innerHTML = \`
+				return \`
 					<td><strong style="font-weight:600;">\${escapeHtml(k.name)}</strong></td>
 					<td>
 						<div style="display:flex; align-items:center; gap:8px;">
@@ -5947,7 +5871,6 @@ async function handleAdminPage(request, env, ctx) {
 						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey('\${k.id}')">删除</button>
 					</td>
 				\`;
-				document.getElementById('keys-table-body').appendChild(tr);
 			}, (hasData) => {
 				const el = document.getElementById('no-key-warning');
 				if (el) el.classList.toggle('hidden', !!hasData);
@@ -6016,10 +5939,14 @@ async function handleAdminPage(request, env, ctx) {
 				const res = await apiFetch('/api/settings');
 				const data = await res.json();
 				customMappings = data.customModelMap || {};
+				const items = Object.keys(customMappings).map(source => ({ source, target: customMappings[source] }));
 				const tbody = document.getElementById('mappings-table-body');
 				tbody.innerHTML = '';
-				Object.keys(customMappings).forEach(source => {
-					const target = customMappings[source];
+				if (items.length === 0) {
+					tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-muted); padding: 30px;">暂无模型映射</td></tr>';
+					return;
+				}
+				items.forEach(({ source, target }) => {
 					const isPreset = Object.prototype.hasOwnProperty.call(defaultMappings, source) && defaultMappings[source] === target;
 					const typeText = isPreset ? '<span class="badge badge-success">预设映射</span>' : '<span class="badge badge-warning">自定义</span>';
 					const tr = document.createElement('tr');
