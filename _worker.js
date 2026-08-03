@@ -1834,11 +1834,18 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 	let cacheWriteTokens = 0;
 
 	let enqueuedAny = false;
+	let pingInterval = null;
 
 	return new ReadableStream({
 		start(controller) {
 			// 初始 ping 保持连接（推理模型首 token 延迟可能较长）
 			controller.enqueue(encoder.encode(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`));
+			// 定时 ping 保持连接（每 10 秒，参照 new-api 的 SSE ping 保活机制）
+			pingInterval = setInterval(() => {
+				try {
+					controller.enqueue(encoder.encode(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`));
+				} catch (_) { /* controller 已关闭 */ }
+			}, 10000);
 		},
 		async pull(controller) {
 			enqueuedAny = false;
@@ -1873,6 +1880,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 							sendFinalEvent(controller);
 						}
 						controller.close();
+						if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 						break;
 					}
 
@@ -1898,8 +1906,10 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				} catch (e2) { console.error('anthropicStreamTransform secondary error:', e2?.message || e2); }
 				try { controller.close(); } catch (_) { }
 			}
+			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 		},
 		cancel() {
+			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 			reader.cancel();
 		},
 	});
@@ -2478,8 +2488,18 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 	const encoder = new TextEncoder();
 	let buffer = '';
 	let streamUsage = null; // 捕获流式响应中的 usage（最后一个 chunk 才有）
+	let pingInterval = null;
 
 	return new ReadableStream({
+		start(controller) {
+			// 初始 ping + 定时 ping 保持连接（每 10 秒）
+			controller.enqueue(encoder.encode(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`));
+			pingInterval = setInterval(() => {
+				try {
+					controller.enqueue(encoder.encode(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`));
+				} catch (_) { /* controller 已关闭 */ }
+			}, 10000);
+		},
 		async pull(controller) {
 			let timeoutRetries = 0;
 			const MAX_TIMEOUT_RETRIES = 5;
@@ -2504,6 +2524,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 						}
 						controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 						controller.close();
+						if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 						if (streamUsage && env && ctx) {
 							const promptDetails = streamUsage.prompt_tokens_details || {};
 							accumulateTokens(env, ctx, {
@@ -2536,8 +2557,10 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 				} catch (e2) { console.error('passthroughStream secondary error:', e2?.message || e2); }
 				try { controller.close(); } catch (_) { }
 			}
+			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 		},
 		cancel() {
+			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 			reader.cancel();
 		},
 	});
