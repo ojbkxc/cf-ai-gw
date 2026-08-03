@@ -782,7 +782,7 @@ async function getUsageLimits(env) {
 
 // 获取当月用量的 KV 键名
 function getMonthlyUsageKey() {
-	const now = beijingNow();
+	const now = new Date();
 	return `usage_monthly_${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
