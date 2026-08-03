@@ -79,7 +79,7 @@ function accumulateFromUsage(env, ctx, usage, requestStartTime) {
 		input: usage.prompt_tokens || 0,
 		output: usage.completion_tokens || 0,
 		reasoning: usage.reasoning_tokens || 0,
-		cacheRead: pd.cached_tokens || usage.cache_read_tokens || 0,
+		cacheRead: pd.cached_tokens ?? usage.cache_read_tokens ?? 0,
 		cacheWrite: usage.cache_write_tokens || 0,
 		durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
 	});
@@ -3284,18 +3284,6 @@ async function handleLandingPage(request, env, ctx) {
 	</script>
 	<footer style="text-align: center; padding: 24px 0 20px; font-size: 12px; color: var(--text-muted); opacity: 0.6; z-index: 10;">
 		由 <a href="https://github.com/ojbkxc/cf-ai-gw" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">cf-ai-gw</a> 强力驱动
-	</footer>
-</body>
-</html>`;
-
-	return new Response(html, {
-		headers: { 'Content-Type': 'text/html; charset=utf-8' }
-	});
-}
-
-
-
-
 	</footer>
 </body>
 </html>`;
