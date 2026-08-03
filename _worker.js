@@ -2969,9 +2969,9 @@ async function handleDashboardApi(request, env, ctx) {
 			if (!res.ok || !data.result) {
 				return new Response(JSON.stringify({ error: data.errors?.[0]?.message || 'Failed to fetch models' }), { status: 502, headers: { 'Content-Type': 'application/json' } });
 			}
-			const freeModels = data.result.filter(m => m.id && m.id.startsWith('@cf/')).sort((a, b) => (a.id || '').localeCompare(b.id || '')).map(m => ({
-				id: m.id,
-				name: m.name || m.id,
+			const freeModels = data.result.filter(m => m.name && m.name.startsWith('@cf/')).sort((a, b) => (a.name || '').localeCompare(b.name || '')).map(m => ({
+				id: m.name,
+				name: m.name,
 			}));
 			return new Response(JSON.stringify({ models: freeModels }), { headers: { 'Content-Type': 'application/json' } });
 		} catch (e) {
