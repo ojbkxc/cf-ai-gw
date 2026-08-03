@@ -22,7 +22,7 @@ compatibility_date = "2025-08-01"
 binding = "AI"
 
 # === KV 命名空间绑定（两种模式都需要）===
-# KV 命名空间的创建名称可随意，只有 id 需要填对；binding 必须是 "KV"
+# 建议命名空间名称为 cf-ai-gw；只有 id 需要填对，binding 必须是 "KV"
 [[kv_namespaces]]
 binding = "KV"
 id = "YOUR_KV_NAMESPACE_ID"

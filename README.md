@@ -15,13 +15,13 @@
 
 ### 模式 A：Worker + AI Binding（推荐，规避检查）
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YOUR_GITHUB_USERNAME/cf-ai-gw)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ojbkxc/cf-ai-gw)
 
 > 使用 `main` 分支部署。调用不经公网，Cloudflare 网关无法识别为代理。
 
 ### 模式 B：Worker + REST API（多账号 failover）
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YOUR_GITHUB_USERNAME/cf-ai-gw/tree/deploy-rest)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ojbkxc/cf-ai-gw/tree/deploy-rest)
 
 > 使用 `deploy-rest` 分支部署。支持多账号轮换，但调用经公网 HTTPS。
 
@@ -55,7 +55,7 @@
 
 1. 点击上方任一部署按钮
 2. 授权 GitHub 登录 Cloudflare
-3. 仓库会自动 fork 到你账号下，Workers 会自动部署（Cloudflare 会自动创建 KV 命名空间并绑定）
+3. 仓库会自动 fork 到你账号下；部署前请先参考下方「手动部署」创建 KV 命名空间 `cf-ai-gw` 并填入 `wrangler.toml` / Dashboard 绑定
 4. 部署完成后，在 Cloudflare Dashboard 中修改环境变量 `ADMIN_PASSWORD` 为你的密码
 
 ## 手动部署
@@ -70,7 +70,7 @@ npm install -g wrangler
 wrangler login
 
 # 3. 创建 KV 命名空间（名称随意，只记 ID）
-wrangler kv:namespace create cf-ai-gw-kv
+wrangler kv:namespace create cf-ai-gw
 
 # 4. 将返回的 id 填入 wrangler.toml 的 YOUR_KV_NAMESPACE_ID
 
@@ -90,7 +90,7 @@ npm install -g wrangler
 wrangler login
 
 # 3. 创建 KV 命名空间
-wrangler kv:namespace create cf-ai-gw-kv
+wrangler kv:namespace create cf-ai-gw
 
 # 4. 将返回的 id 填入 wrangler.toml 的 YOUR_KV_NAMESPACE_ID
 
