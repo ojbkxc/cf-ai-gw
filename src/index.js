@@ -2179,6 +2179,25 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
+	// 查询当前账号的 @cf/ 免费模型列表（通过 Workers AI Binding）
+	if (url.pathname === '/api/models/search' && method === 'GET') {
+		try {
+			const allModels = await env.AI.models({ hide_experimental: true, per_page: 200 });
+			const freeModels = allModels
+				.filter(m => m.id && m.id.startsWith('@cf/'))
+				.sort((a, b) => (a.id || '').localeCompare(b.id || ''))
+				.map(m => ({
+					id: m.id,
+					name: m.name || m.id,
+					description: m.description || '',
+					task: m.task?.name || '',
+				}));
+			return new Response(JSON.stringify({ models: freeModels }), { headers: { 'Content-Type': 'application/json' } });
+		} catch (e) {
+			return new Response(JSON.stringify({ error: e.message }), { status: 502, headers: { 'Content-Type': 'application/json' } });
+		}
+	}
+
 	if (url.pathname === '/api/limits') {
 		if (method === 'GET') {
 			const limits = await getUsageLimits(env);
@@ -3101,6 +3120,23 @@ async function handleLandingPage(request, env, ctx) {
 					<button class="btn btn-primary" onclick="submitLogin()" style="height: 38px;">登录</button>
 				</div>
 			`}
+		</div>
+	</div>
+
+	<!-- Modal: Select Free Model -->
+	<div class="modal-overlay" id="model-select-modal">
+		<div class="modal-card">
+			<div class="modal-header">
+				<h3>选择 @cf/ 免费模型</h3>
+				<button onclick="document.getElementById('model-select-modal').classList.remove('active')" class="close-btn">${SVG_CLOSE}</button>
+			</div>
+			<div style="margin-bottom: 12px; font-size: 13px; color: var(--text-muted);">点击模型名称自动填入目标模型路径</div>
+			<div id="model-select-list" style="max-height: 400px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px;">
+				<div style="text-align: center; padding: 30px; color: var(--text-muted);">加载中...</div>
+			</div>
+			<div class="modal-footer">
+				<button class="btn btn-secondary" onclick="document.getElementById('model-select-modal').classList.remove('active')">关闭</button>
+			</div>
 		</div>
 	</div>
 
@@ -4116,6 +4152,7 @@ async function handleAdminPage(request, env, ctx) {
 							<div style="display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;">
 								<button class="btn btn-primary" onclick="addMapping()" style="height: 45px;">添加/修改</button>
 								<button class="btn btn-secondary" onclick="restorePresetMappings()" style="height: 45px;">预设映射</button>
+								<button class="btn btn-secondary" onclick="fetchFreeModels()" style="height: 45px;">获取免费模型</button>
 							</div>
 						</div>
 
@@ -5169,6 +5206,34 @@ async function handleAdminPage(request, env, ctx) {
 				showToast('已删除映射');
 			} else {
 				showToast('删除映射失败！', 'error');
+			}
+		}
+
+		async function fetchFreeModels() {
+			document.getElementById('model-select-modal').classList.add('active');
+			const listEl = document.getElementById('model-select-list');
+			listEl.innerHTML = '<div style="text-align: center; padding: 30px; color: var(--text-muted);">正在查询 @cf/ 免费模型...</div>';
+			try {
+				const res = await apiFetch('/api/models/search');
+				const data = await res.json();
+				if (!res.ok) {
+					listEl.innerHTML = \`<div style="text-align: center; padding: 30px; color: var(--danger-color);">\${escapeHtml(data.error || '获取失败')}</div>\`;
+					return;
+				}
+				const models = data.models || [];
+				if (models.length === 0) {
+					listEl.innerHTML = '<div style="text-align: center; padding: 30px; color: var(--text-muted);">未找到 @cf/ 模型，请检查账号配置</div>';
+					return;
+				}
+				listEl.innerHTML = models.map(m => \`
+					<div style="padding: 10px 14px; cursor: pointer; border-bottom: 1px solid var(--border-color); font-size: 13px; line-height: 1.5;"
+						 onclick="document.getElementById('map-target').value=\${attrEscape(m.id)};document.getElementById('model-select-modal').classList.remove('active');showToast('已选择: ' + \${attrEscape(m.id)})">
+						<strong>\${escapeHtml(m.name)}</strong><br>
+						<code style="font-size: 11px; color: var(--text-muted);">\${escapeHtml(m.id)}</code>
+					</div>
+				\`).join('');
+			} catch (e) {
+				listEl.innerHTML = \`<div style="text-align: center; padding: 30px; color: var(--danger-color);">获取失败: \${escapeHtml(e.message)}</div>\`;
 			}
 		}
 
