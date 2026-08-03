@@ -721,7 +721,7 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 	try {
 		if (stream) {
 			const inputs = { ...cfPayload, stream: true };
-			const resp = await env.AI.run(cfModel, inputs, { returnRawResponse: true });
+			const resp = await env.AI.run(cfModel, inputs, { returnRawResponse: true, signal: AbortSignal.timeout(600000) });
 			if (!resp.ok) {
 				const errText = await resp.text();
 				let parsedErr;
@@ -740,7 +740,7 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 			noteModelOk(cfModel);
 			return { success: true, status: resp.status, stream: resp.body };
 		}
-		const result = await env.AI.run(cfModel, cfPayload);
+		const result = await env.AI.run(cfModel, cfPayload, { signal: AbortSignal.timeout(120000) });
 		cbOnSuccess(env);
 		noteModelOk(cfModel);
 		return { success: true, status: 200, data: result };
@@ -1610,7 +1610,7 @@ async function handleEmbeddings(request, env, ctx) {
 	const textArray = Array.isArray(input) ? input : [input];
 
 	try {
-		const result = await env.AI.run(cfModel, { text: textArray });
+		const result = await env.AI.run(cfModel, { text: textArray }, { signal: AbortSignal.timeout(120000) });
 		// AI Binding 返回格式: { data: [[...embeddings]] } 或直接是 embedding 数组
 		let data;
 		if (result.data && Array.isArray(result.data)) {
@@ -1673,7 +1673,7 @@ async function handleImageGenerations(request, env, ctx) {
 		const cfPayload = { prompt, width, height };
 		if (cfModel.includes('flux')) cfPayload.num_steps = 4;
 
-		const result = await env.AI.run(cfModel, cfPayload);
+		const result = await env.AI.run(cfModel, cfPayload, { signal: AbortSignal.timeout(120000) });
 
 		// AI Binding 返回格式: { image: "base64string" } 或直接是 base64 字符串
 		let rawImage = result.image || result;
@@ -1746,7 +1746,7 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 		// AI Binding 的 Whisper 接受 { audio: [...] } 格式，translations 加 task 参数
 		const whisperInput = { audio: [...audioUint8] };
 		if (isTranslation) whisperInput.task = 'translate';
-		const result = await env.AI.run(actualCfModel, whisperInput);
+		const result = await env.AI.run(actualCfModel, whisperInput, { signal: AbortSignal.timeout(120000) });
 
 		const text = result.text || '';
 
@@ -1783,7 +1783,7 @@ async function handleAudioSpeech(request, env, ctx) {
 	if (body.speed !== undefined) cfPayload.speed = body.speed;
 
 	try {
-		const resp = await env.AI.run(cfModel, cfPayload, { returnRawResponse: true });
+		const resp = await env.AI.run(cfModel, cfPayload, { returnRawResponse: true, signal: AbortSignal.timeout(600000) });
 		if (!resp.ok) {
 			const errText = await resp.text();
 			let parsedErr;

@@ -1269,23 +1269,19 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 		if (cfResponse.ok) {
 			if (stream) {
 				if (!cfResponse.body) {
-					return { retry: true, error: 'CF API returned empty response body' };
+					return { retry: true, skipAccount: true, error: 'CF API returned empty response body', status: cfResponse.status };
 				}
 				const streamReader = cfResponse.body.getReader();
 				const firstResult = await readWithTimeout(streamReader, 240000, { cancelOnTimeout: true });
 				if (firstResult.done) {
-					return { retry: true, error: 'CF API returned empty stream' };
+					return { retry: true, skipAccount: true, error: 'CF API returned empty stream', status: cfResponse.status };
 				}
 				const decoder = new TextDecoder();
 				const firstText = decoder.decode(firstResult.value, { stream: true });
 				if (firstText.trimStart().startsWith('{') && (firstText.includes('"success":false') || firstText.includes('"success": false'))) {
-					let errBody = firstText;
-					while (true) {
-						const { value, done } = await readWithTimeout(streamReader, 60000);
-						if (done) break;
-						errBody += decoder.decode(value, { stream: true });
-					}
-					return { retry: true, skipAccount: true, error: `CF API error: ${extractErrorMessage(errBody) || errBody}`, status: cfResponse.status };
+					// 首块已包含完整错误信息，取消 reader 避免无意义继续读取
+					try { streamReader.cancel(); } catch (_) {}
+					return { retry: true, skipAccount: true, error: `CF API error: ${extractErrorMessage(firstText) || firstText}`, status: cfResponse.status };
 				}
 				const prependReader = {
 					_firstChunk: firstResult.value,
@@ -1361,11 +1357,13 @@ async function callCFRunAPI(cfModel, buildPayload, processResult, env, { rawResp
 		if (!_buildHeaders?.['Content-Type'] && !_buildHeaders?.['content-type']) {
 			delete mergedHeaders['Content-Type'];
 		}
-		cfPayload = { ...restPayload, headers: mergedHeaders };
+		const { signal: callerSignal, ...cleanPayload } = restPayload;
+		cleanPayload.headers = mergedHeaders;
 		const apiUrl = buildCFUrl(account, `run/${cfModel}`);
+		const fetchSignal = callerSignal || AbortSignal.timeout(120000);
 		const cfResponse = await fetch(apiUrl, {
-			...cfPayload,
-			signal: AbortSignal.timeout(120000),
+			...cleanPayload,
+			signal: fetchSignal,
 		});
 
 		if (cfResponse.ok) {
@@ -2292,7 +2290,6 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 					method: 'POST',
 					headers: { 'Authorization': `Bearer ${account.apiToken}` },
 					body: cfFormData,
-					signal: AbortSignal.timeout(120000),
 				};
 			},
 			(cfResult) => ({ text: cfResult.text || '' }),
@@ -2740,41 +2737,48 @@ async function handleDashboardApi(request, env, ctx) {
 			return new Response(JSON.stringify({ success: false, error: 'Account info not found' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 		}
 
-		const [readResult, editResult, analyticsResult] = await Promise.all([
-			(async () => {
-				try {
-					const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${targetAccountId}/ai/models/search?limit=1`, {
-						method: 'GET',
-						headers: browserHeaders(targetApiToken),
-						signal: AbortSignal.timeout(30000),
-					});
-					const data = await res.json();
-					if (res.ok && data.success !== false) {
-						return { success: true };
-					}
-					return { success: false, error: data.errors?.[0]?.message || `HTTP ${res.status}` };
-				} catch (e) {
-					return { success: false, error: e.message };
+		// 串行执行避免同时向 api.cloudflare.com 发 3 个请求（减少被识别为代理的流量特征）
+		const readResult = await (async () => {
+			try {
+				const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${targetAccountId}/ai/models/search?limit=1`, {
+					method: 'GET',
+					headers: browserHeaders(targetApiToken),
+					signal: AbortSignal.timeout(30000),
+				});
+				const data = await res.json();
+				if (res.ok && data.success !== false) {
+					return { success: true };
 				}
-			})(),
-			(async () => {
-				try {
-					const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${targetAccountId}/ai/run/@cf/google/embeddinggemma-300m`, {
-						method: 'POST',
-						headers: browserHeaders(targetApiToken),
-						body: JSON.stringify({ text: ['test'] }),
-						signal: AbortSignal.timeout(30000),
-					});
-					const data = await res.json();
-					if (res.ok && data.success !== false) {
-						return { success: true };
-					}
-					return { success: false, error: data.errors?.[0]?.message || `HTTP ${res.status}` };
-				} catch (e) {
-					return { success: false, error: e.message };
+				return { success: false, error: data.errors?.[0]?.message || `HTTP ${res.status}` };
+			} catch (e) {
+				return { success: false, error: e.message };
+			}
+		})();
+
+		// 小延迟降低连续请求特征
+		await new Promise(r => setTimeout(r, 200));
+
+		const editResult = await (async () => {
+			try {
+				const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${targetAccountId}/ai/run/@cf/google/embeddinggemma-300m`, {
+					method: 'POST',
+					headers: browserHeaders(targetApiToken),
+					body: JSON.stringify({ text: ['test'] }),
+					signal: AbortSignal.timeout(30000),
+				});
+				const data = await res.json();
+				if (res.ok && data.success !== false) {
+					return { success: true };
 				}
-			})(),
-			(async () => {
+				return { success: false, error: data.errors?.[0]?.message || `HTTP ${res.status}` };
+			} catch (e) {
+				return { success: false, error: e.message };
+			}
+		})();
+
+		await new Promise(r => setTimeout(r, 200));
+
+		const analyticsResult = await (async () => {
 				try {
 					const query = `
 						query GetAIUsage($accountId: String!, $start: String!) {
@@ -2814,8 +2818,7 @@ async function handleDashboardApi(request, env, ctx) {
 				} catch (e) {
 					return { success: false, error: e.message };
 				}
-			})()
-		]);
+			})();
 
 		const allSuccess = readResult.success && editResult.success && analyticsResult.success;
 		let overallError = null;
