@@ -2184,11 +2184,11 @@ async function handleDashboardApi(request, env, ctx) {
 		try {
 			const allModels = await env.AI.models({ hide_experimental: true, per_page: 200 });
 			const freeModels = allModels
-				.filter(m => m.id && m.id.startsWith('@cf/'))
-				.sort((a, b) => (a.id || '').localeCompare(b.id || ''))
+				.filter(m => m.name && m.name.startsWith('@cf/'))
+				.sort((a, b) => (a.name || '').localeCompare(b.name || ''))
 				.map(m => ({
-					id: m.id,
-					name: m.name || m.id,
+					id: m.name,
+					name: m.name,
 					description: m.description || '',
 					task: m.task?.name || '',
 				}));
