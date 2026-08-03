@@ -311,6 +311,7 @@ function createResumableStream(reader, options) {
 }
 
 const TOKEN_KV_TTL_SEC = 86400 * 2;    // KV 键保留 2 天
+const MAX_TIMEOUT_RETRIES = 5;          // 流读取超时最大重试次数
 
 // 获取 token 统计 KV 键名
 function getTokenDailyKey() {
@@ -356,6 +357,20 @@ async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0
 			console.error('Failed to accumulate tokens:', e?.message || e);
 		}
 	})());
+}
+
+// 从 CF /v1/ API 返回的 usage 对象提取字段并累加 token 统计
+function accumulateFromUsage(env, ctx, usage, requestStartTime) {
+	if (!ctx || !usage) return;
+	const pd = usage.prompt_tokens_details || {};
+	accumulateTokens(env, ctx, {
+		input: usage.prompt_tokens || 0,
+		output: usage.completion_tokens || 0,
+		reasoning: usage.reasoning_tokens || 0,
+		cacheRead: pd.cached_tokens || usage.cache_read_tokens || 0,
+		cacheWrite: usage.cache_write_tokens || 0,
+		durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
+	});
 }
 
 async function getTodayTokenStats(env) {
@@ -734,29 +749,15 @@ function generateRequestId() {
 	return id;
 }
 
-// 带超时的流读取（初始读取）：用于首次预读校验。
-// 超时时会取消 reader，避免后续无效等待。
-function readWithTimeout(reader, timeoutMs) {
+// 带超时的流读取。
+// cancelOnTimeout: true 时超时会取消 reader（用于初始预读校验），false 时抛出可重试错误（用于流式传输持续读取）。
+function readWithTimeout(reader, timeoutMs, { cancelOnTimeout = false } = {}) {
 	let timer;
 	const read = reader.read();
 	const timeout = new Promise((_, reject) => {
 		timer = setTimeout(() => {
-			try { reader.cancel(); } catch (_) {}
-			reject(new Error('Initial read timed out'));
-		}, timeoutMs);
-	});
-	return Promise.race([read, timeout]).finally(() => clearTimeout(timer));
-}
-
-// 带超时的流读取（持续读取）：用于流式传输过程中的持续读取。
-// 超时时不会取消 reader，而是抛出可重试的错误，避免中断活跃流。
-// 适合推理模型长时间思考、输出间隔大的场景。
-function readStreamWithTimeout(reader, timeoutMs) {
-	let timer;
-	const read = reader.read();
-	const timeout = new Promise((_, reject) => {
-		timer = setTimeout(() => {
-			reject(new Error('Stream read timed out'));
+			if (cancelOnTimeout) { try { reader.cancel(); } catch (_) {} }
+			reject(new Error(cancelOnTimeout ? 'Initial read timed out' : 'Stream read timed out'));
 		}, timeoutMs);
 	});
 	return Promise.race([read, timeout]).finally(() => clearTimeout(timer));
@@ -1285,7 +1286,7 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 					return { retry: true, error: 'CF API returned empty response body' };
 				}
 				const streamReader = cfResponse.body.getReader();
-				const firstResult = await readWithTimeout(streamReader, 240000);
+				const firstResult = await readWithTimeout(streamReader, 240000, { cancelOnTimeout: true });
 				if (firstResult.done) {
 					return { retry: true, error: 'CF API returned empty stream' };
 				}
@@ -1334,7 +1335,6 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 					},
 					maxReconnects: 5,
 					onResumeExpired: 'accept-partial',
-					onProgress: () => {},
 				});
 				return { success: true, status: cfResponse.status, stream: resumableStream };
 			}
@@ -1365,9 +1365,9 @@ async function resolveModelName(model, env) {
 
 // 通用的 CF /ai/run/{model} failover 调用函数
 // 用于 embeddings、images、audio 等非 chat 端点，统一多账号 failover 逻辑
-async function callCFRunAPI(cfModel, buildPayload, processResult, env) {
+async function callCFRunAPI(cfModel, buildPayload, processResult, env, { rawResponse = false } = {}) {
 	return withFailover(env, async (account, attempt, accountIndex) => {
-		const cfPayload = buildPayload(account);
+		let cfPayload = buildPayload(account);
 		// 合并 browserHeaders 确保请求头一致性，Content-Type 由调用方设置（如 FormData 不需要手动设）
 		const { headers: _buildHeaders, ...restPayload } = cfPayload;
 		const mergedHeaders = { ...browserHeaders(account.apiToken, null), ..._buildHeaders };
@@ -1383,6 +1383,9 @@ async function callCFRunAPI(cfModel, buildPayload, processResult, env) {
 		});
 
 		if (cfResponse.ok) {
+			if (rawResponse) {
+				return { success: true, data: cfResponse };
+			}
 			const cfJson = await cfResponse.json();
 			if (cfJson.success && cfJson.result) {
 				return { success: true, data: processResult(cfJson.result) };
@@ -1453,16 +1456,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 	}
 	const cfJson = result.data;
 	if (cfJson.model !== undefined) cfJson.model = model;
-	if (ctx && cfJson.usage) {
-		const _u = cfJson.usage, _pd = _u.prompt_tokens_details || {};
-		accumulateTokens(env, ctx, {
-			input: _u.prompt_tokens || 0, output: _u.completion_tokens || 0,
-			reasoning: _u.reasoning_tokens || 0,
-			cacheRead: _pd.cached_tokens || _u.cache_read_tokens || 0,
-			cacheWrite: _u.cache_write_tokens || 0,
-			durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
-		});
-	}
+	accumulateFromUsage(env, ctx, cfJson.usage, requestStartTime);
 	if (pathname === '/v1/completions') {
 		const textChoices = (cfJson.choices || []).map(c => ({
 			text: c.message?.content || '',
@@ -1799,16 +1793,7 @@ async function handleMessages(request, env, ctx) {
 		);
 	}
 	const openaiResponse = result.data;
-	if (ctx && openaiResponse.usage) {
-		const _u = openaiResponse.usage, _pd = _u.prompt_tokens_details || {};
-		accumulateTokens(env, ctx, {
-			input: _u.prompt_tokens || 0, output: _u.completion_tokens || 0,
-			reasoning: _u.reasoning_tokens || 0,
-			cacheRead: _pd.cached_tokens || _u.cache_read_tokens || 0,
-			cacheWrite: _u.cache_write_tokens || 0,
-			durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
-		});
-	}
+	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime);
 	return jsonResponse(convertOpenAIToAnthropic(openaiResponse, model), fallbackWarning);
 }
 
@@ -1855,13 +1840,12 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				originalEnqueue(chunk);
 			};
 			let timeoutRetries = 0;
-			const MAX_TIMEOUT_RETRIES = 5;
 
 			try {
 				while (true) {
 					let result;
 					try {
-						result = await readStreamWithTimeout(reader, 120000);
+						result = await readWithTimeout(reader, 120000);
 					} catch (e) {
 						// 流读取超时：模型可能正在思考，重试
 						if (e.message === 'Stream read timed out' && timeoutRetries < MAX_TIMEOUT_RETRIES) {
@@ -2373,36 +2357,27 @@ async function handleAudioSpeech(request, env, ctx) {
 	if (body.response_format) cfPayload.response_format = body.response_format;
 	if (body.speed !== undefined) cfPayload.speed = body.speed;
 
-	const result = await withFailover(env, async (account, attempt, accountIndex) => {
-		const apiUrl = buildCFUrl(account, `run/${cfModel}`);
-		const cfResponse = await fetch(apiUrl, {
+	const result = await callCFRunAPI(
+		cfModel,
+		(account) => ({
 			method: 'POST',
-			headers: browserHeaders(account.apiToken),
+			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify(cfPayload),
-			signal: AbortSignal.timeout(120000),
-		});
-
-		if (cfResponse.ok) {
-			const audioBuffer = await cfResponse.arrayBuffer();
-			const contentType = cfResponse.headers.get('Content-Type') || 'audio/wav';
-			if (ctx) {
-				accumulateTokens(env, ctx, { input: Math.ceil(input.length / 4), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0 });
-			}
-			return { success: true, data: { audioBuffer, contentType } };
-		}
-
-		const errorText = await cfResponse.text();
-		const error = `CF API status ${cfResponse.status}: ${extractErrorMessage(errorText) || errorText}`;
-		if (!isRetryableStatus(cfResponse.status)) {
-			return { success: false, status: cfResponse.status, error };
-		}
-		return { retry: true, error, status: cfResponse.status };
-	});
+		}),
+		null,
+		env,
+		{ rawResponse: true }
+	);
 
 	if (!result.success) {
 		return jsonError(`All Cloudflare accounts failed. Last error: ${result.error}`, result.status, "server_error");
 	}
-	const { audioBuffer, contentType } = result.data;
+	const cfResponse = result.data;
+	const audioBuffer = await cfResponse.arrayBuffer();
+	const contentType = cfResponse.headers.get('Content-Type') || 'audio/wav';
+	if (ctx) {
+		accumulateTokens(env, ctx, { input: Math.ceil(input.length / 4), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0 });
+	}
 	return new Response(audioBuffer, {
 		headers: {
 			'Content-Type': contentType,
@@ -2502,12 +2477,11 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 		},
 		async pull(controller) {
 			let timeoutRetries = 0;
-			const MAX_TIMEOUT_RETRIES = 5;
 			try {
 				while (true) {
 					let result;
 					try {
-						result = await readStreamWithTimeout(reader, 120000);
+						result = await readWithTimeout(reader, 120000);
 					} catch (e) {
 						// 流读取超时：模型可能正在思考，重试
 						if (e.message === 'Stream read timed out' && timeoutRetries < MAX_TIMEOUT_RETRIES) {
@@ -2525,17 +2499,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 						controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 						controller.close();
 						if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-						if (streamUsage && env && ctx) {
-							const promptDetails = streamUsage.prompt_tokens_details || {};
-							accumulateTokens(env, ctx, {
-								input: streamUsage.prompt_tokens || 0,
-								output: streamUsage.completion_tokens || 0,
-								reasoning: streamUsage.reasoning_tokens || 0,
-								cacheRead: promptDetails.cached_tokens || streamUsage.cache_read_tokens || 0,
-								cacheWrite: streamUsage.cache_write_tokens || 0,
-								durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
-							});
-						}
+						accumulateFromUsage(env, ctx, streamUsage, requestStartTime);
 						break;
 					}
 
