@@ -6,10 +6,30 @@
 
 | 模式 | 入口文件 | 调用方式 | 账号模式 | 规避检查 |
 |------|---------|---------|---------|---------|
-| **Worker + AI Binding（推荐）** | `src/index.js` | `env.AI.run()` 内部 RPC | 单账号 | ⭐⭐⭐ 最佳 |
-| **Pages / Worker + REST API** | `_worker.js` | `fetch()` 公网 REST | 多账号 failover | ⭐ 一般 |
+| **模式 A：Worker + AI Binding（推荐）** | `src/index.js` | `env.AI.run()` 内部 RPC | 单账号 | ⭐⭐⭐ 最佳 |
+| **模式 B：Worker + REST API** | `_worker.js` | `fetch()` 公网 REST | 多账号 failover | ⭐ 一般 |
+
+## 一键部署
+
+两个按钮均可直接部署，Cloudflare 会自动 fork 仓库到你的 GitHub 账号并部署，无需手动绑定。
+
+### 模式 A：Worker + AI Binding（推荐，规避检查）
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YOUR_GITHUB_USERNAME/cf-ai-gw)
+
+> 使用 `main` 分支部署。调用不经公网，Cloudflare 网关无法识别为代理。
+
+### 模式 B：Worker + REST API（多账号 failover）
+
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YOUR_GITHUB_USERNAME/cf-ai-gw/tree/deploy-rest)
+
+> 使用 `deploy-rest` 分支部署。支持多账号轮换，但调用经公网 HTTPS。
+
+> **注意**：模式 B 按钮需要仓库存在 `deploy-rest` 分支。如尚未创建，请仓库维护者运行：
+> ```bash
+> bash create-deploy-rest-branch.sh
+> git push origin deploy-rest
+> ```
 
 ## 两种模式对比
 
@@ -31,14 +51,12 @@
 - **Worker + Binding 模式**：调用不经过公网 HTTP，Cloudflare 网关仅看到一次内部 RPC，无法通过流量特征识别为代理
 - **REST API 模式**：每次调用都是 `api.cloudflare.com` 的公网 HTTPS 请求，频率高时容易被识别为代理转发，建议配合多账号轮换降低单账号频率
 
-## 一键部署（Worker + Binding 模式）
+## 一键部署步骤
 
-1. 点击上方的 **Deploy to Cloudflare Workers** 按钮
+1. 点击上方任一部署按钮
 2. 授权 GitHub 登录 Cloudflare
-3. 仓库会自动 fork 到你账号下，Workers 会自动部署
-4. 部署完成后，在 Cloudflare Dashboard 中配置以下两项：
-   - **KV 命名空间**：创建一个 KV，绑定名为 `KV`
-   - **环境变量**：修改 `ADMIN_PASSWORD` 为你的密码
+3. 仓库会自动 fork 到你账号下，Workers 会自动部署（Cloudflare 会自动创建 KV 命名空间并绑定）
+4. 部署完成后，在 Cloudflare Dashboard 中修改环境变量 `ADMIN_PASSWORD` 为你的密码
 
 ## 手动部署
 
