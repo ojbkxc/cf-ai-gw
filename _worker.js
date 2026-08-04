@@ -6233,11 +6233,10 @@ async function handleAdminPage(request, env, ctx) {
 </body>
 </html>`;
 
-	return new Response(html, {
-		headers: {
-			'Content-Type': 'text/html; charset=utf-8',
-			'Set-Cookie': csrfCookie
-		}
-	});
-}
+		return new Response(html, {
+			headers: {
+				'Content-Type': 'text/html; charset=utf-8',
+				'Set-Cookie': csrfCookie
+			}
+		});
 }
