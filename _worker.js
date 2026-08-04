@@ -397,6 +397,9 @@ const DEFAULT_MODEL_MAP = {
 	'qwen1.5-14b': '@cf/qwen/qwen1.5-14b-instruct',
 	'deepseek-coder-6.7b': '@cf/deepseek-ai/deepseek-coder-6.7b-instruct',
 	'llama-3.2-3b': '@cf/meta/llama-3.2-3b-instruct',
+	'llama-4-scout-17b-16e-instruct': '@cf/meta/llama-4-scout-17b-16e-instruct',
+	'llama-3.3-70b-instruct-fp8-fast': '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+	'qwen3-30b-a3b-fp8': '@cf/qwen/qwen3-30b-a3b-fp8',
 	'codellama-34b': '@cf/codellama/codellama-34b-instruct',
 	'mixtral-8x7b': '@cf/mistral/mixtral-8x7b-instruct',
 	'gemma-2-27b': '@cf/google/gemma-2-27b-it',
@@ -411,21 +414,25 @@ const DEFAULT_MODEL_MAP = {
 	// 多模态模型
 	'llava-1.5-7b': '@cf/llava-hf/llava-1.5-7b-hf',
 	'flux-1-schnell': '@cf/black-forest-labs/flux-1-schnell',
+	'flux': '@cf/deepgram/flux',
 	'sdxl': '@cf/stabilityai/stable-diffusion-xl-base-1.0',
 
 	// 语音识别（Whisper）模型
 	'whisper': '@cf/openai/whisper',
 	'whisper-tiny-en': '@cf/openai/whisper-tiny-en',
 	'whisper-large-v3-turbo': '@cf/openai/whisper-large-v3-turbo',
+	'nova-3': '@cf/deepgram/nova-3',
 
 	// 视觉模型
 	'moondream3.1-9B-A2B': '@cf/moondream/moondream3.1-9B-A2B',
 
 	// 向量嵌入（Embeddings）模型补充
 	'bge-base-en-v1.5': '@cf/baai/bge-base-en-v1.5',
+	'bge-reranker-base': '@cf/baai/bge-reranker-base',
 
 	// 文本转语音（TTS）模型
-	'tts': '@cf/myshell-ai/tts'
+	'tts': '@cf/myshell-ai/tts',
+	'aura-2-en': '@cf/deepgram/aura-2-en'
 };
 
 // CF 模型前缀 → owned_by 映射表（替代 /v1/models 中的 if/else 判断链）
@@ -437,6 +444,7 @@ const CF_OWNER_MAP = [
 	['@cf/black-forest-labs/', 'black-forest-labs'], ['@cf/codellama/', 'codellama'],
 	['@cf/llava-hf/', 'llava-hf'], ['@cf/internlm/', 'internlm'],
 	['@cf/myshell-ai/', 'myshell-ai'], ['@cf/moondream/', 'moondream'],
+	['@cf/deepgram/', 'deepgram'],
 ];
 
 function getModelOwnedBy(cfModel, id) {
@@ -5028,8 +5036,12 @@ async function handleAdminPage(request, env, ctx) {
 				<h3>选择 @cf/ 免费模型</h3>
 				<button onclick="document.getElementById('model-select-modal').classList.remove('active')" class="close-btn">${SVG_CLOSE}</button>
 			</div>
-			<div style="margin-bottom: 12px; font-size: 13px; color: var(--text-muted);">点击模型名称自动填入目标模型路径</div>
-			<div id="model-select-list" style="max-height: 400px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px;">
+			<div style="margin-bottom: 12px; font-size: 13px; color: var(--text-muted);">点击模型自动新增映射：左侧为简称，右侧为完整路径</div>
+			<div style="margin-bottom: 10px;">
+				<input type="text" id="model-search-input" placeholder="搜索模型..." oninput="filterModelList()"
+					   style="width: 100%; padding: 8px 12px; border: 1px solid var(--border-color); border-radius: 6px; font-size: 13px; box-sizing: border-box;">
+			</div>
+			<div id="model-select-list" style="max-height: 350px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px;">
 				<div style="text-align: center; padding: 30px; color: var(--text-muted);">加载中...</div>
 			</div>
 			<div class="modal-footer">
@@ -5938,8 +5950,11 @@ async function handleAdminPage(request, env, ctx) {
 			await copyText(val, \`已复制模型: \${val}\`);
 		}
 
+		let allFreeModels = [];
+
 		async function fetchFreeModels() {
 			document.getElementById('model-select-modal').classList.add('active');
+			document.getElementById('model-search-input').value = '';
 			const listEl = document.getElementById('model-select-list');
 			listEl.innerHTML = '<div style="text-align: center; padding: 30px; color: var(--text-muted);">正在查询 @cf/ 免费模型...</div>';
 			try {
@@ -5949,21 +5964,48 @@ async function handleAdminPage(request, env, ctx) {
 					listEl.innerHTML = \`<div style="text-align: center; padding: 30px; color: var(--danger-color);">\${escapeHtml(data.error || '获取失败')}</div>\`;
 					return;
 				}
-				const models = data.models || [];
-				if (models.length === 0) {
+				allFreeModels = (data.models || []).map(m => {
+					const shortName = (m.name || m.id).split('/').pop();
+					return { fullName: m.name || m.id, shortName };
+				});
+				if (allFreeModels.length === 0) {
 					listEl.innerHTML = '<div style="text-align: center; padding: 30px; color: var(--text-muted);">未找到 @cf/ 模型，请检查账号配置</div>';
 					return;
 				}
-				listEl.innerHTML = models.map(m => \`
-					<div style="padding: 10px 14px; cursor: pointer; border-bottom: 1px solid var(--border-color); font-size: 13px; line-height: 1.5;"
-						 onclick="document.getElementById('map-target').value=\${attrEscape(m.id)};document.getElementById('model-select-modal').classList.remove('active');showToast('已选择: ' + \${attrEscape(m.id)})">
-						<strong>\${escapeHtml(m.name)}</strong><br>
-						<code style="font-size: 11px; color: var(--text-muted);">\${escapeHtml(m.id)}</code>
-					</div>
-				\`).join('');
+				renderModelList(allFreeModels);
 			} catch (e) {
 				listEl.innerHTML = \`<div style="text-align: center; padding: 30px; color: var(--danger-color);">获取失败: \${escapeHtml(e.message)}</div>\`;
 			}
+		}
+
+		function filterModelList() {
+			const query = (document.getElementById('model-search-input').value || '').toLowerCase();
+			const filtered = query
+				? allFreeModels.filter(m => m.shortName.toLowerCase().includes(query) || m.fullName.toLowerCase().includes(query))
+				: allFreeModels;
+			renderModelList(filtered);
+		}
+
+		function renderModelList(models) {
+			const listEl = document.getElementById('model-select-list');
+			if (models.length === 0) {
+				listEl.innerHTML = '<div style="text-align: center; padding: 30px; color: var(--text-muted);">无匹配结果</div>';
+				return;
+			}
+			listEl.innerHTML = models.map(m => \`
+				<div style="padding: 10px 14px; cursor: pointer; border-bottom: 1px solid var(--border-color); font-size: 13px; line-height: 1.5;"
+					 onclick="addMappingFromModel(\${attrEscape(m.shortName)}, \${attrEscape(m.fullName)})">
+					<strong>\${escapeHtml(m.shortName)}</strong>
+					<span style="display: block; font-size: 11px; color: var(--text-muted); margin-top: 2px;">→ \${escapeHtml(m.fullName)}</span>
+				</div>
+			\`).join('');
+		}
+
+		async function addMappingFromModel(source, target) {
+			document.getElementById('map-source').value = source;
+			document.getElementById('map-target').value = target;
+			await addMapping();
+			document.getElementById('model-select-modal').classList.remove('active');
 		}
 
 		async function loadSettings() {
