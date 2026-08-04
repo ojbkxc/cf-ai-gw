@@ -6239,3 +6239,5 @@ async function handleAdminPage(request, env, ctx) {
 			'Set-Cookie': csrfCookie
 		}
 	});
+}
+}
