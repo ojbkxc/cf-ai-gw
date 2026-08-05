@@ -2837,12 +2837,14 @@ const SHARED_MODAL_CSS = `
 			background-color: var(--card-bg);
 			border: 1px solid var(--border-color);
 			border-radius: 20px;
-			width: 100%;
-			padding: 32px;
+			width: 90vw;
+			max-width: 600px;
+			max-height: 85vh;
+			padding: 24px;
 			box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
 			display: flex;
 			flex-direction: column;
-			gap: 20px;
+			gap: 16px;
 			transform: scale(0.9) translateY(20px);
 			transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.3s;
 			backdrop-filter: blur(var(--glass-blur));
@@ -3205,7 +3207,7 @@ async function handleLandingPage(request, env, ctx) {
 				<input type="text" id="model-search-input" placeholder="搜索模型..." oninput="filterModelList()"
 					   style="width: 100%; padding: 8px 12px; border: 1px solid var(--border-color); border-radius: 6px; font-size: 13px; box-sizing: border-box;">
 			</div>
-			<div id="model-select-list" style="max-height: 350px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px;">
+			<div id="model-select-list" style="flex: 1; min-height: 0; max-height: 55vh; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px;">
 				<div style="text-align: center; padding: 30px; color: var(--text-muted);">加载中...</div>
 			</div>
 			<div class="modal-footer">
