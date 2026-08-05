@@ -5027,19 +5027,19 @@ async function handleAdminPage(request, env, ctx) {
 				<div id="tab-settings" class="tab-content">
 					<div class="section-card">
 						<div class="section-title">模型映射 (Model Mappings)</div>
-						<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">您可以设置请求中的模型名字（例如 gpt-3.5-turbo）应该被反向代理路由去哪一个具体的 Cloudflare AI 对应模型。若请求的模型以 @cf/ 开头，则默认透传不会经过映射。</p>
+						<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">将客户端请求的模型名映射到 Cloudflare AI 模型。@cf/ 开头直接透传。</p>
 						
 						<div style="display: grid; grid-template-columns: 1fr 1.5fr auto; gap: 15px; background-color: var(--section-item-bg); padding: 20px; border-radius: 12px; border: 1px solid var(--border-color); margin-top: 10px;">
 							<div class="form-group" style="margin-bottom: 0;">
-								<label>请求模型名称 (OpenAI ID/别名)</label>
+								<label>请求模型</label>
 								<input type="text" id="map-source" placeholder="如: gpt-3.5-turbo">
 							</div>
 							<div class="form-group" style="margin-bottom: 0;">
-								<label>CF 目标模型路径 (Cloudflare Model Path)</label>
+								<label>目标模型</label>
 								<input type="text" id="map-target" placeholder="如: @cf/meta/llama-3.1-8b-instruct">
 							</div>
 							<div class="form-group" style="margin-bottom: 0;">
-								<label>Tokens 上限 (可选，留空使用默认)</label>
+								<label>Tokens 上限</label>
 								<input type="number" id="map-tokens" placeholder="留空使用默认值" min="1" step="1">
 							</div>
 							<div class="mappings-table-actions">
