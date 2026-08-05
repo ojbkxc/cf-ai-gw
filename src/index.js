@@ -167,6 +167,7 @@ const DEFAULT_MODEL_MAP = {
 // 默认模型 token 上限
 const DEFAULT_MODEL_TOKENS = {
 	'@cf/zai-org/glm-5.2': 262144,
+	'@cf/zai-org/glm-4.7-flash': 131072,
 	'@cf/moonshotai/kimi-k2.6': 262144,
 	'@cf/moonshotai/kimi-k2.7-code': 262144,
 	'@cf/meta/llama-4-scout-17b-16e-instruct': 131000,
@@ -3851,11 +3852,23 @@ async function handleAdminPage(request, env, ctx) {
 			border-bottom: 1px solid var(--border-color);
 		}
 
+		th, td {
+			white-space: nowrap;
+		}
+
 		td {
 			padding: 16px 20px;
 			border-bottom: 1px solid var(--border-color);
 			color: var(--text-main);
 		}
+
+		/* 模型映射表格：匹配列允许换行，操作列固定窄 */
+		.mappings-table th, .mappings-table td { white-space: nowrap; }
+		.mappings-table .col-source, .mappings-table .col-target { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.mappings-table .col-op { width: 70px; }
+		.row-tokens { display: flex; align-items: center; gap: 6px; }
+		.row-tokens input { width: 130px; height: 32px; padding: 0 8px; font-size: 13px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--input-bg, transparent); color: var(--text-main); }
+		.row-tokens .btn { padding: 4px 10px; font-size: 12px; height: 32px; border-radius: 6px; white-space: nowrap; }
 
 		tr:hover td {
 			background-color: rgba(255, 255, 255, 0.01);
@@ -4223,14 +4236,14 @@ async function handleAdminPage(request, env, ctx) {
 							</div>
 						</div>
 
-						<table style="margin-top: 20px;">
+						<table class="mappings-table" style="margin-top: 20px;">
 							<thead>
 								<tr>
-									<th>客户端请求模型</th>
-									<th>映射后 Cloudflare 目标模型</th>
+									<th>请求模型</th>
+									<th>目标模型</th>
 									<th>Tokens</th>
 									<th>类型</th>
-									<th style="width: 100px;">操作</th>
+									<th class="col-op">操作</th>
 								</tr>
 							</thead>
 							<tbody id="mappings-table-body">
@@ -5202,23 +5215,64 @@ async function handleAdminPage(request, env, ctx) {
 				items.forEach(({ source, target }) => {
 					const isPreset = Object.prototype.hasOwnProperty.call(defaultMappings, source) && defaultMappings[source] === target;
 					const typeText = isPreset ? '<span class="badge badge-success">预设映射</span>' : '<span class="badge badge-warning">自定义</span>';
-					// Tokens 显示：自定义 > 预设 > 无
+					// Tokens 生效值：自定义 > 预设 > 无
 					const tokenVal = modelTokensConfig[target] !== undefined ? modelTokensConfig[target] : defaultTokens[target];
-					const tokensText = tokenVal ? tokenVal.toLocaleString() : '<span style="color: var(--text-muted);">-</span>';
+					const defaultVal = defaultTokens[target];
+					// 输入框显示当前生效值，留空则回退默认
+					const showVal = modelTokensConfig[target] !== undefined ? modelTokensConfig[target] : (tokenVal || '');
+					const tokensPlaceholder = defaultVal ? '默认 ' + defaultVal.toLocaleString() : '默认';
 					const tr = document.createElement('tr');
 					tr.innerHTML = \`
-					<td><code style="cursor: pointer;" title="点击复制" onclick="copyModelId(\${attrEscape(source)})">\${escapeHtml(source)}</code></td>
-					<td><code style="cursor: pointer;" title="点击复制" onclick="copyModelId(\${attrEscape(target)})">\${escapeHtml(target)}</code></td>
-					<td>\${tokensText}</td>
-					<td>\${typeText}</td>
+					<td class="col-source"><code style="cursor: pointer; word-break: break-all;" title="点击复制" onclick="copyModelId(\${attrEscape(source)})">\${escapeHtml(source)}</code></td>
+					<td class="col-target"><code style="cursor: pointer; word-break: break-all;" title="点击复制" onclick="copyModelId(\${attrEscape(target)})">\${escapeHtml(target)}</code></td>
 					<td>
-							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteMapping(\${attrEscape(source)})">删除</button>
-						</td>
+						<div class="row-tokens">
+							<input type="number" min="1" step="1" value="\${showVal ? showVal : ''}" placeholder="\${tokensPlaceholder}" data-target="\${attrEscape(target)}" onchange="saveRowTokens(this)">
+							<button class="btn btn-secondary" onclick="saveRowTokens(this.previousElementSibling)">保存</button>
+						</div>
+					</td>
+					<td>\${typeText}</td>
+					<td class="col-op">
+						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteMapping(\${attrEscape(source)})">删除</button>
+					</td>
 					\`;
 					tbody.appendChild(tr);
 				});
 			} catch(e) {
 				console.error(e);
+			}
+		}
+
+		// 单独保存某一行的 Tokens 配置（按目标模型 target）
+		async function saveRowTokens(input) {
+			if (!input) return;
+			const target = input.getAttribute('data-target');
+			if (!target) return;
+			const val = input.value.trim();
+			const next = { ...modelTokensConfig };
+			if (val) {
+				const tokensNum = parseInt(val, 10);
+				if (isNaN(tokensNum) || tokensNum <= 0) {
+					showToast('Tokens 上限必须为正整数', 'warning');
+					const cur = modelTokensConfig[target] !== undefined ? modelTokensConfig[target] : defaultTokens[target];
+					input.value = cur ? cur : '';
+					return;
+				}
+				next[target] = tokensNum;
+			} else {
+				delete next[target];
+			}
+			const res = await apiFetch('/api/settings', {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ modelTokens: next })
+			});
+			if (res.ok) {
+				modelTokensConfig = next;
+				loadSettings();
+				showToast('Tokens 已保存');
+			} else {
+				showToast('保存 Tokens 失败！', 'error');
 			}
 		}
 
