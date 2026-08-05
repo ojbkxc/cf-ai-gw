@@ -1545,7 +1545,12 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				model: modelName,
 				stop_reason: null,
 				stop_sequence: null,
-				usage: { input_tokens: inputTokens, output_tokens: outputTokens }
+				usage: {
+					input_tokens: inputTokens,
+					output_tokens: outputTokens,
+					cache_creation_input_tokens: cacheWriteTokens || 0,
+					cache_read_input_tokens: cacheReadTokens || 0,
+				}
 			}
 		};
 		controller.enqueue(encoder.encode(`event: message_start\ndata: ${JSON.stringify(event)}\n\n`));
@@ -3871,8 +3876,10 @@ async function handleAdminPage(request, env, ctx) {
 		.mappings-table th, .mappings-table td { white-space: nowrap; }
 		.mappings-table .col-source, .mappings-table .col-target { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 		.mappings-table .col-op { width: 70px; }
+		.mappings-table-actions { display: flex; align-items: flex-end; gap: 10px; flex-wrap: nowrap; }
 		.row-tokens { display: flex; align-items: center; gap: 6px; }
-		.row-tokens input { width: 130px; height: 32px; padding: 0 8px; font-size: 13px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--input-bg, transparent); color: var(--text-main); }
+		.row-tokens input { width: 130px; height: 32px; padding: 0 8px; font-size: 13px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--input-bg, transparent); color: var(--text-main); -moz-appearance: textfield; }
+		.row-tokens input::-webkit-outer-spin-button, .row-tokens input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 		.row-tokens .btn { padding: 4px 10px; font-size: 12px; height: 32px; border-radius: 6px; white-space: nowrap; }
 
 		tr:hover td {
@@ -4234,7 +4241,7 @@ async function handleAdminPage(request, env, ctx) {
 								<label>Tokens 上限 (可选，留空使用默认)</label>
 								<input type="number" id="map-tokens" placeholder="留空使用默认值" min="1" step="1">
 							</div>
-							<div style="display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;">
+							<div class="mappings-table-actions">
 								<button class="btn btn-primary" onclick="addMapping()" style="height: 45px;">添加/修改</button>
 								<button class="btn btn-secondary" onclick="restorePresetMappings()" style="height: 45px;">预设映射</button>
 								<button class="btn btn-secondary" onclick="fetchFreeModels()" style="height: 45px;">获取免费模型</button>
