@@ -1287,8 +1287,13 @@ async function handleMessages(request, env, ctx) {
 	}
 
 	// Token 上限 clamp
-	if (tokens && openaiBody.max_tokens && openaiBody.max_tokens > tokens) {
-		openaiBody.max_tokens = tokens;
+	if (tokens) {
+		if (openaiBody.max_tokens && openaiBody.max_tokens > tokens) {
+			openaiBody.max_tokens = tokens;
+		}
+		if (openaiBody.max_completion_tokens && openaiBody.max_completion_tokens > tokens) {
+			openaiBody.max_completion_tokens = tokens;
+		}
 	}
 
 	// P3: 过大闸检查

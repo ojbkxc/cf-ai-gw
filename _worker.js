@@ -1361,10 +1361,13 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 // 共享的模型名解析函数：根据用户传入的模型名，映射到 Cloudflare 实际模型
 // 找不到映射时回退到默认模型，并标记 isFallback 以便调用方添加警告 header。
 async function resolveModelName(model, env) {
-	if (!model) return { cfModel: DEFAULT_FALLBACK_MODEL, isFallback: true, tokens: DEFAULT_MODEL_TOKENS[DEFAULT_FALLBACK_MODEL] };
+	if (!model) {
+		const tokens = DEFAULT_MODEL_TOKENS[DEFAULT_FALLBACK_MODEL] || null;
+		return { cfModel: DEFAULT_FALLBACK_MODEL, isFallback: true, tokens };
+	}
 	if (model.startsWith('@cf/')) {
 		const customTokens = await getModelTokens(env);
-		const tokens = customTokens[model] || DEFAULT_MODEL_TOKENS[model];
+		const tokens = customTokens[model] || DEFAULT_MODEL_TOKENS[model] || null;
 		return { cfModel: model, isFallback: false, tokens };
 	}
 	const customMap = await getCustomModelMap(env);
@@ -1372,10 +1375,11 @@ async function resolveModelName(model, env) {
 	const mapped = combinedMap[model];
 	if (mapped) {
 		const customTokens = await getModelTokens(env);
-		const tokens = customTokens[mapped] || DEFAULT_MODEL_TOKENS[mapped];
+		const tokens = customTokens[mapped] || DEFAULT_MODEL_TOKENS[mapped] || null;
 		return { cfModel: mapped, isFallback: false, tokens };
 	}
-	return { cfModel: DEFAULT_FALLBACK_MODEL, isFallback: true, tokens: DEFAULT_MODEL_TOKENS[DEFAULT_FALLBACK_MODEL] };
+	const tokens = DEFAULT_MODEL_TOKENS[DEFAULT_FALLBACK_MODEL] || null;
+	return { cfModel: DEFAULT_FALLBACK_MODEL, isFallback: true, tokens };
 }
 
 // 通用的 CF /ai/run/{model} failover 调用函数
@@ -1792,8 +1796,13 @@ async function handleMessages(request, env, ctx) {
 	}
 
 	// Token 上限 clamp
-	if (tokens && openaiBody.max_tokens && openaiBody.max_tokens > tokens) {
-		openaiBody.max_tokens = tokens;
+	if (tokens) {
+		if (openaiBody.max_tokens && openaiBody.max_tokens > tokens) {
+			openaiBody.max_tokens = tokens;
+		}
+		if (openaiBody.max_completion_tokens && openaiBody.max_completion_tokens > tokens) {
+			openaiBody.max_completion_tokens = tokens;
+		}
 	}
 
 	const result = await callOpenAICompatibleAPI(openaiBody, env, stream);
