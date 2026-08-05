@@ -3872,15 +3872,17 @@ async function handleAdminPage(request, env, ctx) {
 			color: var(--text-main);
 		}
 
-		/* 模型映射表格：匹配列允许换行，操作列固定窄 */
-		.mappings-table th, .mappings-table td { white-space: nowrap; }
-		.mappings-table .col-source, .mappings-table .col-target { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-		.mappings-table .col-op { width: 70px; }
+		/* 模型映射表格：紧凑布局、列宽自适应 */
+		.mappings-table { table-layout: auto; width: 100%; }
+		.mappings-table th, .mappings-table td { white-space: nowrap; padding: 8px 12px; }
+		.mappings-table .col-source, .mappings-table .col-target { max-width: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.mappings-table .col-op { width: auto; }
 		.mappings-table-actions { display: flex; align-items: flex-end; gap: 10px; flex-wrap: nowrap; }
-		.row-tokens { display: flex; align-items: center; gap: 6px; }
-		.row-tokens input { width: 130px; height: 32px; padding: 0 8px; font-size: 13px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--input-bg, transparent); color: var(--text-main); -moz-appearance: textfield; }
+		.mappings-table-actions .btn { min-width: 110px; white-space: nowrap; }
+		.row-tokens { display: flex; align-items: center; gap: 4px; }
+		.row-tokens input { width: 65px; height: 28px; padding: 0 6px; font-size: 13px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--input-bg, transparent); color: var(--text-main); -moz-appearance: textfield; }
 		.row-tokens input::-webkit-outer-spin-button, .row-tokens input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
-		.row-tokens .btn { padding: 4px 10px; font-size: 12px; height: 32px; border-radius: 6px; white-space: nowrap; }
+		.row-tokens .btn { padding: 2px 8px; font-size: 12px; height: 28px; border-radius: 6px; white-space: nowrap; }
 
 		tr:hover td {
 			background-color: rgba(255, 255, 255, 0.01);
