@@ -1359,10 +1359,10 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 
 	return new ReadableStream({
 		start(controller) {
-			controller.enqueue(encoder.encode(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`));
+			controller.enqueue(encoder.encode(': ping\n\n'));
 			pingInterval = setInterval(() => {
 				try {
-					controller.enqueue(encoder.encode(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`));
+					controller.enqueue(encoder.encode(': ping\n\n'));
 				} catch (_) { /* controller 已关闭 */ }
 			}, 10000);
 		},
@@ -1947,10 +1947,10 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 
 	return new ReadableStream({
 		start(controller) {
-			controller.enqueue(encoder.encode(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`));
+			controller.enqueue(encoder.encode(': ping\n\n'));
 			pingInterval = setInterval(() => {
 				try {
-					controller.enqueue(encoder.encode(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`));
+					controller.enqueue(encoder.encode(': ping\n\n'));
 				} catch (_) { /* controller 已关闭 */ }
 			}, 10000);
 		},
