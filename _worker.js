@@ -1865,11 +1865,11 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 	return new ReadableStream({
 		start(controller) {
 			// 初始 ping 保持连接（推理模型首 token 延迟可能较长）
-			controller.enqueue(encoder.encode(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`));
+			controller.enqueue(encoder.encode(': ping\n\n'));
 			// 定时 ping 保持连接（每 10 秒，参照 new-api 的 SSE ping 保活机制）
 			pingInterval = setInterval(() => {
 				try {
-					controller.enqueue(encoder.encode(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`));
+					controller.enqueue(encoder.encode(': ping\n\n'));
 				} catch (_) { /* controller 已关闭 */ }
 			}, 10000);
 		},
@@ -2504,10 +2504,10 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 	return new ReadableStream({
 		start(controller) {
 			// 初始 ping + 定时 ping 保持连接（每 10 秒）
-			controller.enqueue(encoder.encode(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`));
+			controller.enqueue(encoder.encode(': ping\n\n'));
 			pingInterval = setInterval(() => {
 				try {
-					controller.enqueue(encoder.encode(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`));
+					controller.enqueue(encoder.encode(': ping\n\n'));
 				} catch (_) { /* controller 已关闭 */ }
 			}, 10000);
 		},
