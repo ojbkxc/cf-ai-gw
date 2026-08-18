@@ -2500,6 +2500,27 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 	let buffer = '';
 	let streamUsage = null; // 捕获流式响应中的 usage（最后一个 chunk 才有）
 	let pingInterval = null;
+	// 追踪上游是否已下发过 finish_reason
+	let sawFinishReason = false;
+	let lastChunkId = null;
+	let lastChunkCreated = null;
+
+	// 若上游未下发 finish_reason（Cloudflare 部分模型不返回），在 [DONE] 前补齐收尾块，
+	// 避免 OpenAI 兼容客户端报 "Stream ended without finish_reason"。
+	function ensureFinishReason(controller, reason) {
+		if (sawFinishReason) return;
+		const now = Math.floor(Date.now() / 1000);
+		const base = {
+			id: lastChunkId || `chatcmpl-${crypto.randomUUID()}`,
+			created: lastChunkCreated || now,
+			model: modelName
+		};
+		const chunk = isCompletion
+			? { ...base, object: 'text_completion', choices: [{ index: 0, text: '', logprobs: null, finish_reason: reason }] }
+			: { ...base, object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: reason }] };
+		try { controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`)); } catch (_) {}
+		sawFinishReason = true;
+	}
 
 	return new ReadableStream({
 		start(controller) {
@@ -2530,6 +2551,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 								controller.enqueue(encoder.encode(`${buffer.trim()}\n\n`));
 							}
 						}
+						ensureFinishReason(controller, 'stop');
 						controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 						controller.close();
 						if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
@@ -2552,6 +2574,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 					if (buffer.trim()) {
 						buffer = processLines(buffer, controller);
 					}
+					ensureFinishReason(controller, 'error');
 					controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 				} catch (e2) { console.error('passthroughStream secondary error:', e2?.message || e2); }
 				if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
@@ -2578,6 +2601,10 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 
 				try {
 					const chunk = JSON.parse(dataStr);
+					// 追踪 finish_reason，判断是否需要补齐收尾块
+					if (chunk.choices && chunk.choices.some(c => c.finish_reason != null)) sawFinishReason = true;
+					if (chunk.id !== undefined) lastChunkId = chunk.id;
+					if (chunk.created !== undefined) lastChunkCreated = chunk.created;
 					// 只改模型名，其余原样透传
 					if (chunk.model !== undefined) chunk.model = modelName;
 					// 捕获 usage（最后一个 chunk 才有）
