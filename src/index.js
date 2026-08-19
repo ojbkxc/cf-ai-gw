@@ -836,19 +836,22 @@ async function handleV1Proxy(request, env, ctx) {
 
 	if (url.pathname === '/v1/models' && request.method === 'GET') {
 		const customMap = await getCustomModelMap(env);
+		const customTokens = await getModelTokens(env);
 		const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
 
 		const modelsData = Object.keys(combinedMap).map(id => {
 			const cfModel = combinedMap[id] || '';
 			if (!cfModel.startsWith('@cf/')) return null; // 只返回 @cf/ 开头的模型
 			const ownedBy = getModelOwnedBy(cfModel, id);
+			const tokens = customTokens[cfModel] || DEFAULT_MODEL_TOKENS[cfModel] || 0;
 			return {
 				id,
 				object: 'model',
 				created: MODEL_CREATED_TS,
-				owned_by: ownedBy
+				owned_by: ownedBy,
+				_tokens: tokens
 			};
-		}).filter(Boolean);
+		}).filter(Boolean).sort((a, b) => b._tokens - a._tokens).map(({ _tokens, ...rest }) => rest);
 
 		return new Response(JSON.stringify({
 			object: 'list',

@@ -146,6 +146,7 @@ cf-ai-gw/
 - [x] **P2-4 safeJsonBody 错误文案「too large」→「Invalid or missing JSON body」、status 413→400（两入口）**
 - [x] **核对 CF 官方目录更新模型映射：移除 8 个弃用/过时模型，替换+新增 8 个最新模型，补全 token 上限**
 - [x] **改造 getModelOwnedBy：移除 CF_OWNER_MAP 前缀表，改为从 @cf/ 路径自动提取 owner**
+- [x] **/v1/models 按 token 上限从大到小排序（两入口）**
 
 ### 下一步任务（待用户决策，按优先级）
 - [x] **P1-A 补滥用防护**：用户裁决跳过——Cloudflare 平台自带限流
@@ -155,6 +156,7 @@ cf-ai-gw/
 
 ## 5. 变更日志（最新在上）
 
+- **2026-08-19（/v1/models 按 token 降序排序）**：两文件 `/v1/models` 端点改为按 token 上限从大到小排序（`customTokens[cfModel] || DEFAULT_MODEL_TOKENS[cfModel] || 0`），无 token 上限的模型（embedding/image/audio 等）排到最后。排序用临时 `_tokens` 字段，输出前 `.map(({ _tokens, ...rest }) => rest)` 剥离，不污染 OpenAI 格式。两文件同步，`node --check` 通过。
 - **2026-08-19（模型目录核对 + getModelOwnedBy 改造）**：① 对照 CF 官方目录（2026-08-12，84 模型）核对 `DEFAULT_MODEL_MAP`：移除 8 个已弃用/不在目录/过时的模型（llama-3.1-8b、qwen1.5-14b、deepseek-coder-6.7b、codellama-34b、mixtral-8x7b、gemma-2-27b、phi-3-mini、deepseek-r1-distill-qwen-32b），替换为最新版本（llama-3.1-8b-instruct-fast、mistral-small-3.1-24b-instruct），新增 6 个模型（qwq-32b、granite-4.0-h-micro、llama-3.2-1b-instruct、llama-3.2-11b-vision-instruct、qwen3.8-27b、gemma-sea-lion-v4-27b-it）。② 改造 `getModelOwnedBy`：移除 `CF_OWNER_MAP` 前缀表，改为从 `@cf/` 路径自动提取 owner（如 `@cf/meta/xxx` → `meta`），新增模型无需维护前缀表。③ `DEFAULT_MODEL_TOKENS` 补全所有新模型 token 上限。④ AGENTS.md 新增 §6 CF 官方模型目录查询方法。两文件同步，`node --check` + grep 校验通过。
 - **2026-08-19（低风险优化批量落地）**：按用户「性能优先、影响性能的不做」裁决落地 4 项（两入口同步）：① P2-8 `checkUsageLimit` 在 `threshold<=0`（限额关闭，默认）时短路返回，跳过 `getCachedSummary`+`getMonthlyUsage` 两次 KV 读（热路径性能提升）；② P2-6 `handleLandingPage`/`handleAdminPage` HTML 响应补 `X-Content-Type-Options: nosniff`+`X-Frame-Options: DENY`，csrf cookie 补 `Secure`；③ P2-7 `_worker.js` `/api/tokens/today` 注释「公开」→「需管理员认证」；④ P2-4 safeJsonBody 错误文案「Request body too large (max 10MB/32MB)」→「Invalid or missing JSON body」、status 413→400。`node --check` 两文件通过，grep 校验全绿。未做：P1-A（Cloudflare 自带限流，用户裁决跳过）、P1-B 主动刷新/口径统一、P1-C 熔断、P2-1/2/3/5（均影响性能或复杂度高）。
 - **2026-08-19（决策落地 + 补充调研）**：① 按用户裁决落地：README 第41行「加密存储」改为「以明文存储」（删错误声称）；移除 `safeJsonBody` 大小限制（`src/index.js`/`_worker.js` 同步，函数改单参数，4 处显式传参调用点 `safeJsonBody(request,10/32)` 全部去参），`node --check` 通过、`safeJsonBody(request,` 为 0 处。② 用户裁决维持现状：P0-2 无 key 时 checkProxyAuth 开放、P1-4 两入口重复、P1-5 前端内嵌模板。③ 补充调研（只读）新增发现：P1-A 全站无限流/无登录爆破防护；P1-B 模式 B 限额拦截依赖过期 GraphQL 缓存（10min TTL，仅管理员打开用量页才刷新）且 Neurons/token 口径与模式 A（本地 token 统计）不一致；P1-C 模式 B failover+可恢复流无熔断可放大 8+ 倍上游推理、429 也重试。另有 P2-1~P2-8：KV read-modify-write 丢失更新、流式 token 中断漏记、非流式错误一律标 server_error、会话 token=sha256(密码) 静态无撤销、安全响应头缺失+csrf cookie 缺 Secure+第三方 CDN、`/api/tokens/today` 注释「公开」与实现矛盾、热路径固定 2 次 KV 读。CORS/XSS/CSRF/时序安全/日志脱敏已核查无问题。
