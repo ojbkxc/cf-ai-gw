@@ -120,21 +120,21 @@ const DEFAULT_MODEL_MAP = {
 	'kimi-k2.7-code': '@cf/moonshotai/kimi-k2.7-code',
 	'kimi-k2.6': '@cf/moonshotai/kimi-k2.6',
 	'gemma-4-26b-a4b-it': '@cf/google/gemma-4-26b-a4b-it',
+	'gemma-sea-lion-v4-27b-it': '@cf/aisingapore/gemma-sea-lion-v4-27b-it',
 	'nemotron-3-120b-a12b': '@cf/nvidia/nemotron-3-120b-a12b',
 	'gpt-oss-20b': '@cf/openai/gpt-oss-20b',
 	'gpt-oss-120b': '@cf/openai/gpt-oss-120b',
-	'llama-3.1-8b': '@cf/meta/llama-3.1-8b-instruct',
-	'deepseek-r1-distill-qwen-32b': '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b',
-	'qwen1.5-14b': '@cf/qwen/qwen1.5-14b-instruct',
-	'deepseek-coder-6.7b': '@cf/deepseek-ai/deepseek-coder-6.7b-instruct',
+	'llama-3.1-8b-instruct-fast': '@cf/meta/llama-3.1-8b-instruct-fast',
+	'llama-3.2-1b-instruct': '@cf/meta/llama-3.2-1b-instruct',
 	'llama-3.2-3b': '@cf/meta/llama-3.2-3b-instruct',
-	'llama-4-scout-17b-16e-instruct': '@cf/meta/llama-4-scout-17b-16e-instruct',
+	'llama-3.2-11b-vision-instruct': '@cf/meta/llama-3.2-11b-vision-instruct',
 	'llama-3.3-70b-instruct-fp8-fast': '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+	'llama-4-scout-17b-16e-instruct': '@cf/meta/llama-4-scout-17b-16e-instruct',
 	'qwen3-30b-a3b-fp8': '@cf/qwen/qwen3-30b-a3b-fp8',
-	'codellama-34b': '@cf/codellama/codellama-34b-instruct',
-	'mixtral-8x7b': '@cf/mistral/mixtral-8x7b-instruct',
-	'gemma-2-27b': '@cf/google/gemma-2-27b-it',
-	'phi-3-mini': '@cf/microsoft/phi-3-mini-4k-instruct',
+	'qwq-32b': '@cf/qwen/qwq-32b',
+	'qwen3.8-27b': '@cf/qwen/qwen3.8-27b',
+	'mistral-small-3.1-24b-instruct': '@cf/mistral/mistral-small-3.1-24b-instruct',
+	'granite-4.0-h-micro': '@cf/ibm/granite-4.0-h-micro',
 
 	// 向量嵌入（Embeddings）模型
 	'embeddinggemma-300m': '@cf/google/embeddinggemma-300m',
@@ -168,38 +168,35 @@ const DEFAULT_MODEL_MAP = {
 
 // 默认模型 token 上限
 const DEFAULT_MODEL_TOKENS = {
+	'@cf/deepseek-ai/deepseek-v4-pro-0813': 1048576,
+	'@cf/deepseek-ai/deepseek-v4-flash-0731': 1048576,
 	'@cf/zai-org/glm-5.2': 262144,
 	'@cf/zai-org/glm-4.7-flash': 131072,
 	'@cf/moonshotai/kimi-k2.6': 262144,
 	'@cf/moonshotai/kimi-k2.7-code': 262144,
-	'@cf/meta/llama-4-scout-17b-16e-instruct': 131000,
-	'@cf/nvidia/nemotron-3-120b-a12b': 256000,
 	'@cf/google/gemma-4-26b-a4b-it': 131072,
-	'@cf/qwen/qwen3-30b-a3b-fp8': 32768,
+	'@cf/aisingapore/gemma-sea-lion-v4-27b-it': 131072,
+	'@cf/nvidia/nemotron-3-120b-a12b': 256000,
+	'@cf/meta/llama-3.1-8b-instruct-fast': 131072,
+	'@cf/meta/llama-3.2-1b-instruct': 131072,
+	'@cf/meta/llama-3.2-11b-vision-instruct': 131072,
+	'@cf/meta/llama-4-scout-17b-16e-instruct': 131000,
 	'@cf/meta/llama-3.3-70b-instruct-fp8-fast': 24000,
-	'@cf/deepseek-ai/deepseek-v4-pro-0813': 1048576,
-	'@cf/deepseek-ai/deepseek-v4-flash-0731': 1048576,
+	'@cf/qwen/qwen3-30b-a3b-fp8': 32768,
+	'@cf/qwen/qwq-32b': 32768,
+	'@cf/qwen/qwen3.8-27b': 131072,
+	'@cf/mistral/mistral-small-3.1-24b-instruct': 131072,
+	'@cf/ibm/granite-4.0-h-micro': 131072,
 };
 
-// CF 模型前缀 → owned_by 映射表
-const CF_OWNER_MAP = [
-	['@cf/meta/', 'meta'], ['@cf/google/', 'google'], ['@cf/mistral/', 'mistral'],
-	['@cf/microsoft/', 'microsoft'], ['@cf/openai/', 'openai'], ['@cf/nvidia/', 'nvidia'],
-	['@cf/deepseek-ai/', 'deepseek'], ['@cf/qwen/', 'qwen'], ['@cf/zai-org/', 'zai-org'],
-	['@cf/moonshotai/', 'moonshotai'], ['@cf/baai/', 'baai'], ['@cf/stabilityai/', 'stabilityai'],
-	['@cf/black-forest-labs/', 'black-forest-labs'], ['@cf/codellama/', 'codellama'],
-	['@cf/llava-hf/', 'llava-hf'], ['@cf/internlm/', 'internlm'],
-	['@cf/myshell-ai/', 'myshell-ai'], ['@cf/moondream/', 'moondream'],
-	['@cf/deepgram/', 'deepgram'],
-];
-
+// 从 @cf/ 模型路径提取 owned_by（如 @cf/meta/xxx → meta），无需维护前缀表
 function getModelOwnedBy(cfModel, id) {
-	let ownedBy = 'system';
-	for (const [prefix, owner] of CF_OWNER_MAP) {
-		if (cfModel.startsWith(prefix)) { ownedBy = owner; break; }
+	if (cfModel.startsWith('@cf/')) {
+		const parts = cfModel.slice(4).split('/');
+		return parts[0] || 'system';
 	}
-	if (ownedBy === 'system' && id.includes('embedding')) ownedBy = 'openai';
-	return ownedBy;
+	if (id.includes('embedding')) return 'openai';
+	return 'system';
 }
 
 export default {

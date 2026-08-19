@@ -69,7 +69,7 @@ Worker 部署成功后，用 curl 或浏览器验证：
 - **缓存 invalidate 覆盖检查**：每个 `createKVGetter(...)` 创建的 getter，其对应 `save*` 函数末尾必须有 `.invalidate()` 调用。
 - **无绕过 getter 的直接 KV 读取**：`grep "KV.get('cfg_"` 应为 0（所有配置读取走 `createKVGetter`）。
 - **`git status` 确认无残留未 commit 修改**：会话开始前与 commit 前各执行一次。
-- 人工 review：模型映射 key 是否以 `@cf/` 开头、token 上限是否正整数、`CF_OWNER_MAP` 前缀是否覆盖新模型。
+- 人工 review：模型映射 key 是否以 `@cf/` 开头、token 上限是否正整数。
 
 ### R2.5 wrangler.toml 维护
 - **不要**在 `wrangler.toml` 里加 KV/AI Binding/环境变量配置——这些在 Cloudflare Dashboard 中配置，推代码不会覆盖。
@@ -109,10 +109,10 @@ cf-ai-gw 是 **Cloudflare Workers AI → OpenAI/Anthropic 兼容 API 网关**（
 | 配置 KV 键 | `cfg_model_map` / `cfg_model_tokens` / `cfg_api_keys` / `cfg_limits` / `cfg_accounts` | `createKVGetter` 调用 |
 | 缓存 | `createKVGetter` 60s 闭包缓存，`save*` 必须 `.invalidate()`（§R0.7） | grep `.invalidate()` |
 | 模型映射 | `DEFAULT_MODEL_MAP` + `DEFAULT_MODEL_TOKENS`，**两文件同步**（§R0.6） | grep 对称性 |
-| 模型 owned_by | `@cf/` 前缀 → `CF_OWNER_MAP` 映射 | `CF_OWNER_MAP` |
+| 模型 owned_by | `@cf/` 路径自动提取（`getModelOwnedBy`） | `getModelOwnedBy` |
 | 无构建步骤 | push 即部署，无 npm install/bundle | — |
 
-新增 `@cf/` 模型时：在两文件 `DEFAULT_MODEL_MAP` 加映射、`DEFAULT_MODEL_TOKENS` 加上限（如有），确认 `CF_OWNER_MAP` 已覆盖其前缀。
+新增 `@cf/` 模型时：在两文件 `DEFAULT_MODEL_MAP` 加映射、`DEFAULT_MODEL_TOKENS` 加上限（如有）。`owned_by` 由 `getModelOwnedBy` 从 `@cf/` 路径自动提取（如 `@cf/meta/xxx` → `meta`），无需维护前缀表。
 
 ## 3. 仓库结构
 
@@ -126,7 +126,7 @@ cf-ai-gw/
 └── _worker.js         # 模式 B 入口（REST API，多账号 failover，fetch() 公网）
 ```
 
-两入口各自完整包含：`DEFAULT_MODEL_MAP`、`DEFAULT_MODEL_TOKENS`、`CF_OWNER_MAP`、`createKVGetter`、`resolveModelName`、`/api/settings` 端点、`/admin` 管理面板 HTML+JS。**改任何共享逻辑必须两文件同步**。
+两入口各自完整包含：`DEFAULT_MODEL_MAP`、`DEFAULT_MODEL_TOKENS`、`getModelOwnedBy`、`createKVGetter`、`resolveModelName`、`/api/settings` 端点、`/admin` 管理面板 HTML+JS。**改任何共享逻辑必须两文件同步**。
 
 ## 4. 当前进度与下一步任务
 
@@ -144,6 +144,8 @@ cf-ai-gw/
 - [x] **P2-6 HTML 响应加 X-Content-Type-Options/X-Frame-Options + csrf cookie 加 Secure（两入口）**
 - [x] **P2-7 /api/tokens/today 注释「公开」→「需管理员认证」（模式 B）**
 - [x] **P2-4 safeJsonBody 错误文案「too large」→「Invalid or missing JSON body」、status 413→400（两入口）**
+- [x] **核对 CF 官方目录更新模型映射：移除 8 个弃用/过时模型，替换+新增 8 个最新模型，补全 token 上限**
+- [x] **改造 getModelOwnedBy：移除 CF_OWNER_MAP 前缀表，改为从 @cf/ 路径自动提取 owner**
 
 ### 下一步任务（待用户决策，按优先级）
 - [x] **P1-A 补滥用防护**：用户裁决跳过——Cloudflare 平台自带限流
@@ -153,7 +155,36 @@ cf-ai-gw/
 
 ## 5. 变更日志（最新在上）
 
+- **2026-08-19（模型目录核对 + getModelOwnedBy 改造）**：① 对照 CF 官方目录（2026-08-12，84 模型）核对 `DEFAULT_MODEL_MAP`：移除 8 个已弃用/不在目录/过时的模型（llama-3.1-8b、qwen1.5-14b、deepseek-coder-6.7b、codellama-34b、mixtral-8x7b、gemma-2-27b、phi-3-mini、deepseek-r1-distill-qwen-32b），替换为最新版本（llama-3.1-8b-instruct-fast、mistral-small-3.1-24b-instruct），新增 6 个模型（qwq-32b、granite-4.0-h-micro、llama-3.2-1b-instruct、llama-3.2-11b-vision-instruct、qwen3.8-27b、gemma-sea-lion-v4-27b-it）。② 改造 `getModelOwnedBy`：移除 `CF_OWNER_MAP` 前缀表，改为从 `@cf/` 路径自动提取 owner（如 `@cf/meta/xxx` → `meta`），新增模型无需维护前缀表。③ `DEFAULT_MODEL_TOKENS` 补全所有新模型 token 上限。④ AGENTS.md 新增 §6 CF 官方模型目录查询方法。两文件同步，`node --check` + grep 校验通过。
 - **2026-08-19（低风险优化批量落地）**：按用户「性能优先、影响性能的不做」裁决落地 4 项（两入口同步）：① P2-8 `checkUsageLimit` 在 `threshold<=0`（限额关闭，默认）时短路返回，跳过 `getCachedSummary`+`getMonthlyUsage` 两次 KV 读（热路径性能提升）；② P2-6 `handleLandingPage`/`handleAdminPage` HTML 响应补 `X-Content-Type-Options: nosniff`+`X-Frame-Options: DENY`，csrf cookie 补 `Secure`；③ P2-7 `_worker.js` `/api/tokens/today` 注释「公开」→「需管理员认证」；④ P2-4 safeJsonBody 错误文案「Request body too large (max 10MB/32MB)」→「Invalid or missing JSON body」、status 413→400。`node --check` 两文件通过，grep 校验全绿。未做：P1-A（Cloudflare 自带限流，用户裁决跳过）、P1-B 主动刷新/口径统一、P1-C 熔断、P2-1/2/3/5（均影响性能或复杂度高）。
 - **2026-08-19（决策落地 + 补充调研）**：① 按用户裁决落地：README 第41行「加密存储」改为「以明文存储」（删错误声称）；移除 `safeJsonBody` 大小限制（`src/index.js`/`_worker.js` 同步，函数改单参数，4 处显式传参调用点 `safeJsonBody(request,10/32)` 全部去参），`node --check` 通过、`safeJsonBody(request,` 为 0 处。② 用户裁决维持现状：P0-2 无 key 时 checkProxyAuth 开放、P1-4 两入口重复、P1-5 前端内嵌模板。③ 补充调研（只读）新增发现：P1-A 全站无限流/无登录爆破防护；P1-B 模式 B 限额拦截依赖过期 GraphQL 缓存（10min TTL，仅管理员打开用量页才刷新）且 Neurons/token 口径与模式 A（本地 token 统计）不一致；P1-C 模式 B failover+可恢复流无熔断可放大 8+ 倍上游推理、429 也重试。另有 P2-1~P2-8：KV read-modify-write 丢失更新、流式 token 中断漏记、非流式错误一律标 server_error、会话 token=sha256(密码) 静态无撤销、安全响应头缺失+csrf cookie 缺 Secure+第三方 CDN、`/api/tokens/today` 注释「公开」与实现矛盾、热路径固定 2 次 KV 读。CORS/XSS/CSRF/时序安全/日志脱敏已核查无问题。
 - **2026-08-19（全量分析）**：对项目做全量优化点分析（未改代码）。结论：P0-1 账号 API Token / API Key 明文存 KV（README 声称加密但未实现）；P0-2 `checkProxyAuth` 无 key 时完全开放；P0-3 `safeJsonBody` 默认 128MB 且 Content-Length 缺失时绕过大小检查；P1-4 两入口 ~90% 重复代码（~5000 行）；P1-5 前端 ~2000 行内嵌模板字符串；P2 用量写 KV 频繁、KV 双重缓存。优点：timingSafeEqual、密码哈希缓存、错误分类/可恢复流、熔断/failover。
 - **2026-08-19**：新增 `deepseek-v4-pro-0813`（`@cf/deepseek-ai/deepseek-v4-pro-0813`）与 `deepseek-v4-flash-0731`（`@cf/deepseek-ai/deepseek-v4-flash-0731`）两个模型映射，token 上限均 1048576，排在 `DEFAULT_MODEL_MAP` 的 `glm-5.2` 前。修复「自定义模型 Tokens 保存失效」：根因为 `createKVGetter` 60 秒闭包缓存导致保存后 `loadSettings` 重载返回旧值；改造 `createKVGetter` 返回函数挂载 `invalidate()` 方法，在 `saveModelTokens`/`saveCustomModelMap`/`saveUsageLimitsConfig`/`saveApiKeys`/`saveAccounts`（仅模式 B）写 KV 后调用对应 getter 的 `invalidate()`。两文件 `src/index.js` / `_worker.js` 同步。`node --check` 语法 OK，grep 对称性验证通过。创建本 `AGENTS.md`。
+
+---
+
+## 6. Cloudflare 官方模型目录查询与 @cf/ 模型筛选
+
+> 更新 `DEFAULT_MODEL_MAP` 前必读：先核对 CF 官方目录，移除已弃用模型，替换为最新版本。
+
+### 6.1 查询官方目录
+- **URL**：`https://developers.cloudflare.com/workers-ai/models/`
+- **方法**：用 `webfetch` 工具获取该页面（markdown 格式），页面列出所有 Workers AI 可用模型（约 80+ 个），含模型名称、提供商、任务类型、是否弃用。
+- **更新频率**：CF 不定期更新目录，建议每 1-2 个月核对一次。
+
+### 6.2 筛选 @cf/ 模型
+- 目录中每个模型有一个 `@cf/<provider>/<model-name>` 格式的 ID。
+- **只保留 `@cf/` 开头的模型**——这些是 Cloudflare 托管的模型，通过 Workers AI Binding 或 REST API 调用。
+- 排除标记为 "Deprecated" 的模型。
+- 排除 LoRA-only 模型（除非项目支持 LoRA）。
+
+### 6.3 更新流程
+1. `webfetch` 获取 `https://developers.cloudflare.com/workers-ai/models/`（markdown 格式）。
+2. 提取所有 `@cf/` 模型，排除 Deprecated 和 LoRA-only。
+3. 与当前 `DEFAULT_MODEL_MAP` 对比：
+   - **移除**：已弃用或不在目录的模型。
+   - **替换**：有最新版本的过时模型，替换为新版本。
+   - **新增**：目录中新增的有价值模型。
+4. 在 `DEFAULT_MODEL_TOKENS` 填上对应 token 上限（从模型详情页或目录描述获取 context window）。
+5. 两文件同步修改（`src/index.js` + `_worker.js`），`node --check` + grep 校验。
+6. `owned_by` 由 `getModelOwnedBy` 从 `@cf/` 路径自动提取（如 `@cf/meta/xxx` → `meta`），无需维护前缀表。
