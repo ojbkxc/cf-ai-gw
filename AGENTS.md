@@ -147,6 +147,8 @@ cf-ai-gw/
 - [x] **核对 CF 官方目录更新模型映射：移除 8 个弃用/过时模型，替换+新增 8 个最新模型，补全 token 上限**
 - [x] **改造 getModelOwnedBy：移除 CF_OWNER_MAP 前缀表，改为从 @cf/ 路径自动提取 owner**
 - [x] **/v1/models 按 token 上限从大到小排序（两入口）**
+- [x] **管理面板 loadSettings 模型映射列表按 token 降序排序（两入口）**
+- [x] **更新 README.md 内置模型列表（按类别分组+Tokens 列）、模式对比表、端点列表**
 
 ### 下一步任务（待用户决策，按优先级）
 - [x] **P1-A 补滥用防护**：用户裁决跳过——Cloudflare 平台自带限流
@@ -156,6 +158,7 @@ cf-ai-gw/
 
 ## 5. 变更日志（最新在上）
 
+- **2026-08-20（README.md 更新 + 管理面板排序）**：① 更新 README.md「内置模型」部分：移除已弃用模型（deepseek-r1-distill-qwen-32b、llama-3.1-8b 等），按类别分组（文本生成/向量嵌入/多模态/语音），文本生成带 Tokens 列按 token 降序，新增 22 个文本生成 + 17 个其他模型的完整列表；模式对比表「模型列表」行补充「按 token 降序」说明；管理面板端点表新增 `/api/models/search`。② 管理面板 `loadSettings` 模型映射列表按 token 降序排序（两入口同步，commit 7b6816b）。commit b4f0a76 已推送，部署验证通过。
 - **2026-08-19（/v1/models 按 token 降序排序）**：两文件 `/v1/models` 端点改为按 token 上限从大到小排序（`customTokens[cfModel] || DEFAULT_MODEL_TOKENS[cfModel] || 0`），无 token 上限的模型（embedding/image/audio 等）排到最后。排序用临时 `_tokens` 字段，输出前 `.map(({ _tokens, ...rest }) => rest)` 剥离，不污染 OpenAI 格式。两文件同步，`node --check` 通过。
 - **2026-08-19（模型目录核对 + getModelOwnedBy 改造）**：① 对照 CF 官方目录（2026-08-12，84 模型）核对 `DEFAULT_MODEL_MAP`：移除 8 个已弃用/不在目录/过时的模型（llama-3.1-8b、qwen1.5-14b、deepseek-coder-6.7b、codellama-34b、mixtral-8x7b、gemma-2-27b、phi-3-mini、deepseek-r1-distill-qwen-32b），替换为最新版本（llama-3.1-8b-instruct-fast、mistral-small-3.1-24b-instruct），新增 6 个模型（qwq-32b、granite-4.0-h-micro、llama-3.2-1b-instruct、llama-3.2-11b-vision-instruct、qwen3.8-27b、gemma-sea-lion-v4-27b-it）。② 改造 `getModelOwnedBy`：移除 `CF_OWNER_MAP` 前缀表，改为从 `@cf/` 路径自动提取 owner（如 `@cf/meta/xxx` → `meta`），新增模型无需维护前缀表。③ `DEFAULT_MODEL_TOKENS` 补全所有新模型 token 上限。④ AGENTS.md 新增 §6 CF 官方模型目录查询方法。两文件同步，`node --check` + grep 校验通过。
 - **2026-08-19（低风险优化批量落地）**：按用户「性能优先、影响性能的不做」裁决落地 4 项（两入口同步）：① P2-8 `checkUsageLimit` 在 `threshold<=0`（限额关闭，默认）时短路返回，跳过 `getCachedSummary`+`getMonthlyUsage` 两次 KV 读（热路径性能提升）；② P2-6 `handleLandingPage`/`handleAdminPage` HTML 响应补 `X-Content-Type-Options: nosniff`+`X-Frame-Options: DENY`，csrf cookie 补 `Secure`；③ P2-7 `_worker.js` `/api/tokens/today` 注释「公开」→「需管理员认证」；④ P2-4 safeJsonBody 错误文案「Request body too large (max 10MB/32MB)」→「Invalid or missing JSON body」、status 413→400。`node --check` 两文件通过，grep 校验全绿。未做：P1-A（Cloudflare 自带限流，用户裁决跳过）、P1-B 主动刷新/口径统一、P1-C 熔断、P2-1/2/3/5（均影响性能或复杂度高）。
