@@ -138,10 +138,22 @@ cf-ai-gw/
 - [x] **新增 deepseek-v4-pro-0813 / deepseek-v4-flash-0731（1048576 tokens），排在 glm-5.2 前**
 - [x] **修复 Tokens 保存失效（createKVGetter 加 invalidate，所有 save* 调用）**
 - [x] **创建 AGENTS.md（本文件）**
+- [x] **修正 README 第41行「加密存储」→「以明文存储」（删除错误声称）**
+- [x] **移除 safeJsonBody 大小限制（两入口同步，4 处调用点去参）**
+- [x] **P2-8 checkUsageLimit threshold<=0 短路跳过 KV 读（性能提升，两入口）**
+- [x] **P2-6 HTML 响应加 X-Content-Type-Options/X-Frame-Options + csrf cookie 加 Secure（两入口）**
+- [x] **P2-7 /api/tokens/today 注释「公开」→「需管理员认证」（模式 B）**
+- [x] **P2-4 safeJsonBody 错误文案「too large」→「Invalid or missing JSON body」、status 413→400（两入口）**
 
-### 下一步任务
-- [ ] 无明确待办。按用户后续指令推进。
+### 下一步任务（待用户决策，按优先级）
+- [x] **P1-A 补滥用防护**：用户裁决跳过——Cloudflare 平台自带限流
+- [ ] **P1-B 修正限额拦截时效与口径**：模式 B 拦截基于过期 GraphQL 缓存 + Neurons/token 混用，两入口口径不一致（主动刷新影响性能，暂不做）
+- [ ] **P1-C 为模式 B 增加熔断/重试上限**：failover + 可恢复流无熔断，坏请求可放大 8+ 倍上游推理（熔断需状态维护影响性能，暂不做）
+- [ ] P2-1/P2-2/P2-3/P2-5：KV read-modify-write 丢失更新、流式 token 漏记、错误码一律 server_error、会话 token 静态无撤销（均需状态维护或改错误行为，影响性能/复杂度高，暂不做）
 
 ## 5. 变更日志（最新在上）
 
+- **2026-08-19（低风险优化批量落地）**：按用户「性能优先、影响性能的不做」裁决落地 4 项（两入口同步）：① P2-8 `checkUsageLimit` 在 `threshold<=0`（限额关闭，默认）时短路返回，跳过 `getCachedSummary`+`getMonthlyUsage` 两次 KV 读（热路径性能提升）；② P2-6 `handleLandingPage`/`handleAdminPage` HTML 响应补 `X-Content-Type-Options: nosniff`+`X-Frame-Options: DENY`，csrf cookie 补 `Secure`；③ P2-7 `_worker.js` `/api/tokens/today` 注释「公开」→「需管理员认证」；④ P2-4 safeJsonBody 错误文案「Request body too large (max 10MB/32MB)」→「Invalid or missing JSON body」、status 413→400。`node --check` 两文件通过，grep 校验全绿。未做：P1-A（Cloudflare 自带限流，用户裁决跳过）、P1-B 主动刷新/口径统一、P1-C 熔断、P2-1/2/3/5（均影响性能或复杂度高）。
+- **2026-08-19（决策落地 + 补充调研）**：① 按用户裁决落地：README 第41行「加密存储」改为「以明文存储」（删错误声称）；移除 `safeJsonBody` 大小限制（`src/index.js`/`_worker.js` 同步，函数改单参数，4 处显式传参调用点 `safeJsonBody(request,10/32)` 全部去参），`node --check` 通过、`safeJsonBody(request,` 为 0 处。② 用户裁决维持现状：P0-2 无 key 时 checkProxyAuth 开放、P1-4 两入口重复、P1-5 前端内嵌模板。③ 补充调研（只读）新增发现：P1-A 全站无限流/无登录爆破防护；P1-B 模式 B 限额拦截依赖过期 GraphQL 缓存（10min TTL，仅管理员打开用量页才刷新）且 Neurons/token 口径与模式 A（本地 token 统计）不一致；P1-C 模式 B failover+可恢复流无熔断可放大 8+ 倍上游推理、429 也重试。另有 P2-1~P2-8：KV read-modify-write 丢失更新、流式 token 中断漏记、非流式错误一律标 server_error、会话 token=sha256(密码) 静态无撤销、安全响应头缺失+csrf cookie 缺 Secure+第三方 CDN、`/api/tokens/today` 注释「公开」与实现矛盾、热路径固定 2 次 KV 读。CORS/XSS/CSRF/时序安全/日志脱敏已核查无问题。
+- **2026-08-19（全量分析）**：对项目做全量优化点分析（未改代码）。结论：P0-1 账号 API Token / API Key 明文存 KV（README 声称加密但未实现）；P0-2 `checkProxyAuth` 无 key 时完全开放；P0-3 `safeJsonBody` 默认 128MB 且 Content-Length 缺失时绕过大小检查；P1-4 两入口 ~90% 重复代码（~5000 行）；P1-5 前端 ~2000 行内嵌模板字符串；P2 用量写 KV 频繁、KV 双重缓存。优点：timingSafeEqual、密码哈希缓存、错误分类/可恢复流、熔断/failover。
 - **2026-08-19**：新增 `deepseek-v4-pro-0813`（`@cf/deepseek-ai/deepseek-v4-pro-0813`）与 `deepseek-v4-flash-0731`（`@cf/deepseek-ai/deepseek-v4-flash-0731`）两个模型映射，token 上限均 1048576，排在 `DEFAULT_MODEL_MAP` 的 `glm-5.2` 前。修复「自定义模型 Tokens 保存失效」：根因为 `createKVGetter` 60 秒闭包缓存导致保存后 `loadSettings` 重载返回旧值；改造 `createKVGetter` 返回函数挂载 `invalidate()` 方法，在 `saveModelTokens`/`saveCustomModelMap`/`saveUsageLimitsConfig`/`saveApiKeys`/`saveAccounts`（仅模式 B）写 KV 后调用对应 getter 的 `invalidate()`。两文件 `src/index.js` / `_worker.js` 同步。`node --check` 语法 OK，grep 对称性验证通过。创建本 `AGENTS.md`。

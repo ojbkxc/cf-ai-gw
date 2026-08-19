@@ -528,30 +528,27 @@ async function getMonthlyUsage(env) {
 async function checkUsageLimit(env) {
 	const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
 
+	// threshold <= 0 表示关闭限额拦截：短路返回，跳过用量 KV 读取（性能优化）
+	if (threshold <= 0) {
+		return { allowed: true, dailyUsage: 0, dailyLimit, monthlyUsage: 0, monthlyLimit, threshold };
+	}
+
 	// 当日用量从 token 统计 KV 获取
 	const stats = await getTodayTokenStats(env);
 	const dailyUsage = stats.total;
 
 	const monthlyUsage = await getMonthlyUsage(env);
 
-	let result;
-	if (threshold <= 0) {
-		result = { allowed: true, dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold };
-	} else {
-		const dailyExceeded = dailyUsage >= dailyLimit * threshold;
-		const monthlyExceeded = monthlyUsage >= monthlyLimit * threshold;
+	const dailyExceeded = dailyUsage >= dailyLimit * threshold;
+	const monthlyExceeded = monthlyUsage >= monthlyLimit * threshold;
 
-		if (dailyExceeded || monthlyExceeded) {
-			const reason = dailyExceeded
-				? `Daily usage (${dailyUsage}/${dailyLimit}) exceeds ${Math.round(threshold * 100)}% threshold`
-				: `Monthly usage (${monthlyUsage}/${monthlyLimit}) exceeds ${Math.round(threshold * 100)}% threshold`;
-			result = { allowed: false, reason, dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold };
-		} else {
-			result = { allowed: true, dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold };
-		}
+	if (dailyExceeded || monthlyExceeded) {
+		const reason = dailyExceeded
+			? `Daily usage (${dailyUsage}/${dailyLimit}) exceeds ${Math.round(threshold * 100)}% threshold`
+			: `Monthly usage (${monthlyUsage}/${monthlyLimit}) exceeds ${Math.round(threshold * 100)}% threshold`;
+		return { allowed: false, reason, dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold };
 	}
-
-	return result;
+	return { allowed: true, dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold };
 }
 
 // ===== P0: Workers AI 错误码映射 + friendlyError =====
@@ -943,8 +940,8 @@ async function handleV1Proxy(request, env, ctx) {
 
 // ===== handleCompletions =====
 async function handleCompletions(request, env, ctx, pathname) {
-	const body = await safeJsonBody(request, 10);
-	if (!body) return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	const body = await safeJsonBody(request);
+	if (!body) return jsonError("Invalid or missing JSON body", 400, "invalid_request_error");
 
 	const requestStartTime = Date.now();
 
@@ -1278,8 +1275,8 @@ function convertOpenAIToAnthropic(openaiResponse, originalModel) {
 // ===== handleMessages =====
 async function handleMessages(request, env, ctx) {
 	const requestStartTime = Date.now();
-	const anthropicBody = await safeJsonBody(request, 32);
-	if (!anthropicBody) return anthropicError('Request body too large (max 32MB).');
+	const anthropicBody = await safeJsonBody(request);
+	if (!anthropicBody) return anthropicError('Invalid or missing JSON body.');
 
 	if (!anthropicBody.messages || !Array.isArray(anthropicBody.messages)) {
 		return anthropicError('messages field is required and must be an array.');
@@ -1669,7 +1666,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 // ===== handleEmbeddings - 使用 AI Binding =====
 async function handleEmbeddings(request, env, ctx) {
 	const body = await safeJsonBody(request);
-	if (!body) return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	if (!body) return jsonError("Invalid or missing JSON body", 400, "invalid_request_error");
 
 	const requestStartTime = Date.now();
 
@@ -1723,7 +1720,7 @@ async function handleEmbeddings(request, env, ctx) {
 async function handleImageGenerations(request, env, ctx) {
 	const requestStartTime = Date.now();
 	const body = await safeJsonBody(request);
-	if (!body) return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	if (!body) return jsonError("Invalid or missing JSON body", 400, "invalid_request_error");
 
 	const { model, prompt, response_format } = body;
 	if (!prompt) {
@@ -1839,7 +1836,7 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 // ===== handleAudioSpeech - 使用 AI Binding =====
 async function handleAudioSpeech(request, env, ctx) {
 	const body = await safeJsonBody(request);
-	if (!body) return jsonError("Request body too large (max 10MB)", 413, "invalid_request_error");
+	if (!body) return jsonError("Invalid or missing JSON body", 400, "invalid_request_error");
 
 	const requestStartTime = Date.now();
 	const { model, input, voice } = body;
@@ -1884,7 +1881,7 @@ async function handleAudioSpeech(request, env, ctx) {
 // ===== handleCountTokens =====
 async function handleCountTokens(request, env) {
 	const body = await safeJsonBody(request);
-	if (!body) return anthropicError("Request body too large or invalid");
+	if (!body) return anthropicError("Invalid or missing JSON body");
 
 	if (!body.messages || !Array.isArray(body.messages)) {
 		return anthropicError('messages field is required and must be an array.');
@@ -2083,11 +2080,9 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 	}
 }
 
-async function safeJsonBody(request, sizeLimitMB = 128) {
+async function safeJsonBody(request) {
 	const ct = request.headers.get('Content-Type') || '';
 	if (!ct.includes('application/json') && !ct.includes('text/plain')) return null;
-	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
-	if (contentLength > sizeLimitMB * 1024 * 1024) return null;
 	try { return await request.json(); } catch { return null; }
 }
 
@@ -3419,7 +3414,11 @@ async function handleLandingPage(request, env, ctx) {
 </html>`;
 
 	return new Response(html, {
-		headers: { 'Content-Type': 'text/html; charset=utf-8' }
+		headers: {
+			'Content-Type': 'text/html; charset=utf-8',
+			'X-Content-Type-Options': 'nosniff',
+			'X-Frame-Options': 'DENY'
+		}
 	});
 }
 
@@ -3427,7 +3426,7 @@ async function handleLandingPage(request, env, ctx) {
 async function handleAdminPage(request, env, ctx) {
 	// 生成 CSRF Token：同时写入 cookie（JS 可读）和 meta 标签，前端请求时通过 X-CSRF-Token 头回传
 	const csrfToken = await sha256(env.ADMIN_PASSWORD + '_csrf_v1');
-	const csrfCookie = `csrf_token=${csrfToken}; Path=/; SameSite=Strict; Max-Age=86400`;
+	const csrfCookie = `csrf_token=${csrfToken}; Path=/; SameSite=Strict; Secure; Max-Age=86400`;
 
 	const html = `<!DOCTYPE html>
 <head>
@@ -5526,7 +5525,9 @@ async function handleAdminPage(request, env, ctx) {
 	return new Response(html, {
 		headers: {
 			'Content-Type': 'text/html; charset=utf-8',
-			'Set-Cookie': csrfCookie
+			'Set-Cookie': csrfCookie,
+			'X-Content-Type-Options': 'nosniff',
+			'X-Frame-Options': 'DENY'
 		}
 	});
 }
