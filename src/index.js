@@ -113,6 +113,8 @@ const DEFAULT_FALLBACK_MODEL = '@cf/zai-org/glm-4.7-flash';
 // 默认模型映射表
 const DEFAULT_MODEL_MAP = {
 	// 对话 / 文本生成模型
+	'deepseek-v4-pro-0813': '@cf/deepseek-ai/deepseek-v4-pro-0813',
+	'deepseek-v4-flash-0731': '@cf/deepseek-ai/deepseek-v4-flash-0731',
 	'glm-5.2': '@cf/zai-org/glm-5.2',
 	'glm-4.7-flash': '@cf/zai-org/glm-4.7-flash',
 	'kimi-k2.7-code': '@cf/moonshotai/kimi-k2.7-code',
@@ -175,6 +177,8 @@ const DEFAULT_MODEL_TOKENS = {
 	'@cf/google/gemma-4-26b-a4b-it': 131072,
 	'@cf/qwen/qwen3-30b-a3b-fp8': 32768,
 	'@cf/meta/llama-3.3-70b-instruct-fp8-fast': 24000,
+	'@cf/deepseek-ai/deepseek-v4-pro-0813': 1048576,
+	'@cf/deepseek-ai/deepseek-v4-flash-0731': 1048576,
 };
 
 // CF 模型前缀 → owned_by 映射表
@@ -340,7 +344,7 @@ async function sha256(message) {
 function createKVGetter(kvKey, defaultValue) {
 	let _promise = null;
 	let _promiseTime = 0;
-	return async function(env) {
+	const fn = async function(env) {
 		const now = Date.now();
 		if (_promise && (now - _promiseTime) < 60000) return _promise;
 		_promise = (async () => {
@@ -350,6 +354,8 @@ function createKVGetter(kvKey, defaultValue) {
 		_promiseTime = now;
 		try { return await _promise; } finally { /* keep for 60s */ }
 	};
+	fn.invalidate = () => { _promise = null; _promiseTime = 0; };
+	return fn;
 }
 const getApiKeys = createKVGetter('cfg_api_keys', []);
 const getCustomModelMap = createKVGetter('cfg_model_map', {});
@@ -360,18 +366,22 @@ async function saveUsageLimitsConfig(env, limits) {
 	const existing = await getUsageLimitsConfig(env);
 	const merged = { ...existing, ...limits };
 	await env.KV.put('cfg_limits', JSON.stringify(merged));
+	getUsageLimitsConfig.invalidate();
 }
 
 async function saveCustomModelMap(env, map) {
 	await env.KV.put('cfg_model_map', JSON.stringify(map));
+	getCustomModelMap.invalidate();
 }
 
 async function saveModelTokens(env, tokens) {
 	await env.KV.put('cfg_model_tokens', JSON.stringify(tokens));
+	getModelTokens.invalidate();
 }
 
 async function saveApiKeys(env, keys) {
 	await env.KV.put('cfg_api_keys', JSON.stringify(keys));
+	getApiKeys.invalidate();
 }
 
 const COOKIE_TOKEN_RE = /admin_token=([^;]+)/;
