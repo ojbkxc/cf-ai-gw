@@ -1,0 +1,147 @@
+# AGENTS.md — cf-ai-gw 项目代理工作指引
+
+> 本文件供 AI 编码代理（含未来会话）进入项目时**首先自读**，快速对齐项目定位、当前进度、架构契约与下一步任务，然后**继续完善未完成的代码**。
+> 优先级：本文件 > `README.md`。
+
+---
+
+## R0. 强制规则（MANDATORY，不可绕过）
+
+> 本节是*最高优先级的强制约束*，凌驾于一切其他指引之上。违反即视为流程失败。
+
+1. **每次会话必须先自读本文件**：进入项目后，在执行任何写代码/搜索/构建动作之前，必须先 `read` 完整 `AGENTS.md`，对齐「当前进度」「下一步任务」「接口契约」。
+2. **每次会话结束前必须回写本文件**：无论本次完成了几项任务（含 0 项，即仅排查/失败），在结束前**必须**用 `edit`/`write` 更新本文件至少一处：
+   - **必须**更新「§4 变更日志」追加一行（最新在上），记录本次做了什么、改了哪些文件、是否通过验证、下一步建议。
+   - **必须**更新「当前进度」与「下一步任务」的勾选状态以反映真实状态。
+   - 若改动了接口契约或模型映射，*必须*同步更新「§2 硬约束」与「§3 仓库结构」。
+3. **本文件是单一事实源（single source of truth）**：当本文件与代码、与 `README.md`、与口头描述出现矛盾时，**先以代码为准**，然后*立即回写本文件*消除漂移。
+4. **不得删除或弱化本节**：任何对「§R0 强制规则」的删减、降级、加「视情况而定」修饰，都需用户明确同意；代理自身不得自行放宽。
+5. **回写是义务而非可选**：即使用户未要求「更新 AGENTS.md」，每次会话结束前也必须执行回写；用户明确说「不用更新」时才可跳过，并在变更日志注明「依用户要求跳过本次回写」。
+6. **两入口必须同步**（MANDATORY）：项目有**两个独立入口**——`src/index.js`（模式 A：AI Binding，单账号）与 `_worker.js`（模式 B：REST API，多账号 failover）。两者各自维护一份 `DEFAULT_MODEL_MAP` / `DEFAULT_MODEL_TOKENS` / `createKVGetter` / `save*`。**任何对默认模型映射、token 上限、KV 缓存逻辑、配置键的改动，必须在两个文件同步修改**，否则切换 `wrangler.toml` 的 `main` 字段时行为不一致。改完必须用 grep 校验两文件对应符号出现次数一致。
+7. **KV 缓存写后必须失效**（MANDATORY）：所有配置读取走 `createKVGetter`（60 秒闭包缓存 `_promise`）。**任何 `save*` 函数在 `env.KV.put()` 之后，必须调用对应 getter 的 `.invalidate()`**，否则保存后立即读取（如管理面板保存后 `loadSettings` 重载）会命中缓存返回旧值，表现为「保存失效」。新增配置键时，同时新增 getter 与对应 save 的 invalidate 调用。
+8. **部署验证必须通过 push 到 GitHub 触发 Cloudflare 自动部署**（MANDATORY）：本地无 Cloudflare 运行时，**无法**直接运行 Worker。任何代码改动后的验证必须通过 `git commit && git push` 提交到 `origin`（`https://github.com/ojbkxc/cf-ai-gw.git`，分支 `main`），由 Cloudflare Pages/Workers 的 Git 集成自动部署。**禁止**在未 push 且部署成功前声称某子任务「完成/已验证」。AGENTS.md 等纯文档改动不触发 Worker 部署，但仍随 push 同步到仓库。
+9. **通过部署后端点验证迭代修复**（MANDATORY）：push 后若 Cloudflare 部署失败或运行时报错，*必须*读取部署日志/错误，本地修复后*再次 commit & push*，循环直到部署成功且端点可用。*不得*跳过部署失败直接推进下一子任务。验证端点：`GET /v1/models`（模型列表）、`GET /admin`（管理面板）、`GET /api/settings`（配置）。
+10. **自动推进项目（auto-continue，默认行为）**（MANDATORY）：用户说「自动继续」「继续」「auto」或未明确叫停时，代理*必须自主连续推进*项目任务，不得每完成一小步就停下来询问下一步。具体要求：
+    - 进入项目后按 §0 流程**自主**挑选下一个最高优先级的最小可独立交付子任务并开工。
+    - 单个子任务完成后**立即**开始下一个，无需请求许可；仅在遇到「方向性分歧」「破坏性操作」「违反硬约束」「信息严重不足且无法合理推断」时才用 `question` 工具询问用户。
+    - 推进过程中*主动*跑 §R2.3 部署验证闭环、§R0 回写，不要等用户提醒。
+    - 停下汇报时应附「已完成的 / 正在做的 / 下一步打算做的」三段式摘要。
+
+---
+
+## R2. Cloudflare 部署验证策略（MANDATORY，配合 §R0.8–R0.9）
+
+> 本节落实 §R0.8/R0.9 的「push 到 GitHub 触发 Cloudflare 自动部署 + 据报错修复」闭环。本地无 Cloudflare 运行时，push → 部署 → 端点验证是*唯一*验证通道。
+
+### R2.1 部署触发条件
+- **push 到 `origin/main`**：Cloudflare Workers 的 Git 集成监听 `main` 分支，push 后自动构建并部署 `wrangler.toml` 中 `main` 字段指定的入口文件。
+- 当前 `main = "_worker.js"`（模式 B）。切换模式只需改 `wrangler.toml` 的 `main` 字段并 push。
+- 无独立 CI workflow：Cloudflare 直接部署 JS 源码，无构建步骤（无 npm install / bundle）。
+
+### R2.2 部署后必须验证的端点（全绿才算通过）
+```
+Worker 部署成功后，用 curl 或浏览器验证：
+1. GET https://cf-ai-gw.<subdomain>.workers.dev/v1/models
+   → 返回 JSON，data 数组含 DEFAULT_MODEL_MAP 的所有模型 id（如 deepseek-v4-pro-0813、glm-5.2）
+2. GET /admin → 返回管理面板 HTML（登录页）
+3. 登录后 GET /api/settings → 返回 { customModelMap, modelTokens }
+4. POST /v1/chat/completions（带 API Key，model 用新映射）→ 返回 OpenAI 兼容响应
+```
+部署后若端点 500/超时/返回空，按 §R2.3 修复。
+
+### R2.3 据报错修复的迭代流程（每次 push 后必走）
+1. `git push origin main`。
+2. 在 Cloudflare Dashboard → Workers & Pages → cf-ai-gw → Deployments 查看部署状态；或用 `wrangler tail` 看实时日志。
+3. 若部署失败或运行时报错：读日志定位首个 `Error` / `TypeError` / `SyntaxError` 行。
+4. 本地按报错修代码（常见：两入口不同步、缓存未 invalidate、模型映射 key 写错、ES Module 语法）。*不*绕过。
+5. 本地先跑 §R2.4 静态检查，再 `git commit && git push`，回到步骤 2，直到部署成功且端点可用。
+6. 部署成功且端点验证通过后才能在 §4 勾选该子任务「完成」并注明「部署验证通过」。
+
+### R2.4 本地可做的静态检查（push 前自检，减少部署往返）
+- **`node --check` 语法检查**：两文件是 ES Module（`export default`），需用 `.mjs` 扩展名检查：
+  ```powershell
+  Copy-Item src/index.js $env:TEMP\check_a.mjs -Force
+  Copy-Item _worker.js $env:TEMP\check_b.mjs -Force
+  node --check $env:TEMP\check_a.mjs
+  node --check $env:TEMP\check_b.mjs
+  ```
+- **两入口对称性检查**：用 grep 确认 `DEFAULT_MODEL_MAP` / `DEFAULT_MODEL_TOKENS` / `createKVGetter` / `save*` / `.invalidate()` 在两文件中对应符号出现次数一致（模式 A 无 `saveAccounts`/`getAccounts`，其余应对称）。
+- **缓存 invalidate 覆盖检查**：每个 `createKVGetter(...)` 创建的 getter，其对应 `save*` 函数末尾必须有 `.invalidate()` 调用。
+- **无绕过 getter 的直接 KV 读取**：`grep "KV.get('cfg_"` 应为 0（所有配置读取走 `createKVGetter`）。
+- **`git status` 确认无残留未 commit 修改**：会话开始前与 commit 前各执行一次。
+- 人工 review：模型映射 key 是否以 `@cf/` 开头、token 上限是否正整数、`CF_OWNER_MAP` 前缀是否覆盖新模型。
+
+### R2.5 wrangler.toml 维护
+- **不要**在 `wrangler.toml` 里加 KV/AI Binding/环境变量配置——这些在 Cloudflare Dashboard 中配置，推代码不会覆盖。
+- 切换部署模式：改 `main` 字段为 `"src/index.js"`（模式 A）或 `"_worker.js"`（模式 B）后 push。
+- 新增环境变量（如限额阈值）在 Dashboard Settings → Variables & Secrets 配置，代码里通过 `env.XXX` 读取。
+
+---
+
+## 0. 进入项目后的标准流程（必读）
+
+1. **通读本文件**（尤其是「§R0 强制规则」「当前进度」「下一步任务」三节）。
+1b. **`git status` 检查残留修改**：若工作目录有未 commit 的修改，先理解其内容并 commit，再开始新工作。*不要* `git stash` 或 `git checkout -- .` 丢弃前次修改——先搞清楚是什么。
+2. 按「下一步任务」的优先级顺序挑选一个*最小可独立交付*的子任务开工。
+3. 开工前用 `read`/`grep`/`glob` 阅读相关已有代码，*复用既有函数与命名*，不要另起炉灶。改默认模型/映射/tokens/缓存逻辑时，**先读 `src/index.js` 与 `_worker.js` 对应区段确认两文件当前是否一致**。
+4. 每完成一个子任务：执行 §R2.4 静态检查清单，然后 `git add -A && git status` 确认所有修改已 staged，`git commit && git push` 触发 Cloudflare 部署验证。
+5. **回写本文件**（强制，见 §R0）：更新「当前进度」「下一步任务」勾选状态，并在「变更日志」追加一行。
+6. **不要**主动 `git commit`，除非用户明确要求或子任务已通过 §R2.4 静态检查准备部署。*不要*写未经请求的 README/文档。*不要*加注释除非用户要求。
+7. **会话结束前再次确认 §R0 的回写已执行**；若未执行，补做后再结束。
+
+---
+
+## 1. 项目定位（一句话）
+
+cf-ai-gw 是 **Cloudflare Workers AI → OpenAI/Anthropic 兼容 API 网关**（Cloudflare Worker，纯 JS/ES Module），自带 `/admin` 管理面板，支持多账号负载均衡与故障自动切换，把 `@cf/` 系列模型暴露为 OpenAI 兼容的 `/v1/chat/completions` 等端点。
+
+## 2. 硬约束（任何改动都不得违反）
+
+| 维度 | 约束 | 验证方式 |
+|---|---|---|
+| 远程仓库 | `https://github.com/ojbkxc/cf-ai-gw.git`，分支 `main` | `git remote -v` |
+| 部署机制 | push `main` → Cloudflare 自动部署，无独立 CI | Cloudflare Dashboard Deployments |
+| 入口文件 | `src/index.js`（模式 A）/ `_worker.js`（模式 B），`wrangler.toml` `main` 切换 | `wrangler.toml` |
+| 模块格式 | ES Module（`export default`） | `node --check *.mjs` |
+| 运行时 | Cloudflare Workers，`compatibility_date = "2025-08-01"` | `wrangler.toml` |
+| KV 绑定 | Variable name = `KV`（Dashboard 配置，不在 wrangler.toml） | Dashboard Bindings |
+| 必填环境变量 | `ADMIN_PASSWORD`（Dashboard） | Dashboard Variables & Secrets |
+| 配置 KV 键 | `cfg_model_map` / `cfg_model_tokens` / `cfg_api_keys` / `cfg_limits` / `cfg_accounts` | `createKVGetter` 调用 |
+| 缓存 | `createKVGetter` 60s 闭包缓存，`save*` 必须 `.invalidate()`（§R0.7） | grep `.invalidate()` |
+| 模型映射 | `DEFAULT_MODEL_MAP` + `DEFAULT_MODEL_TOKENS`，**两文件同步**（§R0.6） | grep 对称性 |
+| 模型 owned_by | `@cf/` 前缀 → `CF_OWNER_MAP` 映射 | `CF_OWNER_MAP` |
+| 无构建步骤 | push 即部署，无 npm install/bundle | — |
+
+新增 `@cf/` 模型时：在两文件 `DEFAULT_MODEL_MAP` 加映射、`DEFAULT_MODEL_TOKENS` 加上限（如有），确认 `CF_OWNER_MAP` 已覆盖其前缀。
+
+## 3. 仓库结构
+
+```
+cf-ai-gw/
+├── AGENTS.md          # 本文件（代理工作指引）
+├── README.md          # 项目说明（部署/模式/端点/环境变量）
+├── wrangler.toml      # Cloudflare Worker 部署配置（name/main/compatibility_date；KV/AI/变量在 Dashboard）
+├── src/
+│   └── index.js       # 模式 A 入口（AI Binding，单账号，env.AI.run()）
+└── _worker.js         # 模式 B 入口（REST API，多账号 failover，fetch() 公网）
+```
+
+两入口各自完整包含：`DEFAULT_MODEL_MAP`、`DEFAULT_MODEL_TOKENS`、`CF_OWNER_MAP`、`createKVGetter`、`resolveModelName`、`/api/settings` 端点、`/admin` 管理面板 HTML+JS。**改任何共享逻辑必须两文件同步**。
+
+## 4. 当前进度与下一步任务
+
+### 当前进度
+- [x] 内置默认模型映射（glm/kimi/deepseek/llama/qwen 等）
+- [x] 管理面板（账号/API Key/模型映射/Tokens/限额）
+- [x] 多账号 failover（模式 B）
+- [x] KV 配置缓存（createKVGetter）
+- [x] **新增 deepseek-v4-pro-0813 / deepseek-v4-flash-0731（1048576 tokens），排在 glm-5.2 前**
+- [x] **修复 Tokens 保存失效（createKVGetter 加 invalidate，所有 save* 调用）**
+- [x] **创建 AGENTS.md（本文件）**
+
+### 下一步任务
+- [ ] 无明确待办。按用户后续指令推进。
+
+## 5. 变更日志（最新在上）
+
+- **2026-08-19**：新增 `deepseek-v4-pro-0813`（`@cf/deepseek-ai/deepseek-v4-pro-0813`）与 `deepseek-v4-flash-0731`（`@cf/deepseek-ai/deepseek-v4-flash-0731`）两个模型映射，token 上限均 1048576，排在 `DEFAULT_MODEL_MAP` 的 `glm-5.2` 前。修复「自定义模型 Tokens 保存失效」：根因为 `createKVGetter` 60 秒闭包缓存导致保存后 `loadSettings` 重载返回旧值；改造 `createKVGetter` 返回函数挂载 `invalidate()` 方法，在 `saveModelTokens`/`saveCustomModelMap`/`saveUsageLimitsConfig`/`saveApiKeys`/`saveAccounts`（仅模式 B）写 KV 后调用对应 getter 的 `invalidate()`。两文件 `src/index.js` / `_worker.js` 同步。`node --check` 语法 OK，grep 对称性验证通过。创建本 `AGENTS.md`。
