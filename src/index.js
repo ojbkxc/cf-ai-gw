@@ -5257,6 +5257,11 @@ async function handleAdminPage(request, env, ctx) {
 				customMappings = data.customModelMap || {};
 				modelTokensConfig = data.modelTokens || {};
 				const items = Object.keys(customMappings).map(source => ({ source, target: customMappings[source] }));
+				items.sort((a, b) => {
+					const ta = modelTokensConfig[a.target] !== undefined ? modelTokensConfig[a.target] : (defaultTokens[a.target] || 0);
+					const tb = modelTokensConfig[b.target] !== undefined ? modelTokensConfig[b.target] : (defaultTokens[b.target] || 0);
+					return tb - ta;
+				});
 				const tbody = document.getElementById('mappings-table-body');
 				tbody.innerHTML = '';
 				if (items.length === 0) {
