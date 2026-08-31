@@ -745,6 +745,36 @@ function shouldRejectOversize(options, env) {
 
 // ===== Workers AI Binding 调用函数 =====
 
+// 归一化 AI Binding 非流式响应为 OpenAI 兼容格式
+// Binding env.AI.run(model, {messages}) 可能返回原生格式 {response, usage, tool_calls}
+// 或 OpenAI 格式 {choices}（取决于模型/版本），统一确保为 OpenAI 格式
+function normalizeBindingResult(result, cfModel) {
+	// 已是 OpenAI 格式（有 choices 数组）→ 直接返回
+	if (result && typeof result === 'object' && Array.isArray(result.choices)) {
+		return result;
+	}
+	// 原生格式 { response: string, usage, tool_calls } → 构造 OpenAI 格式
+	if (result && typeof result === 'object' && typeof result.response === 'string') {
+		const hasToolCalls = Array.isArray(result.tool_calls) && result.tool_calls.length > 0;
+		const message = { role: 'assistant', content: result.response };
+		if (hasToolCalls) message.tool_calls = result.tool_calls;
+		return {
+			id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '')}`,
+			object: 'chat.completion',
+			created: Math.floor(Date.now() / 1000),
+			model: cfModel,
+			choices: [{
+				index: 0,
+				message,
+				finish_reason: hasToolCalls ? 'tool_calls' : 'stop'
+			}],
+			usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+		};
+	}
+	// 兜底：原样返回（可能是字符串或其他未知格式）
+	return result;
+}
+
 async function callBindingChat(cfModel, cfPayload, env, stream) {
 	// 熔断器开闸 → 快速失败
 	if (cbOpen()) {
@@ -774,10 +804,10 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 			noteModelOk(cfModel);
 			return { success: true, status: resp.status, stream: resp.body };
 		}
-		const result = await env.AI.run(cfModel, cfPayload, { signal: AbortSignal.timeout(120000) });
-		cbOnSuccess(env);
-		noteModelOk(cfModel);
-		return { success: true, status: 200, data: result };
+	const result = await env.AI.run(cfModel, cfPayload, { signal: AbortSignal.timeout(120000) });
+	cbOnSuccess(env);
+	noteModelOk(cfModel);
+	return { success: true, status: 200, data: normalizeBindingResult(result, cfModel) };
 	} catch (e) {
 		cbOnCapacityFail(env);
 		noteModelFail(cfModel, e);
@@ -4441,6 +4471,27 @@ async function handleAdminPage(request, env, ctx) {
 				<div class="modal-footer" style="margin-top: 10px; width: 100%;">
 					<button class="btn btn-secondary" onclick="closeKeyModal()" style="width: 100%;">我已保存，关闭</button>
 				</div>
+			</div>
+		</div>
+	</div>
+
+	<!-- Modal: Select Free Model -->
+	<div class="modal-overlay" id="model-select-modal">
+		<div class="modal-card">
+			<div class="modal-header">
+				<h3>选择 @cf/ 免费模型</h3>
+				<button onclick="document.getElementById('model-select-modal').classList.remove('active')" class="close-btn">${SVG_CLOSE}</button>
+			</div>
+			<div style="margin-bottom: 12px; font-size: 13px; color: var(--text-muted);">点击模型自动新增映射：左侧为简称，右侧为完整路径</div>
+			<div style="margin-bottom: 10px;">
+				<input type="text" id="model-search-input" placeholder="搜索模型..." oninput="filterModelList()"
+					   style="width: 100%; padding: 8px 12px; border: 1px solid var(--border-color); border-radius: 6px; font-size: 13px; box-sizing: border-box;">
+			</div>
+			<div id="model-select-list" style="flex: 1; min-height: 0; max-height: 55vh; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px;">
+				<div style="text-align: center; padding: 30px; color: var(--text-muted);">加载中...</div>
+			</div>
+			<div class="modal-footer">
+				<button class="btn btn-secondary" onclick="document.getElementById('model-select-modal').classList.remove('active')">关闭</button>
 			</div>
 		</div>
 	</div>
