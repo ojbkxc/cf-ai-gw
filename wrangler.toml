@@ -7,7 +7,7 @@
 #
 # 默认采用模式 A（Worker + AI Binding，单账号首选）。
 
-name = "cf-ai-gw"
+name = "Binding"
 main = "src/index.js"
 compatibility_date = "2025-08-01"
 
