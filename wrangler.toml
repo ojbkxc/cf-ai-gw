@@ -10,11 +10,12 @@
 name = "api"
 main = "src/index.js"
 compatibility_date = "2025-08-01"
+account_id = "cc4b64888d2bb80770ff42b0e3c1fad2"
 
 # KV 绑定：存储配置、API Key、用量统计等
 [[kv_namespaces]]
 binding = "KV"
-id = "f2d6dfb3f9034d4b86c46740f813c634"
+id = "2dee8032afd64456b28821f41b5aff44"
 
 # Workers AI 绑定（模式 A：单账号，内部 RPC 调用）
 [ai]

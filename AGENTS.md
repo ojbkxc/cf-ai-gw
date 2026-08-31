@@ -19,7 +19,7 @@
 5. **回写是义务而非可选**：即使用户未要求「更新 AGENTS.md」，每次会话结束前也必须执行回写；用户明确说「不用更新」时才可跳过，并在变更日志注明「依用户要求跳过本次回写」。
 6. **两入口必须同步**（MANDATORY）：项目有**两个独立入口**——`src/index.js`（模式 A：AI Binding，单账号）与 `_worker.js`（模式 B：REST API，多账号 failover）。两者各自维护一份 `DEFAULT_MODEL_MAP` / `DEFAULT_MODEL_TOKENS` / `createKVGetter` / `save*`。**任何对默认模型映射、token 上限、KV 缓存逻辑、配置键的改动，必须在两个文件同步修改**，否则切换 `wrangler.toml` 的 `main` 字段时行为不一致。改完必须用 grep 校验两文件对应符号出现次数一致。
 7. **KV 缓存写后必须失效**（MANDATORY）：所有配置读取走 `createKVGetter`（60 秒闭包缓存 `_promise`）。**任何 `save*` 函数在 `env.KV.put()` 之后，必须调用对应 getter 的 `.invalidate()`**，否则保存后立即读取（如管理面板保存后 `loadSettings` 重载）会命中缓存返回旧值，表现为「保存失效」。新增配置键时，同时新增 getter 与对应 save 的 invalidate 调用。
-8. **部署验证必须通过 push 到 GitHub 触发 Cloudflare 自动部署**（MANDATORY）：本地无 Cloudflare 运行时，**无法**直接运行 Worker。任何代码改动后的验证必须通过 `git commit && git push` 提交到 `origin`（`https://github.com/ojbkxc/cf-ai-gw.git`，分支 `main`），由 Cloudflare Pages/Workers 的 Git 集成自动部署。**禁止**在未 push 且部署成功前声称某子任务「完成/已验证」。AGENTS.md 等纯文档改动不触发 Worker 部署，但仍随 push 同步到仓库。
+8. **部署验证必须通过 `wrangler deploy` 直连 Cloudflare 账户**（MANDATORY，2026-08-31 起生效）：当前部署通道为 `npx wrangler deploy` 直连账户 `cc4b64888d2bb80770ff42b0e3c1fad2`（ojbkxc），API Token 经环境变量 `CLOUDFLARE_API_TOKEN` 传入，**禁止**把 Token 写入任何文件/日志/commit。`git push` 仅用于同步代码到 GitHub（`https://github.com/ojbkxc/cf-ai-gw.git`，分支 `main`），**不再**触发 Worker 部署。**禁止**在未 `wrangler deploy` 成功且端点验证通过前声称某子任务「完成/已验证」。AGENTS.md 等纯文档改动不必部署 Worker。
 9. **通过部署后端点验证迭代修复**（MANDATORY）：push 后若 Cloudflare 部署失败或运行时报错，*必须*读取部署日志/错误，本地修复后*再次 commit & push*，循环直到部署成功且端点可用。*不得*跳过部署失败直接推进下一子任务。验证端点：`GET /v1/models`（模型列表）、`GET /admin`（管理面板）、`GET /api/settings`（配置）。
 10. **自动推进项目（auto-continue，默认行为）**（MANDATORY）：用户说「自动继续」「继续」「auto」或未明确叫停时，代理*必须自主连续推进*项目任务，不得每完成一小步就停下来询问下一步。具体要求：
     - 进入项目后按 §0 流程**自主**挑选下一个最高优先级的最小可独立交付子任务并开工。
@@ -34,14 +34,15 @@
 > 本节落实 §R0.8/R0.9 的「push 到 GitHub 触发 Cloudflare 自动部署 + 据报错修复」闭环。本地无 Cloudflare 运行时，push → 部署 → 端点验证是*唯一*验证通道。
 
 ### R2.1 部署触发条件
-- **push 到 `origin/main`**：Cloudflare Workers 的 Git 集成监听 `main` 分支，push 后自动构建并部署 `wrangler.toml` 中 `main` 字段指定的入口文件。
-- 当前 `main = "_worker.js"`（模式 B）。切换模式只需改 `wrangler.toml` 的 `main` 字段并 push。
-- 无独立 CI workflow：Cloudflare 直接部署 JS 源码，无构建步骤（无 npm install / bundle）。
+- **`npx wrangler deploy`**（项目根目录执行，需 `CLOUDFLARE_API_TOKEN` 环境变量）：部署 `wrangler.toml` 中 `main` 字段指定的入口文件到账户 `cc4b64888d2bb80770ff42b0e3c1fad2`。
+- 当前 `main = "src/index.js"`（模式 A）。切换模式只需改 `wrangler.toml` 的 `main` 字段再 deploy。
+- 无构建步骤：Cloudflare 直接部署 JS 源码，无 npm install / bundle。
+- Worker 名 `api`，线上地址 `https://api.lxseek.workers.dev`。
 
 ### R2.2 部署后必须验证的端点（全绿才算通过）
 ```
 Worker 部署成功后，用 curl 或浏览器验证：
-1. GET https://cf-ai-gw.<subdomain>.workers.dev/v1/models
+1. GET https://api.lxseek.workers.dev/v1/models
    → 返回 JSON，data 数组含 DEFAULT_MODEL_MAP 的所有模型 id（如 deepseek-v4-pro-0813、glm-5.2）
 2. GET /admin → 返回管理面板 HTML（登录页）
 3. 登录后 GET /api/settings → 返回 { customModelMap, modelTokens }
@@ -49,15 +50,15 @@ Worker 部署成功后，用 curl 或浏览器验证：
 ```
 部署后若端点 500/超时/返回空，按 §R2.3 修复。
 
-### R2.3 据报错修复的迭代流程（每次 push 后必走）
-1. `git push origin main`。
-2. 在 Cloudflare Dashboard → Workers & Pages → cf-ai-gw → Deployments 查看部署状态；或用 `wrangler tail` 看实时日志。
+### R2.3 据报错修复的迭代流程（每次 deploy 后必走）
+1. `npx wrangler deploy`（读输出中的错误信息）。
+2. 用 `npx wrangler tail` 看实时日志；或在 Dashboard → Workers & Pages → api → Deployments 查看部署状态。
 3. 若部署失败或运行时报错：读日志定位首个 `Error` / `TypeError` / `SyntaxError` 行。
 4. 本地按报错修代码（常见：两入口不同步、缓存未 invalidate、模型映射 key 写错、ES Module 语法）。*不*绕过。
-5. 本地先跑 §R2.4 静态检查，再 `git commit && git push`，回到步骤 2，直到部署成功且端点可用。
+5. 本地先跑 §R2.4 静态检查，再 `git commit` + 重新 `npx wrangler deploy`，回到步骤 2，直到部署成功且端点可用。
 6. 部署成功且端点验证通过后才能在 §4 勾选该子任务「完成」并注明「部署验证通过」。
 
-### R2.4 本地可做的静态检查（push 前自检，减少部署往返）
+### R2.4 本地可做的静态检查（deploy 前自检，减少部署往返）
 - **`node --check` 语法检查**：两文件是 ES Module（`export default`），需用 `.mjs` 扩展名检查：
   ```powershell
   Copy-Item src/index.js $env:TEMP\check_a.mjs -Force
@@ -71,10 +72,11 @@ Worker 部署成功后，用 curl 或浏览器验证：
 - **`git status` 确认无残留未 commit 修改**：会话开始前与 commit 前各执行一次。
 - 人工 review：模型映射 key 是否以 `@cf/` 开头、token 上限是否正整数。
 
-### R2.5 wrangler.toml 维护
-- **不要**在 `wrangler.toml` 里加 KV/AI Binding/环境变量配置——这些在 Cloudflare Dashboard 中配置，推代码不会覆盖。
-- 切换部署模式：改 `main` 字段为 `"src/index.js"`（模式 A）或 `"_worker.js"`（模式 B）后 push。
-- 新增环境变量（如限额阈值）在 Dashboard Settings → Variables & Secrets 配置，代码里通过 `env.XXX` 读取。
+### R2.5 wrangler.toml / secrets 维护
+- KV/AI Binding 写在 `wrangler.toml`（直连部署的绑定来源）：当前 KV id `2dee8032afd64456b28821f41b5aff44`（binding `KV`）、`[ai] binding = "AI"`、`account_id = "cc4b64888d2bb80770ff42b0e3c1fad2"`。
+- 切换部署模式：改 `main` 字段为 `"src/index.js"`（模式 A）或 `"_worker.js"`（模式 B）后 `npx wrangler deploy`。
+- 环境变量/Secret 用 `npx wrangler secret put <NAME>` 管理（当前已设 `ADMIN_PASSWORD`，值仅告知用户不落盘）；普通变量（如限额阈值）可在 `wrangler.toml` 加 `[vars]`，代码里通过 `env.XXX` 读取。
+- **API Token 只经环境变量 `CLOUDFLARE_API_TOKEN` 传入，严禁写入任何文件。**
 
 ---
 
@@ -100,12 +102,12 @@ cf-ai-gw 是 **Cloudflare Workers AI → OpenAI/Anthropic 兼容 API 网关**（
 | 维度 | 约束 | 验证方式 |
 |---|---|---|
 | 远程仓库 | `https://github.com/ojbkxc/cf-ai-gw.git`，分支 `main` | `git remote -v` |
-| 部署机制 | push `main` → Cloudflare 自动部署，无独立 CI | Cloudflare Dashboard Deployments |
+| 部署机制 | `npx wrangler deploy` 直连账户 `cc4b64888d2bb80770ff42b0e3c1fad2`；push GitHub 仅同步代码不触发部署 | deploy 输出 + 端点验证 |
 | 入口文件 | `src/index.js`（模式 A）/ `_worker.js`（模式 B），`wrangler.toml` `main` 切换 | `wrangler.toml` |
 | 模块格式 | ES Module（`export default`） | `node --check *.mjs` |
 | 运行时 | Cloudflare Workers，`compatibility_date = "2025-08-01"` | `wrangler.toml` |
-| KV 绑定 | Variable name = `KV`（Dashboard 配置，不在 wrangler.toml） | Dashboard Bindings |
-| 必填环境变量 | `ADMIN_PASSWORD`（Dashboard） | Dashboard Variables & Secrets |
+| KV 绑定 | `wrangler.toml` 管理：binding = `KV`，id = `2dee8032afd64456b28821f41b5aff44` | `wrangler.toml` |
+| 必填环境变量 | `ADMIN_PASSWORD`（`wrangler secret put` 管理，已设，勿随意重置） | `npx wrangler secret list` |
 | 配置 KV 键 | `cfg_model_map` / `cfg_model_tokens` / `cfg_api_keys` / `cfg_limits` / `cfg_accounts` | `createKVGetter` 调用 |
 | 缓存 | `createKVGetter` 60s 闭包缓存，`save*` 必须 `.invalidate()`（§R0.7） | grep `.invalidate()` |
 | 模型映射 | `DEFAULT_MODEL_MAP` + `DEFAULT_MODEL_TOKENS`，**两文件同步**（§R0.6） | grep 对称性 |
@@ -154,6 +156,7 @@ cf-ai-gw/
 - [x] **修复模式A Binding响应格式归一化（env.AI.run原生格式→OpenAI格式）**
 - [x] **修复模式A流式Binding格式归一化（passthroughStream/anthropicStreamTransform的processLines）**
 - [x] **修复全量安全评估12条缺陷（P2×3+P3×9，清单见 final-security-assessment-20260831-201409.md）；后按用户裁决回退其中6条低收益/影响功能的修复（P2-2/P2-3/P3-2/P3-3/P3-7/P3-9），实际保留6条（P2-1/P3-1/P3-4/P3-5/P3-6/P3-8）**
+- [x] **部署模式 A 到新账户 cc4b64888d2bb80770ff42b0e3c1fad2（wrangler deploy，Worker 名 api → https://api.lxseek.workers.dev）；新建 KV namespace + ADMIN_PASSWORD secret；端到端验证通过（/v1/models、/admin、管理员登录、非流式 glm-5.2 + llama 双模型、流式 SSE 归一化）**
 
 ### 下一步任务（待用户决策，按优先级）
 - [x] **P1-A 补滥用防护**：用户裁决跳过——Cloudflare 平台自带限流
@@ -163,6 +166,7 @@ cf-ai-gw/
 
 ## 5. 变更日志（最新在上）
 
+- **2026-08-31（模式 A 部署到新 Cloudflare 账户 + 端到端验证）**：按用户指令将项目部署到用户提供的新账户（API Token 仅经 `CLOUDFLARE_API_TOKEN` 环境变量传入，未落盘不入库）。① `wrangler whoami` 验证 Token 有效（账户 ojbkxc / cc4b64888d2bb80770ff42b0e3c1fad2，wrangler 4.86.0）；② 新账户创建 KV namespace（binding `KV`，id `2dee8032afd64456b28821f41b5aff44`，替换旧账户 id f2d6dfb3...）；③ `wrangler.toml` 更新：新增 `account_id` + 替换 KV id（改动文件：仅 wrangler.toml）；④ `npx wrangler deploy` 成功：Worker 名 `api` → **https://api.lxseek.workers.dev**（版本 d1f07e40，212KB/46.6KB gzip，绑定 KV + AI）；⑤ `wrangler secret put ADMIN_PASSWORD`——首次因 PowerShell 5.1 无 `RandomNumberGenerator::Fill` 静态方法误设全 a 弱密码，已立即改用 `Create().GetBytes()` 生成 24 位强随机密码覆盖（教训：PS5.1 加密随机用 `[RNG]::Create()` + `GetBytes()`）；⑥ 端到端验证全绿：GET /v1/models=200 模型列表、GET /admin=200（30604B HTML）、POST /api/auth/login={"success":true}、非流式 POST /v1/chat/completions：glm-5.2（推理模型，reasoning_content 正常流出，normalizeBindingResult 归一化生效）+ llama-3.1-8b-instruct-fast（content="Hello how are you."，finish=stop）、流式 stream=true：SSE 200（text/event-stream，`: ping` 心跳 + OpenAI chunk 格式，流式归一化生效）。注：PS5.1 向 curl.exe 传 JSON 会剥双引号导致流式测试假失败，须用 Invoke-WebRequest 原生测。⑦ 部署通道由「push GitHub 触发 Git 集成」切换为「wrangler deploy 直连」，§R0.8/§R2/§2 已同步更新消除漂移。下一步建议：用户登录 /admin 配置 API Key 与模型映射；因 Token 在对话中明文出现过，建议在 Dashboard 轮换该 API Token。
 - **2026-08-31（回退6条低收益/影响功能的修复）**：按用户裁决回退 commit a49c838 中的 6 条修复，恢复原状。改动文件：`src/index.js` + `_worker.js`。回退清单：① **P2-2**（流式尾块 `{usage}` 处理）：删除两个 processLines 的 `else if (!chunk.choices && chunk.usage !== undefined)` 分支——CF 流式可能不发此格式尾块，属防御性代码，每 chunk 多一次条件判断，实际触发概率低（ensureFinishReason 已兜底补齐 finish_reason）。② **P2-3**（非流式兜底构造 OpenAI 格式）：normalizeBindingResult 兜底恢复 `return result;` 原样返回——CF 当前模型都返回标准格式，兜底路径可能永不触发。③ **P3-9**（`typeof chunk.response === 'string'` 检查）：恢复直接 `chunk.response`——CF 流式 response 总是字符串，非字符串分支永不触发。④ **P3-2**（CSRF `timingSafeEqual` 替代 `!==`）：恢复 `csrfCookie !== csrfHeader`——64 字符 sha256 的时序攻击在网络抖动下不可利用，实际安全收益≈0。⑤ **P3-3**（CSRF cookie 加 HttpOnly）：去掉 `HttpOnly;`——csrf token 也在 `<meta>` 标签（JS 可读），HttpOnly 只防 cookie 被 JS 读，XSS 可从 meta 读 token 绕过，实际增益≈0。⑥ **P3-7**（API key 掩码）：GET /api/keys 恢复明文返回——前端"复制"按钮需要完整 key，掩码导致功能退化；API key 是管理员自己的密钥，明文回传给已认证管理员是常见做法（如 OpenAI Dashboard）。保留未动的 6 条：P2-1（音频 Uint8Array + 流式大小检查，性能优化）、P3-1（accountId encodeURIComponent ×4）、P3-4（图片尺寸 clamp [64,2048] ×4）、P3-5（/api/accounts/test 真实 AI 推理测试）、P3-6（前端 isBindingMode 只读提示）、P3-8（无需修改）。验证：`node --check` 两文件通过；grep 确认回退项归零（timingSafeEqual(csrfCookie / maskTokenKey(k.key) / csrf HttpOnly / typeof chunk.response / chunk.usage !== undefined / fallbackContent 全部=0）、保留项存在（encodeURIComponent=4 / clamp=4 / isBindingMode=2 / audioUint8=4 / embeddinggemma 测试保留）。下一步建议：用户 push 部署验证。
 - **2026-08-31（修复全量安全评估12条缺陷 P2×3+P3×9）**：依据 `final-security-assessment-20260831-201409.md` 清单逐条修复，`node --check` 两文件通过（EXIT=0），grep 验证全绿。改动文件：`src/index.js` + `_worker.js`。逐条说明：① **P2-1**（src/index.js 音频转写 OOM）：移除 `parseInt(Content-Length || '0')` 头依赖（chunked 时=0 绕过），改用 `request.clone().body.getReader()` 流式累计实际字节数，上限 100MB→25MB；`{ audio: [...audioUint8] }` 数组展开改为 `{ audio: audioUint8 }` 直接传 Uint8Array，避免 1 亿元素数组内存放大 8 倍+ OOM。② **P2-2**（src/index.js 流式 finish_reason 缺失）：两个 processLines 加 `else if (!chunk.choices && chunk.usage !== undefined)` 分支处理 CF 流式尾块 `{usage}`（无 choices/response），构造 `{choices:[{delta:{},finish_reason:chunk.finish_reason||'stop'}],usage}`，保留上游真实 finish_reason 避免 ensureFinishReason 覆盖。③ **P2-3**（src/index.js normalizeBindingResult 兜底）：兜底路径从 `return result`（原样返回非 OpenAI 格式）改为构造空 choices 的 OpenAI 格式 `{choices:[{message:{role:'assistant',content},finish_reason:'stop'}],usage}`。④ **P3-1**（_worker.js accountId 路径注入）：`buildCFUrl` + 3 处 fetch URL 的 `${account.accountId}` / `${targetAccountId}` 全部加 `encodeURIComponent()`，共 4 处。⑤ **P3-2**（CSRF 非时序安全比较）：两入口 `csrfCookie !== csrfHeader` 改为 `!timingSafeEqual(csrfCookie, csrfHeader)`，2 处。⑥ **P3-3**（CSRF cookie 缺 HttpOnly）：两入口 csrf cookie 字符串加 `HttpOnly;`，2 处。⑦ **P3-4**（图片 width/height 无上限）：两入口 `parseInt(parts[0]) || 1024` 改为 `Math.min(Math.max(parseInt(parts[0]) || 1024, 64), 2048)`，限制 [64,2048]，4 处。⑧ **P3-5**（/api/accounts/test 永远成功）：模式 A 从硬编码 `success:true` 改为实际调用 `env.AI.run('@cf/google/embeddinggemma-300m', {text:['test']})` 做轻量推理测试。⑨ **P3-6**（前端账号 CRUD 与后端不匹配）：loadAccounts 中 `acc.id === 'binding-single'` 时不显示编辑/删除按钮，显示"由 Binding 配置（只读）"。⑩ **P3-7**（API key 明文回传）：两入口 GET /api/keys 返回 `maskTokenKey(k.key)` 掩码，2 处。⑪ **P3-8**（timingSafeEqual 长度提前返回）：无需修改，比较值都是 sha256 64 字符恒定长度。⑫ **P3-9**（流式 chunk.response 非字符串）：两个 processLines 的 `content: chunk.response` 改为 `content: typeof chunk.response === 'string' ? chunk.response : JSON.stringify(chunk.response)`，2 处。⑬ §R0.6 同步：P3-4/P3-7 虽然缺陷清单只列 src/index.js，但 _worker.js 有相同问题，已同步修复。（注：本条中 ②③⑤⑥⑩⑫ 共 6 项已于同日后续回退，见上一条日志）
 - **2026-08-31（修复模式A流式Binding格式归一化）**：① 根因：CF Workers AI Binding `env.AI.run(model,{messages,stream:true})` 流式返回的 SSE chunk 是**原生格式** `{response:"...",usage,tool_calls}` 而非 OpenAI 格式 `{choices:[...]}`（证据：CF 官方文档 llama-3.3-70b 的 Streaming Output 仍有 `response`(string)/`usage`/`tool_calls` 字段，与 Synchronous Output 相同；参考项目 `openai-cf-workers-ai` 的 chat.js 第 70 行 `delta: { content: data.response }`——从 SSE chunk 读 `data.response` 手动转成 OpenAI delta）。模式 A `callBindingChat` 流式分支用 `returnRawResponse:true` 获取 Response 直接透传 `resp.body`，但后续两个 processLines 函数都假设输入是 OpenAI 格式（读 `chunk.choices`），导致原生格式 chunk 被错误处理。② 现象：位置1 `passthroughStream` 的 processLines（src/index.js:2090）直接透传原生格式 chunk，OpenAI 客户端收到 `{response}` 解析 `choices` 失败；位置2 `anthropicStreamTransform` 的 processLines（src/index.js:1482）`chunk.choices` 是 undefined → `choice` undefined → `if (!choice) continue` 跳过所有内容 chunk → Anthropic 流式客户端收到空响应。模式 B 走 REST API 返回 OpenAI 格式不受影响。③ 修复：在两个 processLines 的 `const chunk = JSON.parse(dataStr);` 之后、其他逻辑之前，加防御性格式归一化——`if (!chunk.choices && chunk.response !== undefined)` 时构造 OpenAI streaming chunk `{id,object:'chat.completion.chunk',created,model:modelName,choices:[{index:0,delta:{content:chunk.response},finish_reason:null}],usage?}`，`const chunk` 改成 `let chunk`（因重新赋值），`modelName` 是外层函数参数（passthroughStream/anthropicStreamTransform 都有）内层闭包可访问。向后兼容：已是 OpenAI 格式（有 choices）时跳过归一化不破坏现有行为。④ 改动文件：仅 `src/index.js`（+约 26 行），未动 `_worker.js`（模式 B 走 REST API 返回 OpenAI 格式不需要此修复，§R0.6 不需同步）。⑤ 验证：`node --check` 通过（EXIT_CODE=0），grep 确认 `!chunk.choices && chunk.response !== undefined` 2 处（第 1485 行 anthropicStreamTransform + 第 2106 行 passthroughStream）、`let chunk = JSON.parse(dataStr)` 2 处（第 1482 行 + 第 2103 行）。⑥ 下一步建议：用户 push 部署验证。
