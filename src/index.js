@@ -804,10 +804,10 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 			noteModelOk(cfModel);
 			return { success: true, status: resp.status, stream: resp.body };
 		}
-	const result = await env.AI.run(cfModel, cfPayload, { signal: AbortSignal.timeout(120000) });
-	cbOnSuccess(env);
-	noteModelOk(cfModel);
-	return { success: true, status: 200, data: normalizeBindingResult(result, cfModel) };
+		const result = await env.AI.run(cfModel, cfPayload, { signal: AbortSignal.timeout(120000) });
+		cbOnSuccess(env);
+		noteModelOk(cfModel);
+		return { success: true, status: 200, data: normalizeBindingResult(result, cfModel) };
 	} catch (e) {
 		cbOnCapacityFail(env);
 		noteModelFail(cfModel, e);
