@@ -136,7 +136,9 @@ main = "_worker.js"
 | 模型名 | Cloudflare 模型 | Tokens |
 |--------|----------------|--------|
 | `deepseek-v4-pro-0813` | `@cf/deepseek-ai/deepseek-v4-pro-0813` | 1,048,576 |
-| `deepseek-v4-flash-0731` | `@cf/deepseek-ai/deepseek-v4-flash-0731` | 1,048,576 |
+| `deepseek-v4-flash-0731` | `@cf/deepseek-ai/deepseek-v4-flash-0731` | 1,310,720 |
+| `glm-5.3` | `@cf/zai-org/glm-5.3` | 1,048,576 |
+| `glm-5.3-flash` | `@cf/zai-org/glm-5.3-flash` | 1,048,576 |
 | `glm-5.2` | `@cf/zai-org/glm-5.2` | 262,144 |
 | `kimi-k2.7-code` | `@cf/moonshotai/kimi-k2.7-code` | 262,144 |
 | `kimi-k2.6` | `@cf/moonshotai/kimi-k2.6` | 262,144 |

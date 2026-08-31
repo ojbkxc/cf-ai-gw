@@ -115,6 +115,8 @@ const DEFAULT_MODEL_MAP = {
 	// 对话 / 文本生成模型
 	'deepseek-v4-pro-0813': '@cf/deepseek-ai/deepseek-v4-pro-0813',
 	'deepseek-v4-flash-0731': '@cf/deepseek-ai/deepseek-v4-flash-0731',
+	'glm-5.3': '@cf/zai-org/glm-5.3',
+	'glm-5.3-flash': '@cf/zai-org/glm-5.3-flash',
 	'glm-5.2': '@cf/zai-org/glm-5.2',
 	'glm-4.7-flash': '@cf/zai-org/glm-4.7-flash',
 	'kimi-k2.7-code': '@cf/moonshotai/kimi-k2.7-code',
@@ -169,7 +171,9 @@ const DEFAULT_MODEL_MAP = {
 // 默认模型 token 上限
 const DEFAULT_MODEL_TOKENS = {
 	'@cf/deepseek-ai/deepseek-v4-pro-0813': 1048576,
-	'@cf/deepseek-ai/deepseek-v4-flash-0731': 1048576,
+	'@cf/deepseek-ai/deepseek-v4-flash-0731': 1310720,
+	'@cf/zai-org/glm-5.3': 1048576,
+	'@cf/zai-org/glm-5.3-flash': 1048576,
 	'@cf/zai-org/glm-5.2': 262144,
 	'@cf/zai-org/glm-4.7-flash': 131072,
 	'@cf/moonshotai/kimi-k2.6': 262144,
