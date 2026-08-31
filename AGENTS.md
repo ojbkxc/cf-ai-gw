@@ -37,12 +37,12 @@
 - **`npx wrangler deploy`**（项目根目录执行，需 `CLOUDFLARE_API_TOKEN` 环境变量）：部署 `wrangler.toml` 中 `main` 字段指定的入口文件到账户 `cc4b64888d2bb80770ff42b0e3c1fad2`。
 - 当前 `main = "src/index.js"`（模式 A）。切换模式只需改 `wrangler.toml` 的 `main` 字段再 deploy。
 - 无构建步骤：Cloudflare 直接部署 JS 源码，无 npm install / bundle。
-- Worker 名 `api`，线上地址 `https://api.lxseek.workers.dev`。
+- Worker 名 `cf-ai-gw`，线上地址 `https://cf-ai-gw.lxseek.workers.dev`（2026-08-31 由旧名 api 迁移更名，旧地址 api.lxseek.workers.dev 已弃用；**name 勿改回 "api"，否则 deploy 会误建新 Worker**）。
 
 ### R2.2 部署后必须验证的端点（全绿才算通过）
 ```
 Worker 部署成功后，用 curl 或浏览器验证：
-1. GET https://api.lxseek.workers.dev/v1/models
+1. GET https://cf-ai-gw.lxseek.workers.dev/v1/models
    → 返回 JSON，data 数组含 DEFAULT_MODEL_MAP 的所有模型 id（如 deepseek-v4-pro-0813、glm-5.2）
 2. GET /admin → 返回管理面板 HTML（登录页）
 3. 登录后 GET /api/settings → 返回 { customModelMap, modelTokens }
@@ -52,7 +52,7 @@ Worker 部署成功后，用 curl 或浏览器验证：
 
 ### R2.3 据报错修复的迭代流程（每次 deploy 后必走）
 1. `npx wrangler deploy`（读输出中的错误信息）。
-2. 用 `npx wrangler tail` 看实时日志；或在 Dashboard → Workers & Pages → api → Deployments 查看部署状态。
+2. 用 `npx wrangler tail` 看实时日志；或在 Dashboard → Workers & Pages → cf-ai-gw → Deployments 查看部署状态。
 3. 若部署失败或运行时报错：读日志定位首个 `Error` / `TypeError` / `SyntaxError` 行。
 4. 本地按报错修代码（常见：两入口不同步、缓存未 invalidate、模型映射 key 写错、ES Module 语法）。*不*绕过。
 5. 本地先跑 §R2.4 静态检查，再 `git commit` + 重新 `npx wrangler deploy`，回到步骤 2，直到部署成功且端点可用。
@@ -73,9 +73,9 @@ Worker 部署成功后，用 curl 或浏览器验证：
 - 人工 review：模型映射 key 是否以 `@cf/` 开头、token 上限是否正整数。
 
 ### R2.5 wrangler.toml / secrets 维护
-- KV/AI Binding 写在 `wrangler.toml`（直连部署的绑定来源）：当前 KV id `2dee8032afd64456b28821f41b5aff44`（binding `KV`）、`[ai] binding = "AI"`、`account_id = "cc4b64888d2bb80770ff42b0e3c1fad2"`。
+- KV/AI Binding 写在 `wrangler.toml`（直连部署的绑定来源）：当前 KV id `692bd958d51b4890a02b5fe637cddae2`（binding `KV`；2026-08-31 改绑——**与用户模式 B Pages 部署共用同一 KV namespace**，模式 A/B 数据互通，模式 A 管理面板可见模式 B 的 API Key/账号/配置；旧 id `2dee8032afd64456b28821f41b5aff44` 是 wrangler 首次部署新建的空库，已弃用）、`[ai] binding = "AI"`、`account_id = "cc4b64888d2bb80770ff42b0e3c1fad2"`。
 - 切换部署模式：改 `main` 字段为 `"src/index.js"`（模式 A）或 `"_worker.js"`（模式 B）后 `npx wrangler deploy`。
-- 环境变量/Secret 用 `npx wrangler secret put <NAME>` 管理（当前已设 `ADMIN_PASSWORD`，值仅告知用户不落盘）；普通变量（如限额阈值）可在 `wrangler.toml` 加 `[vars]`，代码里通过 `env.XXX` 读取。
+- `ADMIN_PASSWORD` 已改为 `wrangler.toml` `[vars]` 明文管理（2026-08-31 用户要求；根因：Dashboard 手工设的 plain_text binding 与 `wrangler secret put` 互斥，报 10053）。其他环境变量/Secret 仍用 `npx wrangler secret put <NAME>` 管理；代码里统一通过 `env.XXX` 读取（var 与 secret 对代码透明）。
 - **API Token 只经环境变量 `CLOUDFLARE_API_TOKEN` 传入，严禁写入任何文件。**
 
 ---
@@ -106,8 +106,8 @@ cf-ai-gw 是 **Cloudflare Workers AI → OpenAI/Anthropic 兼容 API 网关**（
 | 入口文件 | `src/index.js`（模式 A）/ `_worker.js`（模式 B），`wrangler.toml` `main` 切换 | `wrangler.toml` |
 | 模块格式 | ES Module（`export default`） | `node --check *.mjs` |
 | 运行时 | Cloudflare Workers，`compatibility_date = "2025-08-01"` | `wrangler.toml` |
-| KV 绑定 | `wrangler.toml` 管理：binding = `KV`，id = `2dee8032afd64456b28821f41b5aff44` | `wrangler.toml` |
-| 必填环境变量 | `ADMIN_PASSWORD`（`wrangler secret put` 管理，已设，勿随意重置） | `npx wrangler secret list` |
+| KV 绑定 | `wrangler.toml` 管理：binding = `KV`，id = `692bd958d51b4890a02b5fe637cddae2`（与模式 B Pages 共用，数据互通） | `wrangler.toml` |
+| 必填环境变量 | `ADMIN_PASSWORD`（`wrangler.toml` `[vars]` 明文管理，2026-08-31 用户要求；勿随意重置/删除） | `wrangler.toml` |
 | 配置 KV 键 | `cfg_model_map` / `cfg_model_tokens` / `cfg_api_keys` / `cfg_limits` / `cfg_accounts` | `createKVGetter` 调用 |
 | 缓存 | `createKVGetter` 60s 闭包缓存，`save*` 必须 `.invalidate()`（§R0.7） | grep `.invalidate()` |
 | 模型映射 | `DEFAULT_MODEL_MAP` + `DEFAULT_MODEL_TOKENS`，**两文件同步**（§R0.6） | grep 对称性 |
@@ -158,6 +158,11 @@ cf-ai-gw/
 - [x] **修复全量安全评估12条缺陷（P2×3+P3×9，清单见 final-security-assessment-20260831-201409.md）；后按用户裁决回退其中6条低收益/影响功能的修复（P2-2/P2-3/P3-2/P3-3/P3-7/P3-9），实际保留6条（P2-1/P3-1/P3-4/P3-5/P3-6/P3-8）**
 - [x] **部署模式 A 到新账户 cc4b64888d2bb80770ff42b0e3c1fad2（wrangler deploy，Worker 名 api → https://api.lxseek.workers.dev）；新建 KV namespace + ADMIN_PASSWORD secret；端到端验证通过（/v1/models、/admin、管理员登录、非流式 glm-5.2 + llama 双模型、流式 SSE 归一化）**
 - [x] **模式 A 全量兼容接口测试通过（14 类端点全绿）+ 修复 4 个多模态 bug（flux 参数超集/tts 映射不存在/sdxl ReadableStream/whisper 数组展开，两入口同步）**
+- [x] **ADMIN_PASSWORD 改为 wrangler.toml `[vars]` 明文管理（用户指定值，deploy 版本 c4f1f450→f369746f，线上登录验证通过）；期间发现 deploy 会覆盖移除 Dashboard 手工绑定的 api.lxvpn.com 自定义域——已临时固化 routes 恢复，后按用户裁决从配置移除（用户自管，随时可能换域名，下次 deploy 会再次移除该域）**
+
+- [x] **Worker 迁移更名 api → cf-ai-gw（https://cf-ai-gw.lxseek.workers.dev，当前版本 5e5f85a6，bindings：AI + KV + ADMIN_PASSWORD 齐全）；期间一次误部署到 api（wrangler.toml name 被外部工具还原所致），误建 Worker 已删除**
+- [x] **KV 改绑 `692bd958d51b4890a02b5fe637cddae2`：与用户模式 B Pages 部署共用同一 KV——模式 A 管理面板已可见模式 B 的 API Key/账号/配置，跨模式数据互通达成；PATCH settings 已同步脚本级绑定（multipart form-data）**
+- [x] **GitHub 公开仓库记录清理（2026-09-01）：重写含密码的 commit 并 force push 覆盖远程（详见变更日志 2026-09-01 条）**
 
 ### 下一步任务（待用户决策，按优先级）
 - [x] **P1-A 补滥用防护**：用户裁决跳过——Cloudflare 平台自带限流
@@ -167,6 +172,8 @@ cf-ai-gw/
 
 ## 5. 变更日志（最新在上）
 
+- **2026-09-01（Worker 正规化 cf-ai-gw + KV 模式A/B 共用 + GitHub 公开仓库记录清理；回溯含 08-31 深夜事件）**：① **cf-ai-gw 版本迷案（已破解）**：用户删除原 api Worker 后经 Dashboard 重新创建 cf-ai-gw 部署；当时 settings API/Dashboard 只显示 ADMIN_PASSWORD 而功能全绿——真相：Worker 存在「脚本级配置」（Dashboard 维护，PATCH settings 修改）与「版本级配置」（wrangler 部署的版本 manifest）两套，且存在一个**未部署的 #4 Hello world 模板版本**（用户在 Dashboard 编辑器「添加变量」时上传），settings API 显示的是最新上传版本而非实际服务版本（实际服务 #3 完整版本 cc7ef0da）。② **误建 api 事故**：期间 wrangler.toml 的 name=cf-ai-gw 修改被 GitHub Desktop stash 意外还原为 "api"，一次 deploy 误建新 Worker api，已删除（REST DELETE）。③ **PATCH settings 脚本级绑定同步**：wrangler deploy 后 settings API 仍只显示 ADMIN_PASSWORD——REST `PATCH /workers/scripts/cf-ai-gw/settings` 同步脚本级 bindings（**必须 multipart/form-data**，name="settings" part 携带 JSON，纯 JSON 报 415）；成功后 Dashboard 显示 KV+AI+ADMIN_PASSWORD 三项。④ **KV 改绑（模式A/B 共用达成）**：账户有 3 个 KV namespace（2dee8032=wrangler 首次部署新建的空库、692bd958=用户模式 B Pages 全部数据所在、18fbb178=workersai2api 项目）；按用户「KV 的值都是 cf-ai-gw」确认改绑 `692bd958d51b4890a02b5fe637cddae2`（wrangler.toml + deploy 版本 5e5f85a6 + PATCH settings 同步），**模式 A 管理面板 /api/keys 已显示模式 B 的 API Key——共用达成**。⑤ **GitHub 冲突与重 clone**：用户自行 push 了含管理密码明文的 commit（message+AGENTS.md+wrangler.toml 三处泄露）；本地曾 amend 出干净版未及 push，随后本地目录被删除重新 clone（reflog 仅 1 条 clone 记录），前次收尾修正全部丢失、本地回退到远程含密码版本——本次重做：wrangler.toml（name api→cf-ai-gw + KV id 2dee8032→692bd958）、AGENTS.md（§R2.1/R2.2/R2.3/R2.5/§2 同步线上现状 + 进度追加 + 本条 + 前条 5 处密码脱敏为「<用户指定值>」表述）、删除 git 跟踪的陈旧残留 `dist-pages/_worker.js`（旧 Pages 部署副本，与根目录 _worker.js 漂移 90 行，**非模式 B 入口，入口 _worker.js 未动**）、amend 重写 commit（message 去敏感值）、`git push --force-with-lease` 覆盖远程 main。⑥ **遗留安全建议（重要，待用户决策）**：仓库为 **PUBLIC**（ojbkxc/cf-ai-gw），wrangler.toml 的 ADMIN_PASSWORD 明文（用户要求 [vars] 管理）对全网可见，管理域名 cf-ai-gw.lxseek.workers.dev 亦在 README 公开——建议 (a) 更换管理密码（旧密码已公开应视为失效）(b) 仓库转 Private 或 wrangler.toml 移出 git 跟踪；GitHub 侧旧 commit force push 后仍可经 SHA 访问一段时间（彻底清除需 GitHub Support 私有信息删除流程），公开活动流的 push 事件无法删除。⑦ 线上不受影响：cf-ai-gw（5e5f85a6）AI+KV(692bd958)+密码绑定完好、端点全绿。改动文件：wrangler.toml + AGENTS.md + 删除 dist-pages/_worker.js。验证：grep 密码仅剩 wrangler.toml 1 处（用户要求保留）；force push 后远程无敏感值。下一步建议：见 ⑥。
+- **2026-08-31（ADMIN_PASSWORD 改 [vars] 明文 + api.lxvpn.com 自定义域处理）**：① 用户指令「ADMIN_PASSWORD 别加密，用文本」，指定值（略，见 wrangler.toml）。排查确认：REST `GET /workers/scripts/api/settings` 显示 ADMIN_PASSWORD 已是 plain_text binding（值即上述用户指定值，用户此前在 Dashboard 手工设置），这解释了 `wrangler secret put` 报 10053（名字被 plain_text binding 占用）/ `secret delete` 报 10056（secrets 里不存在）/ `secret list` 为空的矛盾——wrangler secret 与 Dashboard plain_text 是两种互斥 binding。② 修复：`wrangler.toml` 加 `[vars] ADMIN_PASSWORD = "<用户指定值>"`（TOML 中 `#` 是注释符，必须引号包裹），`npx wrangler deploy`（版本 c4f1f450→f369746f），deploy 输出确认 `env.ADMIN_PASSWORD (<用户指定值>) Environment Variable`；线上验证 `POST /api/auth/login {"password":"<用户指定值>"}` → `{"success":true}`、`/v1/models` 41 模型正常。改动文件：仅 wrangler.toml（+AGENTS.md 回写）。③ 插曲：deploy 时 WARNING 显示远程有用户手工绑定的自定义域 `api.lxvpn.com`（本地配置无 → 覆盖移除），第一次 deploy 已将其移除；临时在 wrangler.toml 固化 `routes = [{pattern="api.lxvpn.com", custom_domain=true}]` 重新 deploy 恢复（验证 `api.lxvpn.com/v1/models` 41 模型正常）；随后按用户裁决（「不用管，我自己玩玩的，可能哪天就换了」）从 wrangler.toml 移除 routes——**注意：下次 wrangler deploy 仍会移除该自定义域，需要时在 Dashboard 重绑或临时加回 routes 再 deploy**。④ 顺带更正：本会话曾误改 `compatibility_date` 2025-08-01→2025-08-31，已立即回滚（§2 硬约束值）。⑤ 教训：wrangler deploy 输出「local configuration differs from remote」WARNING 时必须先看清 diff（routes/bindings/vars）再继续——非交互环境 fallback=yes 会静默覆盖远程配置。⑥ 亦确认（答用户问）：两模式共用同一 KV（`cfg_model_map`/`cfg_api_keys`/`cfg_limits` 等配置跨模式共享，改 `main` 字段切换模式配置不丢；`cfg_accounts` 仅模式 B 用；模式 A 管理面板可增删模型映射存 `cfg_model_map` 立即生效）。下一步建议：无（密码已生效）。
 - **2026-08-31（模式 A 全量兼容接口测试 + 修复 4 个多模态 bug）**：对线上 https://api.lxseek.workers.dev 全量实测 14 类兼容接口，发现并修复 4 个多模态缺陷（两入口同步，部署 4 轮迭代验证全绿）。**测试结果**：/v1/models（41 模型）、/v1/models/{id}、chat 非流式（glm-5.2/llama 双模型）、chat 流式（SSE+ping）、legacy /v1/completions、/v1/messages 非流式+流式（完整事件序列 message_start→content_block_delta→message_stop）、/v1/messages/count_tokens、/v1/embeddings（bge-m3 1024 维）、/v1/images/generations（flux-1-schnell+sdxl）、/v1/audio/speech、/v1/audio/transcriptions、/v1/audio/translations、OPTIONS CORS、/admin+登录——全部通过。**修复清单（REST API 对比测试定位根因）**：① **flux 图片 500**：flux 系列 schema 仅接受 {prompt}，网关多传 width/height/num_steps 被 CF 拒（400 Additional properties not allowed）→ 改 `cfModel.includes('flux') ? { prompt } : { prompt, width, height }`；② **TTS 500**：'tts' 映射到不存在的 `@cf/myshell-ai/tts`（账户目录实际为 melotts，且 melotts 平台侧 500 故障）→ 改映射 `@cf/deepgram/aura-2-en`（实测可用）；aura-2 输入字段是 `text` 非 `prompt`，且 schema 严格不允许透传 OpenAI 的 voice/response_format/speed → 改 `cfModel.includes('aura') ? { text: input } : { prompt: input }` 并删除透传；③ **sdxl 空 b64**：官方文档「The binding returns a ReadableStream」——sdxl Binding 返回 ReadableStream 而非 {image:base64}，网关 Uint8Array(result) 得空 → 加 `instanceof Response`/`instanceof ReadableStream` 分支（`new Response(stream).arrayBuffer()`）；模式 B 图片接口改 `rawResponse:true` + 按 Content-Type 分流（JSON 取 result.image / 二进制转 base64）；④ **ASR 500「未识别的上游错误」**：Binding 要求 `{audio: [...audioUint8]}` 数组展开，传 Uint8Array 报错（REST 实测：binary 直传与 multipart 均可用、JSON int 数组不可用，Binding 内部将数组编码为二进制流）→ 改数组展开，MAX_AUDIO_SIZE 25MB→8MB（800 万元素≈64MB 内存，25MB 展开会超 Workers 128MB）；模式 B 的 FormData 转发经 REST multipart 实测本就正确，无需修改。⑤ 误导映射：'flux' 原映射 `@cf/deepgram/flux`（ASR 模型冒充图片名）→ 改为 flux-1-schnell 别名。**两个重要教训**：a) wrangler deploy 后立即测试可能命中旧版本实例（sdxl 前两轮「假失败」实为传播延迟，部署后应等待 ~20 秒再验证）；b) 本机 curl.exe 不走系统代理，DNS 把 workers.dev 解析到 Facebook IP 段（face:b00c）——测试 workers.dev 必须用 Invoke-WebRequest/.NET，之前「curl 流式失败是引号问题」的结论是错的。改动文件：src/index.js + _worker.js（部署版本链 8e87a455→87c21982→6812e766→5761b36e→6a7621ac）。验证：node --check 两文件通过、全部接口线上实测通过。下一步建议：无。
 - **2026-08-31（模式 A 部署到新 Cloudflare 账户 + 端到端验证）**：按用户指令将项目部署到用户提供的新账户（API Token 仅经 `CLOUDFLARE_API_TOKEN` 环境变量传入，未落盘不入库）。① `wrangler whoami` 验证 Token 有效（账户 ojbkxc / cc4b64888d2bb80770ff42b0e3c1fad2，wrangler 4.86.0）；② 新账户创建 KV namespace（binding `KV`，id `2dee8032afd64456b28821f41b5aff44`，替换旧账户 id f2d6dfb3...）；③ `wrangler.toml` 更新：新增 `account_id` + 替换 KV id（改动文件：仅 wrangler.toml）；④ `npx wrangler deploy` 成功：Worker 名 `api` → **https://api.lxseek.workers.dev**（版本 d1f07e40，212KB/46.6KB gzip，绑定 KV + AI）；⑤ `wrangler secret put ADMIN_PASSWORD`——首次因 PowerShell 5.1 无 `RandomNumberGenerator::Fill` 静态方法误设全 a 弱密码，已立即改用 `Create().GetBytes()` 生成 24 位强随机密码覆盖（教训：PS5.1 加密随机用 `[RNG]::Create()` + `GetBytes()`）；⑥ 端到端验证全绿：GET /v1/models=200 模型列表、GET /admin=200（30604B HTML）、POST /api/auth/login={"success":true}、非流式 POST /v1/chat/completions：glm-5.2（推理模型，reasoning_content 正常流出，normalizeBindingResult 归一化生效）+ llama-3.1-8b-instruct-fast（content="Hello how are you."，finish=stop）、流式 stream=true：SSE 200（text/event-stream，`: ping` 心跳 + OpenAI chunk 格式，流式归一化生效）。注：PS5.1 向 curl.exe 传 JSON 会剥双引号导致流式测试假失败，须用 Invoke-WebRequest 原生测。⑦ 部署通道由「push GitHub 触发 Git 集成」切换为「wrangler deploy 直连」，§R0.8/§R2/§2 已同步更新消除漂移。下一步建议：用户登录 /admin 配置 API Key 与模型映射；因 Token 在对话中明文出现过，建议在 Dashboard 轮换该 API Token。
 - **2026-08-31（回退6条低收益/影响功能的修复）**：按用户裁决回退 commit a49c838 中的 6 条修复，恢复原状。改动文件：`src/index.js` + `_worker.js`。回退清单：① **P2-2**（流式尾块 `{usage}` 处理）：删除两个 processLines 的 `else if (!chunk.choices && chunk.usage !== undefined)` 分支——CF 流式可能不发此格式尾块，属防御性代码，每 chunk 多一次条件判断，实际触发概率低（ensureFinishReason 已兜底补齐 finish_reason）。② **P2-3**（非流式兜底构造 OpenAI 格式）：normalizeBindingResult 兜底恢复 `return result;` 原样返回——CF 当前模型都返回标准格式，兜底路径可能永不触发。③ **P3-9**（`typeof chunk.response === 'string'` 检查）：恢复直接 `chunk.response`——CF 流式 response 总是字符串，非字符串分支永不触发。④ **P3-2**（CSRF `timingSafeEqual` 替代 `!==`）：恢复 `csrfCookie !== csrfHeader`——64 字符 sha256 的时序攻击在网络抖动下不可利用，实际安全收益≈0。⑤ **P3-3**（CSRF cookie 加 HttpOnly）：去掉 `HttpOnly;`——csrf token 也在 `<meta>` 标签（JS 可读），HttpOnly 只防 cookie 被 JS 读，XSS 可从 meta 读 token 绕过，实际增益≈0。⑥ **P3-7**（API key 掩码）：GET /api/keys 恢复明文返回——前端"复制"按钮需要完整 key，掩码导致功能退化；API key 是管理员自己的密钥，明文回传给已认证管理员是常见做法（如 OpenAI Dashboard）。保留未动的 6 条：P2-1（音频 Uint8Array + 流式大小检查，性能优化）、P3-1（accountId encodeURIComponent ×4）、P3-4（图片尺寸 clamp [64,2048] ×4）、P3-5（/api/accounts/test 真实 AI 推理测试）、P3-6（前端 isBindingMode 只读提示）、P3-8（无需修改）。验证：`node --check` 两文件通过；grep 确认回退项归零（timingSafeEqual(csrfCookie / maskTokenKey(k.key) / csrf HttpOnly / typeof chunk.response / chunk.usage !== undefined / fallbackContent 全部=0）、保留项存在（encodeURIComponent=4 / clamp=4 / isBindingMode=2 / audioUint8=4 / embeddinggemma 测试保留）。下一步建议：用户 push 部署验证。

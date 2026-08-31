@@ -7,15 +7,20 @@
 #
 # 默认采用模式 A（Worker + AI Binding，单账号首选）。
 
-name = "api"
+name = "cf-ai-gw"
 main = "src/index.js"
 compatibility_date = "2025-08-01"
 account_id = "cc4b64888d2bb80770ff42b0e3c1fad2"
 
+
+# 管理密码（用户要求明文 var，不用 secret）
+[vars]
+ADMIN_PASSWORD = "mzyxc8520#"
+
 # KV 绑定：存储配置、API Key、用量统计等
 [[kv_namespaces]]
 binding = "KV"
-id = "2dee8032afd64456b28821f41b5aff44"
+id = "692bd958d51b4890a02b5fe637cddae2"
 
 # Workers AI 绑定（模式 A：单账号，内部 RPC 调用）
 [ai]
