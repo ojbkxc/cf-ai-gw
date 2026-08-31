@@ -1479,7 +1479,20 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				}
 
 				try {
-					const chunk = JSON.parse(dataStr);
+					let chunk = JSON.parse(dataStr);
+					// 流式格式归一化：CF Binding 流式返回原生格式 {response, usage, tool_calls}，
+					// 转成 OpenAI streaming chunk {choices: [{delta: {content}, finish_reason: null}]}
+					if (!chunk.choices && chunk.response !== undefined) {
+						const originalUsage = chunk.usage;
+						chunk = {
+							id: chunk.id || `chatcmpl-${crypto.randomUUID()}`,
+							object: 'chat.completion.chunk',
+							created: chunk.created || Math.floor(Date.now() / 1000),
+							model: modelName,
+							choices: [{ index: 0, delta: { content: chunk.response }, finish_reason: null }]
+						};
+						if (originalUsage) chunk.usage = originalUsage;
+					}
 					const choice = chunk.choices?.[0];
 					if (!choice) continue;
 
@@ -2087,7 +2100,20 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 				if (dataStr === '[DONE]') continue;
 
 				try {
-					const chunk = JSON.parse(dataStr);
+					let chunk = JSON.parse(dataStr);
+					// 流式格式归一化：CF Binding 流式返回原生格式 {response, usage, tool_calls}，
+					// 转成 OpenAI streaming chunk {choices: [{delta: {content}, finish_reason: null}]}
+					if (!chunk.choices && chunk.response !== undefined) {
+						const originalUsage = chunk.usage;
+						chunk = {
+							id: chunk.id || `chatcmpl-${crypto.randomUUID()}`,
+							object: 'chat.completion.chunk',
+							created: chunk.created || Math.floor(Date.now() / 1000),
+							model: modelName,
+							choices: [{ index: 0, delta: { content: chunk.response }, finish_reason: null }]
+						};
+						if (originalUsage) chunk.usage = originalUsage;
+					}
 					if (chunk.choices && chunk.choices.some(c => c.finish_reason != null)) sawFinishReason = true;
 					if (chunk.id !== undefined) lastChunkId = chunk.id;
 					if (chunk.created !== undefined) lastChunkCreated = chunk.created;
