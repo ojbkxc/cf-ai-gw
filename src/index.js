@@ -1291,6 +1291,7 @@ async function handleMessages(request, env, ctx) {
 	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
 
 	const openaiBody = convertAnthropicToOpenAI(anthropicBody);
+	openaiBody.model = cfModel;
 
 	const stream = !!anthropicBody.stream;
 	if (stream) {
