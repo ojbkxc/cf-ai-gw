@@ -150,6 +150,7 @@ cf-ai-gw/
 - [x] **管理面板 loadSettings 模型映射列表按 token 降序排序（两入口）**
 - [x] **更新 README.md 内置模型列表（按类别分组+Tokens 列）、模式对比表、端点列表**
 - [x] **修复模式 A handleMessages 缺 openaiBody.model=cfModel（/v1/messages 非流式 500）**
+- [x] **修复模式A 5个独有bug（流式pingInterval清理/剩余buffer兜底/data前缀/账号测试路由）**
 
 ### 下一步任务（待用户决策，按优先级）
 - [x] **P1-A 补滥用防护**：用户裁决跳过——Cloudflare 平台自带限流
@@ -159,6 +160,7 @@ cf-ai-gw/
 
 ## 5. 变更日志（最新在上）
 
+- **2026-08-31（修复模式A 5个独有bug）**：① 修复 `src/index.js` 5 个模式 A 独有 bug（模式 B `_worker.js` 已正确，不动）：BUG-A-1 anthropicStreamTransform catch 块缺 pingInterval 清理（第 1426 行新增 `if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }`，对照 `_worker.js:1935`）；BUG-A-2 passthroughStream done 分支剩余 buffer 错误加 `data: ` 前缀（第 2009 行 `data: ${buffer.trim()}\n\n` → `${buffer.trim()}\n\n`，对照 `_worker.js:2563`）；BUG-A-3 passthroughStream catch 块缺 pingInterval 清理（第 2037 行新增，对照 `_worker.js:2592`）；BUG-A-4 anthropicStreamTransform done 分支缺剩余 buffer 兜底（第 1395-1397 行新增 `if (buffer.trim()) { controller.enqueue(encoder.encode(\`${buffer.trim()}\n\n\`)); }`，对照 `_worker.js:1902-1905`）；BUG-A-5 前端 testConnection 调 `/api/accounts/test` 但后端无此路由（第 2237-2247 行新增简化成功响应，模式 A 用 AI Binding 无 apiToken，权限由平台 Binding 配置保证）。② 根因：5 个 bug 均为模式 A 实现遗漏，模式 B 已正确实现。③ 改动文件：仅 `src/index.js`（+约 20 行），未动 `_worker.js`（§R0.6 不需同步，模式 B 已正确）。④ 验证：`node --check` 通过（EXIT_CODE=0），grep 确认 `if (pingInterval) { clearInterval` 6 处（4 原有 done+cancel + 2 新增 catch）、`/api/accounts/test` 2 处（前端调用 + 后端路由）。⑤ 下一步建议：用户 push 部署验证（push 由用户自行执行）。
 - **2026-08-31（修复模式 A /v1/messages 非流式 500）**：① 修复：模式 A `src/index.js` 的 `handleMessages` 在 `convertAnthropicToOpenAI` 之后补充 `openaiBody.model = cfModel`（第 1294 行，1 insertion），与模式 B `_worker.js` 第 1803 行写法对齐。② 根因：Workers AI 上游用请求 body 中的 `model` 字段做模型校验（而非 URL 第一参数），模式 A 未将 body model 覆盖为 `@cf/` 路径，导致上游报 `The model glm-4.7-flash does not exist`（实测：body model 为用户模型名返回 404，model 为 `@cf/` 路径或无 model 字段返回 200）。③ 现象：仅 `/v1/messages`（Anthropic 格式）非流式失败；`/v1/chat/completions` 正常（cfPayload 不含 model 字段）；模式 B 正常（已有覆盖行）。④ 验证：`node --check` 两文件通过，grep 对称性通过（`openaiBody.model = cfModel` 两入口各 1 处）。commit ceac6e0（push 由用户自行执行）。
 - **2026-08-20（README.md 更新 + 管理面板排序）**：① 更新 README.md「内置模型」部分：移除已弃用模型（deepseek-r1-distill-qwen-32b、llama-3.1-8b 等），按类别分组（文本生成/向量嵌入/多模态/语音），文本生成带 Tokens 列按 token 降序，新增 22 个文本生成 + 17 个其他模型的完整列表；模式对比表「模型列表」行补充「按 token 降序」说明；管理面板端点表新增 `/api/models/search`。② 管理面板 `loadSettings` 模型映射列表按 token 降序排序（两入口同步，commit 7b6816b）。commit b4f0a76 已推送，部署验证通过。
 - **2026-08-19（/v1/models 按 token 降序排序）**：两文件 `/v1/models` 端点改为按 token 上限从大到小排序（`customTokens[cfModel] || DEFAULT_MODEL_TOKENS[cfModel] || 0`），无 token 上限的模型（embedding/image/audio 等）排到最后。排序用临时 `_tokens` 字段，输出前 `.map(({ _tokens, ...rest }) => rest)` 剥离，不污染 OpenAI 格式。两文件同步，`node --check` 通过。

@@ -1392,6 +1392,9 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 					if (result.done) {
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
+							if (buffer.trim()) {
+								controller.enqueue(encoder.encode(`${buffer.trim()}\n\n`));
+							}
 						}
 						if (!finalEventSent) {
 							sendFinalEvent(controller);
@@ -1420,6 +1423,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 						sendFinalEvent(controller);
 					}
 				} catch (e2) { console.error('anthropicStreamTransform secondary error:', e2?.message || e2); }
+				if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 				try { controller.close(); } catch (_) { }
 			}
 		},
@@ -2002,7 +2006,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
 							if (buffer.trim()) {
-								controller.enqueue(encoder.encode(`data: ${buffer.trim()}\n\n`));
+								controller.enqueue(encoder.encode(`${buffer.trim()}\n\n`));
 							}
 						}
 						ensureFinishReason(controller, 'stop');
@@ -2030,6 +2034,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 					ensureFinishReason(controller, 'error');
 					controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 				} catch (e2) { console.error('passthroughStream secondary error:', e2?.message || e2); }
+				if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 				try { controller.close(); } catch (_) { }
 			}
 		},
@@ -2225,6 +2230,18 @@ async function handleDashboardApi(request, env, ctx) {
 				monthlyRequests: 0,
 				monthlyLimit: limits.monthlyLimit,
 				threshold: limits.threshold
+			}
+		}), { headers: { 'Content-Type': 'application/json' } });
+	}
+
+	// 测试账号连接（模式A：AI Binding 模式下权限由 Cloudflare 平台 Binding 配置保证，直接返回成功）
+	if (url.pathname === '/api/accounts/test' && method === 'POST') {
+		return new Response(JSON.stringify({
+			success: true,
+			permissions: {
+				workersAiRead: { success: true },
+				workersAiEdit: { success: true },
+				accountAnalyticsRead: { success: true }
 			}
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
