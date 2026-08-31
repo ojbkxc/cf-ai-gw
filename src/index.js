@@ -771,8 +771,21 @@ function normalizeBindingResult(result, cfModel) {
 			usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
 		};
 	}
-	// 兜底：原样返回（可能是字符串或其他未知格式）
-	return result;
+	// 兜底：构造空 choices 的 OpenAI 格式，避免原样返回非 OpenAI 格式导致客户端解析失败
+	// 处理纯 {usage} 或其他未知格式
+	const fallbackContent = typeof result === 'string' ? result : (result && typeof result === 'object' ? JSON.stringify(result) : String(result || ''));
+	return {
+		id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '')}`,
+		object: 'chat.completion',
+		created: Math.floor(Date.now() / 1000),
+		model: cfModel,
+		choices: [{
+			index: 0,
+			message: { role: 'assistant', content: fallbackContent },
+			finish_reason: 'stop'
+		}],
+		usage: (result && typeof result === 'object' && result.usage) || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+	};
 }
 
 async function callBindingChat(cfModel, cfPayload, env, stream) {
@@ -1479,20 +1492,32 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				}
 
 				try {
-					let chunk = JSON.parse(dataStr);
-					// 流式格式归一化：CF Binding 流式返回原生格式 {response, usage, tool_calls}，
-					// 转成 OpenAI streaming chunk {choices: [{delta: {content}, finish_reason: null}]}
-					if (!chunk.choices && chunk.response !== undefined) {
-						const originalUsage = chunk.usage;
-						chunk = {
-							id: chunk.id || `chatcmpl-${crypto.randomUUID()}`,
-							object: 'chat.completion.chunk',
-							created: chunk.created || Math.floor(Date.now() / 1000),
-							model: modelName,
-							choices: [{ index: 0, delta: { content: chunk.response }, finish_reason: null }]
-						};
-						if (originalUsage) chunk.usage = originalUsage;
-					}
+				let chunk = JSON.parse(dataStr);
+				// 流式格式归一化：CF Binding 流式返回原生格式 {response, usage, tool_calls}，
+				// 转成 OpenAI streaming chunk {choices: [{delta: {content}, finish_reason: null}]}
+				if (!chunk.choices && chunk.response !== undefined) {
+					const originalUsage = chunk.usage;
+					chunk = {
+						id: chunk.id || `chatcmpl-${crypto.randomUUID()}`,
+						object: 'chat.completion.chunk',
+						created: chunk.created || Math.floor(Date.now() / 1000),
+						model: modelName,
+						choices: [{ index: 0, delta: { content: typeof chunk.response === 'string' ? chunk.response : JSON.stringify(chunk.response) }, finish_reason: null }]
+					};
+					if (originalUsage) chunk.usage = originalUsage;
+				}
+				// P2-2: 处理含 usage 但无 choices/response 的尾块（CF 流式最后一个 chunk 可能是 {usage: {...}}）
+				// 构造 OpenAI 格式尾块，保留上游真实 finish_reason（如 'length'、'tool_calls'），避免被 ensureFinishReason 覆盖为 'stop'
+				else if (!chunk.choices && chunk.usage !== undefined) {
+					chunk = {
+						id: chunk.id || `chatcmpl-${crypto.randomUUID()}`,
+						object: 'chat.completion.chunk',
+						created: chunk.created || Math.floor(Date.now() / 1000),
+						model: modelName,
+						choices: [{ index: 0, delta: {}, finish_reason: chunk.finish_reason || 'stop' }],
+						usage: chunk.usage
+					};
+				}
 					const choice = chunk.choices?.[0];
 					if (!choice) continue;
 
@@ -1786,8 +1811,9 @@ async function handleImageGenerations(request, env, ctx) {
 	if (body.size && typeof body.size === 'string') {
 		const parts = body.size.split('x');
 		if (parts.length === 2) {
-			width = parseInt(parts[0]) || 1024;
-			height = parseInt(parts[1]) || 1024;
+			// P3-4: 限制 width/height 范围 [64, 2048]，避免恶意超大尺寸浪费推理配额
+			width = Math.min(Math.max(parseInt(parts[0]) || 1024, 64), 2048);
+			height = Math.min(Math.max(parseInt(parts[1]) || 1024, 64), 2048);
 		}
 	}
 
@@ -1840,9 +1866,26 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 		return jsonError("Content-Type must be multipart/form-data", 400, "invalid_request_error");
 	}
 
-	const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
-	if (contentLength > 100 * 1024 * 1024) {
-		return jsonError("File size exceeds 100MB limit", 413, "invalid_request_error");
+	// 流式检查请求体实际大小，避免 Content-Length 绕过
+	// （chunked transfer-encoding 时 Content-Length 头缺失，parseInt('0')=0 绕过上限检查）
+	// 不依赖 Content-Length 头，用 ReadableStream 累计实际字节数
+	const MAX_AUDIO_SIZE = 25 * 1024 * 1024; // 25MB（降低上限避免大文件耗推理配额）
+	{
+		const sizeReader = request.clone().body.getReader();
+		let totalBytes = 0;
+		try {
+			while (true) {
+				const { done, value } = await sizeReader.read();
+				if (done) break;
+				totalBytes += value.length;
+				if (totalBytes > MAX_AUDIO_SIZE) {
+					await sizeReader.cancel();
+					return jsonError("File size exceeds 25MB limit", 413, "invalid_request_error");
+				}
+			}
+		} finally {
+			sizeReader.releaseLock();
+		}
 	}
 
 	try {
@@ -1865,8 +1908,14 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 		const audioArrayBuffer = await audioFile.arrayBuffer();
 		const audioUint8 = new Uint8Array(audioArrayBuffer);
 
-		// AI Binding 的 Whisper 接受 { audio: [...] } 格式，translations 加 task 参数
-		const whisperInput = { audio: [...audioUint8] };
+		// 二次校验实际音频大小（防御性，确保单文件不超限）
+		if (audioUint8.length > MAX_AUDIO_SIZE) {
+			return jsonError("File size exceeds 25MB limit", 413, "invalid_request_error");
+		}
+
+		// AI Binding 的 Whisper 接受 { audio: Uint8Array } 格式，translations 加 task 参数
+		// 直接传 Uint8Array，避免 [...audioUint8] 展开为 ~1 亿元素 JS 数组导致内存放大 8 倍+ OOM
+		const whisperInput = { audio: audioUint8 };
 		if (isTranslation) whisperInput.task = 'translate';
 		const result = await env.AI.run(actualCfModel, whisperInput, { signal: AbortSignal.timeout(120000) });
 
@@ -2100,20 +2149,32 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 				if (dataStr === '[DONE]') continue;
 
 				try {
-					let chunk = JSON.parse(dataStr);
-					// 流式格式归一化：CF Binding 流式返回原生格式 {response, usage, tool_calls}，
-					// 转成 OpenAI streaming chunk {choices: [{delta: {content}, finish_reason: null}]}
-					if (!chunk.choices && chunk.response !== undefined) {
-						const originalUsage = chunk.usage;
-						chunk = {
-							id: chunk.id || `chatcmpl-${crypto.randomUUID()}`,
-							object: 'chat.completion.chunk',
-							created: chunk.created || Math.floor(Date.now() / 1000),
-							model: modelName,
-							choices: [{ index: 0, delta: { content: chunk.response }, finish_reason: null }]
-						};
-						if (originalUsage) chunk.usage = originalUsage;
-					}
+				let chunk = JSON.parse(dataStr);
+				// 流式格式归一化：CF Binding 流式返回原生格式 {response, usage, tool_calls}，
+				// 转成 OpenAI streaming chunk {choices: [{delta: {content}, finish_reason: null}]}
+				if (!chunk.choices && chunk.response !== undefined) {
+					const originalUsage = chunk.usage;
+					chunk = {
+						id: chunk.id || `chatcmpl-${crypto.randomUUID()}`,
+						object: 'chat.completion.chunk',
+						created: chunk.created || Math.floor(Date.now() / 1000),
+						model: modelName,
+						choices: [{ index: 0, delta: { content: typeof chunk.response === 'string' ? chunk.response : JSON.stringify(chunk.response) }, finish_reason: null }]
+					};
+					if (originalUsage) chunk.usage = originalUsage;
+				}
+				// P2-2: 处理含 usage 但无 choices/response 的尾块（CF 流式最后一个 chunk 可能是 {usage: {...}}）
+				// 构造 OpenAI 格式尾块，保留上游真实 finish_reason（如 'length'、'tool_calls'），避免被 ensureFinishReason 覆盖为 'stop'
+				else if (!chunk.choices && chunk.usage !== undefined) {
+					chunk = {
+						id: chunk.id || `chatcmpl-${crypto.randomUUID()}`,
+						object: 'chat.completion.chunk',
+						created: chunk.created || Math.floor(Date.now() / 1000),
+						model: modelName,
+						choices: [{ index: 0, delta: {}, finish_reason: chunk.finish_reason || 'stop' }],
+						usage: chunk.usage
+					};
+				}
 					if (chunk.choices && chunk.choices.some(c => c.finish_reason != null)) sawFinishReason = true;
 					if (chunk.id !== undefined) lastChunkId = chunk.id;
 					if (chunk.created !== undefined) lastChunkCreated = chunk.created;
@@ -2243,7 +2304,7 @@ async function handleDashboardApi(request, env, ctx) {
 		const csrfCookieMatch = cookies.match(/csrf_token=([^;]+)/);
 		const csrfCookie = csrfCookieMatch ? csrfCookieMatch[1] : null;
 		const csrfHeader = request.headers.get('X-CSRF-Token');
-		if (!csrfCookie || !csrfHeader || csrfCookie !== csrfHeader) {
+		if (!csrfCookie || !csrfHeader || !timingSafeEqual(csrfCookie, csrfHeader)) {
 			return new Response(JSON.stringify({ error: 'CSRF token validation failed. Please refresh the page.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
 		}
 	}
@@ -2290,22 +2351,40 @@ async function handleDashboardApi(request, env, ctx) {
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 测试账号连接（模式A：AI Binding 模式下权限由 Cloudflare 平台 Binding 配置保证，直接返回成功）
+	// 测试账号连接（模式A：实际调用 env.AI.run 做轻量推理测试，验证 Binding 配置是否有效）
 	if (url.pathname === '/api/accounts/test' && method === 'POST') {
-		return new Response(JSON.stringify({
-			success: true,
-			permissions: {
-				workersAiRead: { success: true },
-				workersAiEdit: { success: true },
-				accountAnalyticsRead: { success: true }
-			}
-		}), { headers: { 'Content-Type': 'application/json' } });
+		try {
+			// 用 embeddinggemma-300m 做轻量测试（与模式 B _worker.js:2862 一致）
+			const testResult = await env.AI.run('@cf/google/embeddinggemma-300m', { text: ['test'] }, { signal: AbortSignal.timeout(30000) });
+			const ok = testResult && (testResult.data || testResult.shape || testResult.response !== undefined);
+			return new Response(JSON.stringify({
+				success: !!ok,
+				permissions: {
+					workersAiRead: { success: !!ok },
+					workersAiEdit: { success: !!ok },
+					accountAnalyticsRead: { success: !!ok }
+				},
+				...(!ok ? { error: 'AI Binding test failed: unexpected response format' } : {})
+			}), { headers: { 'Content-Type': 'application/json' } });
+		} catch (e) {
+			return new Response(JSON.stringify({
+				success: false,
+				error: e.message || 'AI Binding test failed',
+				permissions: {
+					workersAiRead: { success: false, error: e.message },
+					workersAiEdit: { success: false },
+					accountAnalyticsRead: { success: false }
+				}
+			}), { headers: { 'Content-Type': 'application/json' } });
+		}
 	}
 
 	if (url.pathname === '/api/keys') {
 		if (method === 'GET') {
 			const keys = await getApiKeys(env);
-			return new Response(JSON.stringify(keys), { headers: { 'Content-Type': 'application/json' } });
+			// P3-7: 返回掩码 key 避免明文回传前端（已有 XSS 防护，但仍加固）
+			const masked = keys.map(k => ({ ...k, key: maskTokenKey(k.key) }));
+			return new Response(JSON.stringify(masked), { headers: { 'Content-Type': 'application/json' } });
 		}
 
 		if (method === 'POST') {
@@ -3504,7 +3583,7 @@ async function handleLandingPage(request, env, ctx) {
 async function handleAdminPage(request, env, ctx) {
 	// 生成 CSRF Token：同时写入 cookie（JS 可读）和 meta 标签，前端请求时通过 X-CSRF-Token 头回传
 	const csrfToken = await sha256(env.ADMIN_PASSWORD + '_csrf_v1');
-	const csrfCookie = `csrf_token=${csrfToken}; Path=/; SameSite=Strict; Secure; Max-Age=86400`;
+	const csrfCookie = `csrf_token=${csrfToken}; Path=/; SameSite=Strict; Secure; HttpOnly; Max-Age=86400`;
 
 	const html = `<!DOCTYPE html>
 <head>
@@ -5080,15 +5159,17 @@ async function handleAdminPage(request, env, ctx) {
 		async function loadAccounts() {
 			await loadTableData('/api/accounts', 'accounts-table-body', '暂无配置的 Cloudflare 账号', (acc) => {
 				const maskedToken = acc.apiToken.length > 8 ? acc.apiToken.substring(0, 4) + '...' + acc.apiToken.substring(acc.apiToken.length - 4) : '********';
+				// P3-6: 模式 A 单账号（id='binding-single'）由 Cloudflare Binding 配置，不支持 CRUD，隐藏编辑/删除按钮
+				const isBindingMode = acc.id === 'binding-single';
 				return \`
 					<td><strong style="font-weight:600;">\${escapeHtml(acc.name)}</strong></td>
 					<td><code>\${escapeHtml(acc.accountId)}</code></td>
 					<td><code>\${escapeHtml(maskedToken)}</code></td>
 					<td>
-						<div style="display:flex; gap:8px;">
+						\${isBindingMode ? '<span style="color: var(--text-muted); font-size: 12px;">由 Binding 配置（只读）</span>' : \`<div style="display:flex; gap:8px;">
 							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" onclick="editAccount(\${attrEscape(acc.id)}, \${attrEscape(acc.name)}, \${attrEscape(acc.accountId)}, \${attrEscape(acc.apiToken)})">编辑</button>
 							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteAccount(\${attrEscape(acc.id)})">删除</button>
-						</div>
+						</div>\`}
 					</td>
 				\`;
 			});

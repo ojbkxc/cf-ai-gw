@@ -76,7 +76,8 @@ async function withFailover(env, onAccount) {
 }
 
 function buildCFUrl(account, path) {
-	return `https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/${path}`;
+	// P3-1: encodeURIComponent 防止 accountId 路径注入（含 /、?、../ 等恶意字符）
+	return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(account.accountId)}/ai/${path}`;
 }
 
 // ===== 错误分类体系 =====
@@ -2264,8 +2265,9 @@ async function handleImageGenerations(request, env, ctx) {
 	if (body.size && typeof body.size === 'string') {
 		const parts = body.size.split('x');
 		if (parts.length === 2) {
-			width = parseInt(parts[0]) || 1024;
-			height = parseInt(parts[1]) || 1024;
+			// P3-4: 限制 width/height 范围 [64, 2048]，避免恶意超大尺寸浪费推理配额（与 src/index.js 同步）
+			width = Math.min(Math.max(parseInt(parts[0]) || 1024, 64), 2048);
+			height = Math.min(Math.max(parseInt(parts[1]) || 1024, 64), 2048);
 		}
 	}
 
@@ -2754,7 +2756,7 @@ async function handleDashboardApi(request, env, ctx) {
 		const csrfCookieMatch = cookies.match(/csrf_token=([^;]+)/);
 		const csrfCookie = csrfCookieMatch ? csrfCookieMatch[1] : null;
 		const csrfHeader = request.headers.get('X-CSRF-Token');
-		if (!csrfCookie || !csrfHeader || csrfCookie !== csrfHeader) {
+		if (!csrfCookie || !csrfHeader || !timingSafeEqual(csrfCookie, csrfHeader)) {
 			return new Response(JSON.stringify({ error: 'CSRF token validation failed. Please refresh the page.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
 		}
 	}
@@ -2839,7 +2841,7 @@ async function handleDashboardApi(request, env, ctx) {
 		// 串行执行避免同时向 api.cloudflare.com 发 3 个请求（减少被识别为代理的流量特征）
 		const readResult = await (async () => {
 			try {
-				const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${targetAccountId}/ai/models/search?limit=1`, {
+				const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(targetAccountId)}/ai/models/search?limit=1`, {
 					method: 'GET',
 					headers: browserHeaders(targetApiToken),
 					signal: AbortSignal.timeout(30000),
@@ -2859,7 +2861,7 @@ async function handleDashboardApi(request, env, ctx) {
 
 		const editResult = await (async () => {
 			try {
-				const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${targetAccountId}/ai/run/@cf/google/embeddinggemma-300m`, {
+				const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(targetAccountId)}/ai/run/@cf/google/embeddinggemma-300m`, {
 					method: 'POST',
 					headers: browserHeaders(targetApiToken),
 					body: JSON.stringify({ text: ['test'] }),
@@ -3004,7 +3006,9 @@ async function handleDashboardApi(request, env, ctx) {
 	if (url.pathname === '/api/keys') {
 		if (method === 'GET') {
 			const keys = await getApiKeys(env);
-			return new Response(JSON.stringify(keys), { headers: { 'Content-Type': 'application/json' } });
+			// P3-7: 返回掩码 key 避免明文回传前端（与 src/index.js 同步）
+			const masked = keys.map(k => ({ ...k, key: maskTokenKey(k.key) }));
+			return new Response(JSON.stringify(masked), { headers: { 'Content-Type': 'application/json' } });
 		}
 
 		if (method === 'POST') {
@@ -3066,7 +3070,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 		const account = activeAccounts[0];
 		try {
-			const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/models/search`, {
+			const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(account.accountId)}/ai/models/search`, {
 				headers: browserHeaders(account.apiToken),
 				signal: AbortSignal.timeout(15000),
 			});
@@ -4203,7 +4207,7 @@ async function handleLandingPage(request, env, ctx) {
 async function handleAdminPage(request, env, ctx) {
 	// 生成 CSRF Token：同时写入 cookie（JS 可读）和 meta 标签，前端请求时通过 X-CSRF-Token 头回传
 	const csrfToken = await sha256(env.ADMIN_PASSWORD + '_csrf_v1');
-	const csrfCookie = `csrf_token=${csrfToken}; Path=/; SameSite=Strict; Secure; Max-Age=86400`;
+	const csrfCookie = `csrf_token=${csrfToken}; Path=/; SameSite=Strict; Secure; HttpOnly; Max-Age=86400`;
 
 	const html = `<!DOCTYPE html>
 <head>
