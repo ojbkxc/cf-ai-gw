@@ -5,8 +5,17 @@
 #   模式 A（推荐，规避检查）：main = "src/index.js"  → Dashboard 需添加 AI Binding
 #   模式 B（多账号 failover）：main = "_worker.js"    → Dashboard 无需 AI Binding
 #
-# KV 绑定、环境变量、AI Binding 均在 Cloudflare Dashboard 中配置。
+# 默认采用模式 A（Worker + AI Binding，单账号首选）。
 
 name = "cf-ai-gw"
-main = "_worker.js"
+main = "src/index.js"
 compatibility_date = "2025-08-01"
+
+# KV 绑定：存储配置、API Key、用量统计等
+[[kv_namespaces]]
+binding = "KV"
+id = "f2d6dfb3f9034d4b86c46740f813c634"
+
+# Workers AI 绑定（模式 A：单账号，内部 RPC 调用）
+[ai]
+binding = "AI"

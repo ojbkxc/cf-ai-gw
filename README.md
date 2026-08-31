@@ -9,7 +9,10 @@
 | **模式 A：Worker + AI Binding** | `src/index.js` | `env.AI.run()` 内部 RPC | 单账号 | ⭐⭐⭐ 最佳 |
 | **模式 B：Worker + REST API** | `_worker.js` | `fetch()` 公网 REST | 多账号 failover | ⭐⭐ 良好 |
 
-## 快速部署（推荐）
+## 快速部署（推荐：模式 A — Worker + AI Binding）
+
+> 推荐使用 **模式 A（Worker + AI Binding，入口 `src/index.js`）**：单账号、内部 RPC 调用 Workers AI，无需 API Token，风控规避最佳。
+> 模式 B（`_worker.js`，多账号 failover）和 Pages 高级模式（同模式 B 代码）作为备选，见文末「备选部署模式」。
 
 ### 1. 创建 Worker 项目
 
@@ -53,10 +56,10 @@ curl https://cf-ai-gw.YOUR_SUBDOMAIN.workers.dev/v1/chat/completions \
 
 ## 切换模式
 
-编辑 `wrangler.toml` 修改 `main` 字段后推送即可：
+编辑 `wrangler.toml` 修改 `main` 字段后推送即可（默认为模式 A）：
 
 ```toml
-# 模式 A：Worker + AI Binding（需在 Dashboard 添加 AI Binding）
+# 模式 A（默认，推荐）：Worker + AI Binding（需在 Dashboard 添加 AI Binding）
 main = "src/index.js"
 
 # 模式 B：Worker + REST API（多账号 failover）
@@ -75,6 +78,32 @@ main = "_worker.js"
 | 用量查询 | 无需 | 调 GraphQL 拉取 Neurons |
 | 模型列表 | 仅 `@cf/` 开头，按 token 降序 | 全部映射模型，按 token 降序 |
 | 安全增强 | 熔断器 + 断供闩 + 过大闸 | 多账号 failover + 可恢复流 |
+
+## 备选部署模式
+
+### 模式 B：Worker + REST API（多账号 failover）
+
+入口文件改为 `_worker.js`，Dashboard 无需 AI Binding，在管理面板「账号管理」添加多个 Cloudflare 账号（Account ID + API Token），自动负载均衡与故障切换。适合需要多账号分流或不想绑定 AI Binding 的场景。
+
+```toml
+# wrangler.toml
+main = "_worker.js"
+```
+
+### Pages 高级模式（Advanced Mode）
+
+将 `_worker.js` 放在 Pages 项目部署目录根下，Pages 会把它作为 Worker 执行，行为等同于模式 B（不绑 AI Binding、走 REST API）。适合希望用 Pages 托管、或通过 `wrangler pages deploy` 直接上传构建产物的场景。
+
+```bash
+# 创建 Pages 项目
+npx wrangler pages project create cf-ai-gw --production-branch main
+
+# 部署：把 _worker.js 放进部署目录根下
+mkdir -p dist-pages && cp _worker.js dist-pages/
+npx wrangler pages deploy dist-pages --project-name cf-ai-gw --branch main
+```
+
+> **注意**：Pages 高级模式同样需要在 Pages 项目 Settings → Bindings 里绑定 KV（Variable name 填 `KV`）；Pages 不支持 Workers AI Binding，所以只能走模式 B 的 REST API 路径。
 
 ## API 端点
 
@@ -137,8 +166,8 @@ main = "_worker.js"
 |--------|----------------|--------|
 | `deepseek-v4-pro-0813` | `@cf/deepseek-ai/deepseek-v4-pro-0813` | 1,048,576 |
 | `deepseek-v4-flash-0731` | `@cf/deepseek-ai/deepseek-v4-flash-0731` | 1,310,720 |
-| `glm-5.3` | `@cf/zai-org/glm-5.3` | 1,048,576 |
-| `glm-5.3-flash` | `@cf/zai-org/glm-5.3-flash` | 1,048,576 |
+| `glm-5.3` | `@cf/zai-org/glm-5.3` | 1,310,720 |
+| `glm-5.3-flash` | `@cf/zai-org/glm-5.3-flash` | 1,310,720 |
 | `glm-5.2` | `@cf/zai-org/glm-5.2` | 262,144 |
 | `kimi-k2.7-code` | `@cf/moonshotai/kimi-k2.7-code` | 262,144 |
 | `kimi-k2.6` | `@cf/moonshotai/kimi-k2.6` | 262,144 |

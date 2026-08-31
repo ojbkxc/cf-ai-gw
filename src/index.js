@@ -172,8 +172,8 @@ const DEFAULT_MODEL_MAP = {
 const DEFAULT_MODEL_TOKENS = {
 	'@cf/deepseek-ai/deepseek-v4-pro-0813': 1048576,
 	'@cf/deepseek-ai/deepseek-v4-flash-0731': 1310720,
-	'@cf/zai-org/glm-5.3': 1048576,
-	'@cf/zai-org/glm-5.3-flash': 1048576,
+	'@cf/zai-org/glm-5.3': 1310720,
+	'@cf/zai-org/glm-5.3-flash': 1310720,
 	'@cf/zai-org/glm-5.2': 262144,
 	'@cf/zai-org/glm-4.7-flash': 131072,
 	'@cf/moonshotai/kimi-k2.6': 262144,
@@ -5188,7 +5188,7 @@ async function handleAdminPage(request, env, ctx) {
 					</td>
 					<td>\${dateStr}</td>
 					<td>
-						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey(${attrEscape(k.id)})">删除</button>
+						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey(\${attrEscape(k.id)})">删除</button>
 					</td>
 				\`;
 			}, (hasData) => {
