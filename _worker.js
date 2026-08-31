@@ -419,7 +419,7 @@ const DEFAULT_MODEL_MAP = {
 	// 多模态模型
 	'llava-1.5-7b': '@cf/llava-hf/llava-1.5-7b-hf',
 	'flux-1-schnell': '@cf/black-forest-labs/flux-1-schnell',
-	'flux': '@cf/deepgram/flux',
+	'flux': '@cf/black-forest-labs/flux-1-schnell',
 	'sdxl': '@cf/stabilityai/stable-diffusion-xl-base-1.0',
 
 	// 语音识别（Whisper）模型
@@ -436,7 +436,7 @@ const DEFAULT_MODEL_MAP = {
 	'bge-reranker-base': '@cf/baai/bge-reranker-base',
 
 	// 文本转语音（TTS）模型
-	'tts': '@cf/myshell-ai/tts',
+	'tts': '@cf/deepgram/aura-2-en',
 	'aura-2-en': '@cf/deepgram/aura-2-en'
 };
 
@@ -2271,53 +2271,63 @@ async function handleImageGenerations(request, env, ctx) {
 		}
 	}
 
+	// flux 系列 REST 返回 JSON {result:{image: base64}}；sdxl 等模型返回二进制图片流（json() 会抛错），
+	// 统一用 rawResponse 拿原始 Response 再按 Content-Type 分流
 	const result = await callCFRunAPI(
 		cfModel,
 		(account) => {
-			const cfPayload = { prompt, width, height };
-			if (cfModel.includes('flux')) cfPayload.num_steps = 4;
+			// flux 系列 schema 仅接受 prompt（多传 width/height/num_steps 会 400 Additional properties not allowed）
+			const cfPayload = cfModel.includes('flux') ? { prompt } : { prompt, width, height };
 			return {
 				method: 'POST',
 				headers: browserHeaders(account.apiToken),
 				body: JSON.stringify(cfPayload),
 			};
 		},
-		(cfResult) => {
-			const rawImage = cfResult.image || cfResult;
-			let base64Str;
-			if (typeof rawImage === 'string') {
-				base64Str = rawImage;
-			} else {
-				// 分块编码避免 String.fromCharCode 参数数量溢出（大图片 >64KB）
-				const bytes = new Uint8Array(rawImage);
-				let binary = '';
-				const chunkSize = 8192;
-				for (let i = 0; i < bytes.length; i += chunkSize) {
-					binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-				}
-				base64Str = btoa(binary);
-			}
-			return {
-				created: Math.floor(Date.now() / 1000),
-				data: [{
-					[response_format === 'b64_json' ? 'b64_json' : 'url']:
-						response_format === 'b64_json' ? base64Str : `data:image/png;base64,${base64Str}`
-				}],
-			};
-		},
+		null,
 		env,
+		{ rawResponse: true },
 	);
 
 	if (!result.success) {
 		return jsonError(result.error, result.status, "server_error");
 	}
 
+	const cfResponse = result.data;
+	let base64Str;
+	const cfContentType = cfResponse.headers.get('Content-Type') || '';
+	if (cfContentType.includes('json')) {
+		const cfJson = await cfResponse.json();
+		const rawImage = cfJson?.result?.image ?? cfJson?.image ?? '';
+		if (typeof rawImage !== 'string' || !rawImage) {
+			return jsonError("Unexpected image response format", 502, "server_error");
+		}
+		base64Str = rawImage;
+	} else {
+		// 分块编码避免 String.fromCharCode 参数数量溢出（大图片 >64KB）
+		const bytes = new Uint8Array(await cfResponse.arrayBuffer());
+		let binary = '';
+		const chunkSize = 8192;
+		for (let i = 0; i < bytes.length; i += chunkSize) {
+			binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+		}
+		base64Str = btoa(binary);
+	}
+
+	const responseData = {
+		created: Math.floor(Date.now() / 1000),
+		data: [{
+			[response_format === 'b64_json' ? 'b64_json' : 'url']:
+				response_format === 'b64_json' ? base64Str : `data:image/png;base64,${base64Str}`
+		}],
+	};
+
 	const imgHeaders = { 'Content-Type': 'application/json' };
 	if (fallbackWarning) imgHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
 	if (ctx && prompt) {
 		accumulateTokens(env, ctx, { input: Math.ceil(prompt.length / 3), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0 });
 	}
-	return new Response(JSON.stringify(result.data), { headers: imgHeaders });
+	return new Response(JSON.stringify(responseData), { headers: imgHeaders });
 }
 
 // 音频转录 /v1/audio/transcriptions
@@ -2402,10 +2412,8 @@ async function handleAudioSpeech(request, env, ctx) {
 	const { cfModel, isFallback } = await resolveModelName(model || 'tts', env);
 	const fallbackWarning = isFallback ? `Model "${model || 'tts'}" not found in mapping, fell back to ${cfModel}` : null;
 
-	const cfPayload = { prompt: input };
-	if (voice) cfPayload.voice = voice;
-	if (body.response_format) cfPayload.response_format = body.response_format;
-	if (body.speed !== undefined) cfPayload.speed = body.speed;
+	// aura-2 的输入字段是 text 且 schema 严格（透传 OpenAI 的 voice/speed 等字段会 400）
+	const cfPayload = cfModel.includes('aura') ? { text: input } : { prompt: input };
 
 	const result = await callCFRunAPI(
 		cfModel,

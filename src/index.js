@@ -147,7 +147,7 @@ const DEFAULT_MODEL_MAP = {
 	// 多模态模型
 	'llava-1.5-7b': '@cf/llava-hf/llava-1.5-7b-hf',
 	'flux-1-schnell': '@cf/black-forest-labs/flux-1-schnell',
-	'flux': '@cf/deepgram/flux',
+	'flux': '@cf/black-forest-labs/flux-1-schnell',
 	'sdxl': '@cf/stabilityai/stable-diffusion-xl-base-1.0',
 
 	// 语音识别（Whisper）模型
@@ -164,7 +164,7 @@ const DEFAULT_MODEL_MAP = {
 	'bge-reranker-base': '@cf/baai/bge-reranker-base',
 
 	// 文本转语音（TTS）模型
-	'tts': '@cf/myshell-ai/tts',
+	'tts': '@cf/deepgram/aura-2-en',
 	'aura-2-en': '@cf/deepgram/aura-2-en'
 };
 
@@ -1794,13 +1794,20 @@ async function handleImageGenerations(request, env, ctx) {
 	}
 
 	try {
-		const cfPayload = { prompt, width, height };
-		if (cfModel.includes('flux')) cfPayload.num_steps = 4;
+		// flux 系列 schema 仅接受 prompt（多传 width/height/num_steps 会 400 Additional properties not allowed）
+		const cfPayload = cfModel.includes('flux') ? { prompt } : { prompt, width, height };
 
 		const result = await env.AI.run(cfModel, cfPayload, { signal: AbortSignal.timeout(120000) });
 
-		// AI Binding 返回格式: { image: "base64string" } 或直接是 base64 字符串
-		let rawImage = result.image || result;
+		// AI Binding 返回格式: flux 系列 JSON { image: "base64string" }；sdxl 等二进制模型返回 ReadableStream（官方文档）
+		let rawImage;
+		if (result instanceof Response) {
+			rawImage = new Uint8Array(await result.arrayBuffer());
+		} else if (result instanceof ReadableStream) {
+			rawImage = new Uint8Array(await new Response(result).arrayBuffer());
+		} else {
+			rawImage = result.image || result;
+		}
 		let base64Str;
 		if (typeof rawImage === 'string') {
 			base64Str = rawImage;
@@ -1823,6 +1830,7 @@ async function handleImageGenerations(request, env, ctx) {
 		};
 
 		const imgHeaders = { 'Content-Type': 'application/json' };
+
 		if (fallbackWarning) imgHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
 		if (ctx && prompt) {
 			accumulateTokens(env, ctx, { input: Math.ceil(prompt.length / 3), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0 });
@@ -1845,7 +1853,8 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 	// 流式检查请求体实际大小，避免 Content-Length 绕过
 	// （chunked transfer-encoding 时 Content-Length 头缺失，parseInt('0')=0 绕过上限检查）
 	// 不依赖 Content-Length 头，用 ReadableStream 累计实际字节数
-	const MAX_AUDIO_SIZE = 25 * 1024 * 1024; // 25MB（降低上限避免大文件耗推理配额）
+	// 上限 8MB：Binding 需要 [...audioUint8] 数组展开，8MB→800万元素≈64MB内存；25MB 会超出 Workers 128MB 限制
+	const MAX_AUDIO_SIZE = 8 * 1024 * 1024; // 8MB
 	{
 		const sizeReader = request.clone().body.getReader();
 		let totalBytes = 0;
@@ -1854,10 +1863,10 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 				const { done, value } = await sizeReader.read();
 				if (done) break;
 				totalBytes += value.length;
-				if (totalBytes > MAX_AUDIO_SIZE) {
-					await sizeReader.cancel();
-					return jsonError("File size exceeds 25MB limit", 413, "invalid_request_error");
-				}
+			if (totalBytes > MAX_AUDIO_SIZE) {
+				await sizeReader.cancel();
+				return jsonError("File size exceeds 8MB limit", 413, "invalid_request_error");
+			}
 			}
 		} finally {
 			sizeReader.releaseLock();
@@ -1886,12 +1895,13 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 
 		// 二次校验实际音频大小（防御性，确保单文件不超限）
 		if (audioUint8.length > MAX_AUDIO_SIZE) {
-			return jsonError("File size exceeds 25MB limit", 413, "invalid_request_error");
+			return jsonError("File size exceeds 8MB limit", 413, "invalid_request_error");
 		}
 
-		// AI Binding 的 Whisper 接受 { audio: Uint8Array } 格式，translations 加 task 参数
-		// 直接传 Uint8Array，避免 [...audioUint8] 展开为 ~1 亿元素 JS 数组导致内存放大 8 倍+ OOM
-		const whisperInput = { audio: audioUint8 };
+		// AI Binding 的 Whisper 要求 { audio: [...字节数组展开] }：传 Uint8Array 会报「未识别的上游错误」
+		// （REST 实测：二进制 body 直传与 multipart 可用，JSON int 数组不可用；Binding 内部将数组编码为二进制流）
+		// translations 加 task 参数
+		const whisperInput = { audio: [...audioUint8] };
 		if (isTranslation) whisperInput.task = 'translate';
 		const result = await env.AI.run(actualCfModel, whisperInput, { signal: AbortSignal.timeout(120000) });
 
@@ -1924,10 +1934,8 @@ async function handleAudioSpeech(request, env, ctx) {
 	const { cfModel, isFallback, tokens } = await resolveModelName(model || 'tts', env);
 	const fallbackWarning = isFallback ? `Model "${model || 'tts'}" not found in mapping, fell back to ${cfModel}` : null;
 
-	const cfPayload = { prompt: input };
-	if (voice) cfPayload.voice = voice;
-	if (body.response_format) cfPayload.response_format = body.response_format;
-	if (body.speed !== undefined) cfPayload.speed = body.speed;
+	// aura-2 的输入字段是 text 且 schema 严格（透传 OpenAI 的 voice/speed 等字段会 400）
+	const cfPayload = cfModel.includes('aura') ? { text: input } : { prompt: input };
 
 	try {
 		const resp = await env.AI.run(cfModel, cfPayload, { returnRawResponse: true, signal: AbortSignal.timeout(600000) });
