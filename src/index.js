@@ -771,21 +771,8 @@ function normalizeBindingResult(result, cfModel) {
 			usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
 		};
 	}
-	// 兜底：构造空 choices 的 OpenAI 格式，避免原样返回非 OpenAI 格式导致客户端解析失败
-	// 处理纯 {usage} 或其他未知格式
-	const fallbackContent = typeof result === 'string' ? result : (result && typeof result === 'object' ? JSON.stringify(result) : String(result || ''));
-	return {
-		id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '')}`,
-		object: 'chat.completion',
-		created: Math.floor(Date.now() / 1000),
-		model: cfModel,
-		choices: [{
-			index: 0,
-			message: { role: 'assistant', content: fallbackContent },
-			finish_reason: 'stop'
-		}],
-		usage: (result && typeof result === 'object' && result.usage) || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-	};
+	// 兜底：原样返回（可能是字符串或其他未知格式）
+	return result;
 }
 
 async function callBindingChat(cfModel, cfPayload, env, stream) {
@@ -1502,22 +1489,11 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 						object: 'chat.completion.chunk',
 						created: chunk.created || Math.floor(Date.now() / 1000),
 						model: modelName,
-						choices: [{ index: 0, delta: { content: typeof chunk.response === 'string' ? chunk.response : JSON.stringify(chunk.response) }, finish_reason: null }]
+						choices: [{ index: 0, delta: { content: chunk.response }, finish_reason: null }]
 					};
 					if (originalUsage) chunk.usage = originalUsage;
 				}
-				// P2-2: 处理含 usage 但无 choices/response 的尾块（CF 流式最后一个 chunk 可能是 {usage: {...}}）
-				// 构造 OpenAI 格式尾块，保留上游真实 finish_reason（如 'length'、'tool_calls'），避免被 ensureFinishReason 覆盖为 'stop'
-				else if (!chunk.choices && chunk.usage !== undefined) {
-					chunk = {
-						id: chunk.id || `chatcmpl-${crypto.randomUUID()}`,
-						object: 'chat.completion.chunk',
-						created: chunk.created || Math.floor(Date.now() / 1000),
-						model: modelName,
-						choices: [{ index: 0, delta: {}, finish_reason: chunk.finish_reason || 'stop' }],
-						usage: chunk.usage
-					};
-				}
+
 					const choice = chunk.choices?.[0];
 					if (!choice) continue;
 
@@ -2159,22 +2135,11 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 						object: 'chat.completion.chunk',
 						created: chunk.created || Math.floor(Date.now() / 1000),
 						model: modelName,
-						choices: [{ index: 0, delta: { content: typeof chunk.response === 'string' ? chunk.response : JSON.stringify(chunk.response) }, finish_reason: null }]
+						choices: [{ index: 0, delta: { content: chunk.response }, finish_reason: null }]
 					};
 					if (originalUsage) chunk.usage = originalUsage;
 				}
-				// P2-2: 处理含 usage 但无 choices/response 的尾块（CF 流式最后一个 chunk 可能是 {usage: {...}}）
-				// 构造 OpenAI 格式尾块，保留上游真实 finish_reason（如 'length'、'tool_calls'），避免被 ensureFinishReason 覆盖为 'stop'
-				else if (!chunk.choices && chunk.usage !== undefined) {
-					chunk = {
-						id: chunk.id || `chatcmpl-${crypto.randomUUID()}`,
-						object: 'chat.completion.chunk',
-						created: chunk.created || Math.floor(Date.now() / 1000),
-						model: modelName,
-						choices: [{ index: 0, delta: {}, finish_reason: chunk.finish_reason || 'stop' }],
-						usage: chunk.usage
-					};
-				}
+
 					if (chunk.choices && chunk.choices.some(c => c.finish_reason != null)) sawFinishReason = true;
 					if (chunk.id !== undefined) lastChunkId = chunk.id;
 					if (chunk.created !== undefined) lastChunkCreated = chunk.created;
@@ -2304,7 +2269,7 @@ async function handleDashboardApi(request, env, ctx) {
 		const csrfCookieMatch = cookies.match(/csrf_token=([^;]+)/);
 		const csrfCookie = csrfCookieMatch ? csrfCookieMatch[1] : null;
 		const csrfHeader = request.headers.get('X-CSRF-Token');
-		if (!csrfCookie || !csrfHeader || !timingSafeEqual(csrfCookie, csrfHeader)) {
+		if (!csrfCookie || !csrfHeader || csrfCookie !== csrfHeader) {
 			return new Response(JSON.stringify({ error: 'CSRF token validation failed. Please refresh the page.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
 		}
 	}
@@ -2382,9 +2347,7 @@ async function handleDashboardApi(request, env, ctx) {
 	if (url.pathname === '/api/keys') {
 		if (method === 'GET') {
 			const keys = await getApiKeys(env);
-			// P3-7: 返回掩码 key 避免明文回传前端（已有 XSS 防护，但仍加固）
-			const masked = keys.map(k => ({ ...k, key: maskTokenKey(k.key) }));
-			return new Response(JSON.stringify(masked), { headers: { 'Content-Type': 'application/json' } });
+			return new Response(JSON.stringify(keys), { headers: { 'Content-Type': 'application/json' } });
 		}
 
 		if (method === 'POST') {
@@ -3583,7 +3546,7 @@ async function handleLandingPage(request, env, ctx) {
 async function handleAdminPage(request, env, ctx) {
 	// 生成 CSRF Token：同时写入 cookie（JS 可读）和 meta 标签，前端请求时通过 X-CSRF-Token 头回传
 	const csrfToken = await sha256(env.ADMIN_PASSWORD + '_csrf_v1');
-	const csrfCookie = `csrf_token=${csrfToken}; Path=/; SameSite=Strict; Secure; HttpOnly; Max-Age=86400`;
+	const csrfCookie = `csrf_token=${csrfToken}; Path=/; SameSite=Strict; Secure; Max-Age=86400`;
 
 	const html = `<!DOCTYPE html>
 <head>

@@ -2756,7 +2756,7 @@ async function handleDashboardApi(request, env, ctx) {
 		const csrfCookieMatch = cookies.match(/csrf_token=([^;]+)/);
 		const csrfCookie = csrfCookieMatch ? csrfCookieMatch[1] : null;
 		const csrfHeader = request.headers.get('X-CSRF-Token');
-		if (!csrfCookie || !csrfHeader || !timingSafeEqual(csrfCookie, csrfHeader)) {
+		if (!csrfCookie || !csrfHeader || csrfCookie !== csrfHeader) {
 			return new Response(JSON.stringify({ error: 'CSRF token validation failed. Please refresh the page.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
 		}
 	}
@@ -3006,9 +3006,7 @@ async function handleDashboardApi(request, env, ctx) {
 	if (url.pathname === '/api/keys') {
 		if (method === 'GET') {
 			const keys = await getApiKeys(env);
-			// P3-7: 返回掩码 key 避免明文回传前端（与 src/index.js 同步）
-			const masked = keys.map(k => ({ ...k, key: maskTokenKey(k.key) }));
-			return new Response(JSON.stringify(masked), { headers: { 'Content-Type': 'application/json' } });
+			return new Response(JSON.stringify(keys), { headers: { 'Content-Type': 'application/json' } });
 		}
 
 		if (method === 'POST') {
@@ -4207,7 +4205,7 @@ async function handleLandingPage(request, env, ctx) {
 async function handleAdminPage(request, env, ctx) {
 	// 生成 CSRF Token：同时写入 cookie（JS 可读）和 meta 标签，前端请求时通过 X-CSRF-Token 头回传
 	const csrfToken = await sha256(env.ADMIN_PASSWORD + '_csrf_v1');
-	const csrfCookie = `csrf_token=${csrfToken}; Path=/; SameSite=Strict; Secure; HttpOnly; Max-Age=86400`;
+	const csrfCookie = `csrf_token=${csrfToken}; Path=/; SameSite=Strict; Secure; Max-Age=86400`;
 
 	const html = `<!DOCTYPE html>
 <head>
