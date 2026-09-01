@@ -1161,7 +1161,7 @@ async function handleV1Proxy(request, env, ctx) {
 	const url = new URL(request.url);
 
 	if (!await checkProxyAuth(request, env)) {
-		if (url.pathname === '/v1/messages') {
+		if (url.pathname === '/v1/messages' || url.pathname === '/v1/messages/count_tokens') {
 			return new Response(JSON.stringify({
 				type: 'error',
 				error: {
@@ -1177,7 +1177,7 @@ async function handleV1Proxy(request, env, ctx) {
 	if (!limitCheck.allowed) {
 		const msg = `Request blocked: ${limitCheck.reason}. Please check your usage dashboard.`;
 
-		if (url.pathname === '/v1/messages') {
+		if (url.pathname === '/v1/messages' || url.pathname === '/v1/messages/count_tokens') {
 			return new Response(JSON.stringify({
 				type: 'error',
 				error: { type: 'quota_exceeded', message: msg }
@@ -1458,6 +1458,9 @@ async function handleCompletions(request, env, ctx, pathname) {
 
 	const { cfModel, isFallback, tokens } = await resolveModelName(model, env);
 	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	if (isFallback && model && (env.STRICT_MODEL_MATCH || '').toLowerCase() === 'true') {
+		return jsonError(`Model '${model}' not found`, 404, "invalid_request_error", "model_not_found");
+	}
 
 	const cfPayload = {
 		model: cfModel,
@@ -1709,7 +1712,7 @@ function convertAnthropicToOpenAI(anthropicBody) {
 }
 
 // OpenAI Chat Completion 响应 → Anthropic Messages 格式转换
-function convertOpenAIToAnthropic(openaiResponse, originalModel) {
+function convertOpenAIToAnthropic(openaiResponse, originalModel, stopSequences) {
 	const choice = openaiResponse.choices?.[0] || {};
 	const message = choice.message || {};
 
@@ -1767,7 +1770,19 @@ function convertOpenAIToAnthropic(openaiResponse, originalModel) {
 	// finish_reason → stop_reason 映射
 	const finishReason = choice.finish_reason;
 	if (finishReason === 'stop') {
-		anthropicResponse.stop_reason = 'end_turn';
+		// OpenAI finish_reason='stop' 不区分自然结束/命中停词；检查 content 结尾推断 stop_sequence
+		let hitStop = null;
+		if (Array.isArray(stopSequences) && typeof message.content === 'string') {
+			for (const s of stopSequences) {
+				if (s && message.content.endsWith(s)) { hitStop = s; break; }
+			}
+		}
+		if (hitStop !== null) {
+			anthropicResponse.stop_reason = 'stop_sequence';
+			anthropicResponse.stop_sequence = hitStop;
+		} else {
+			anthropicResponse.stop_reason = 'end_turn';
+		}
 	} else if (finishReason === 'tool_calls') {
 		anthropicResponse.stop_reason = 'tool_use';
 	} else if (finishReason === 'length') {
@@ -1804,6 +1819,9 @@ async function handleMessages(request, env, ctx) {
 	const model = anthropicBody.model;
 	const { cfModel, isFallback, tokens } = await resolveModelName(model, env);
 	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	if (isFallback && model && (env.STRICT_MODEL_MATCH || '').toLowerCase() === 'true') {
+		return anthropicError(`Model '${model}' not found`, 404);
+	}
 
 	const openaiBody = convertAnthropicToOpenAI(anthropicBody);
 	openaiBody.model = cfModel;
@@ -1853,7 +1871,7 @@ async function handleMessages(request, env, ctx) {
 	}
 	const openaiResponse = result.data;
 	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime);
-	return jsonResponse(convertOpenAIToAnthropic(openaiResponse, model), fallbackWarning);
+	return jsonResponse(convertOpenAIToAnthropic(openaiResponse, model, anthropicBody.stop_sequences), fallbackWarning);
 }
 
 // Anthropic SSE 流式转换：OpenAI SSE → Anthropic SSE
@@ -2327,7 +2345,7 @@ function convertResponsesToOpenAI(responsesBody) {
 }
 
 // ===== OpenAI Chat Completion 响应 → Responses 格式转换 =====
-function convertOpenAIToResponses(openaiResponse, originalModel) {
+function convertOpenAIToResponses(openaiResponse, originalModel, requestData) {
 	const choice = openaiResponse.choices?.[0] || {};
 	const message = choice.message || {};
 	const usage = openaiResponse.usage || {};
@@ -2387,12 +2405,12 @@ function convertOpenAIToResponses(openaiResponse, originalModel) {
 		},
 		error: null,
 		incomplete_details: incomplete ? { reason: 'max_output_tokens' } : null,
-		instructions: null,
-		parallel_tool_calls: null,
-		temperature: null,
-		top_p: null,
-		tool_choice: null,
-		tools: null
+		instructions: requestData?.instructions ?? null,
+		parallel_tool_calls: requestData?.parallel_tool_calls ?? null,
+		temperature: requestData?.temperature ?? null,
+		top_p: requestData?.top_p ?? null,
+		tool_choice: requestData?.tool_choice ?? null,
+		tools: requestData?.tools ?? null
 	};
 }
 
@@ -2409,6 +2427,9 @@ async function handleResponses(request, env, ctx) {
 	const model = responsesBody.model;
 	const { cfModel, isFallback, tokens } = await resolveModelName(model, env);
 	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	if (isFallback && model && (env.STRICT_MODEL_MATCH || '').toLowerCase() === 'true') {
+		return jsonError(`Model '${model}' not found`, 404, "invalid_request_error", "model_not_found");
+	}
 
 	const openaiBody = convertResponsesToOpenAI(responsesBody);
 	openaiBody.model = cfModel;
@@ -2442,7 +2463,14 @@ async function handleResponses(request, env, ctx) {
 	}
 	const openaiResponse = result.data;
 	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime);
-	return jsonResponse(convertOpenAIToResponses(openaiResponse, model), fallbackWarning);
+	return jsonResponse(convertOpenAIToResponses(openaiResponse, model, {
+		instructions: responsesBody.instructions,
+		parallel_tool_calls: responsesBody.parallel_tool_calls,
+		temperature: responsesBody.temperature,
+		top_p: responsesBody.top_p,
+		tool_choice: responsesBody.tool_choice,
+		tools: responsesBody.tools
+	}), fallbackWarning);
 }
 
 // ===== Responses SSE 流式转换：OpenAI Chat SSE → Responses SSE =====
@@ -3365,6 +3393,14 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 							}
 						}
 					}
+					// 清理 CF 非标准字段，避免污染 OpenAI 兼容客户端
+					if (chunk.p !== undefined) delete chunk.p;
+					if (chunk.matched_stop !== undefined) delete chunk.matched_stop;
+					if (Array.isArray(chunk.choices)) {
+						for (const c of chunk.choices) {
+							if (c.matched_stop !== undefined) delete c.matched_stop;
+						}
+					}
 					controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
 				} catch (_) {
 					controller.enqueue(encoder.encode(`${line}\n`));
@@ -3379,7 +3415,8 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 
 async function safeJsonBody(request) {
 	const ct = request.headers.get('Content-Type') || '';
-	if (!ct.includes('application/json') && !ct.includes('text/plain')) return null;
+	// 空 Content-Type 放行（CF request.json() 不要求该头）；仅拒绝明确的非 JSON 类型（如 multipart）
+	if (ct && !ct.includes('application/json') && !ct.includes('text/plain')) return null;
 	try { return await request.json(); } catch { return null; }
 }
 
