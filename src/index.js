@@ -1308,6 +1308,10 @@ function convertOpenAIToAnthropic(openaiResponse, originalModel, stopSequences) 
 			for (const s of stopSequences) {
 				if (s && message.content.endsWith(s)) { hitStop = s; break; }
 			}
+			// 未匹配到但只传了单个 stop_sequence：CF Workers AI 截断 stop 串（不含在 content 中），合理判定命中
+			if (hitStop === null && stopSequences.length === 1 && stopSequences[0]) {
+				hitStop = stopSequences[0];
+			}
 		}
 		if (hitStop !== null) {
 			anthropicResponse.stop_reason = 'stop_sequence';
