@@ -1242,6 +1242,10 @@ async function handleV1Proxy(request, env, ctx) {
 		return handleMessages(request, env, ctx);
 	}
 
+	if (url.pathname === '/v1/responses' && request.method === 'POST') {
+		return handleResponses(request, env, ctx);
+	}
+
 	if (url.pathname === '/v1/embeddings' && request.method === 'POST') {
 		return handleEmbeddings(request, env, ctx);
 	}
@@ -1272,6 +1276,7 @@ async function handleV1Proxy(request, env, ctx) {
 		'/v1/chat/completions': ['POST'],
 		'/v1/completions': ['POST'],
 		'/v1/messages': ['POST'],
+		'/v1/responses': ['POST'],
 		'/v1/embeddings': ['POST'],
 		'/v1/images/generations': ['POST'],
 		'/v1/audio/transcriptions': ['POST'],
@@ -2191,6 +2196,719 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
 			});
 		}
+	}
+}
+
+// ===== OpenAI Responses API（/v1/responses）→ Chat Completions 格式转换 =====
+// 新版 codex-cli 只支持 Responses 协议（wire_api = "responses"），
+// 网关把 Responses 请求转成 Chat Completions 调上游，再把响应转回 Responses
+function convertResponsesToOpenAI(responsesBody) {
+	const openaiBody = {};
+
+	if (responsesBody.max_output_tokens !== undefined) openaiBody.max_tokens = responsesBody.max_output_tokens;
+	if (responsesBody.temperature !== undefined) openaiBody.temperature = responsesBody.temperature;
+	if (responsesBody.top_p !== undefined) openaiBody.top_p = responsesBody.top_p;
+	if (responsesBody.stop !== undefined) openaiBody.stop = responsesBody.stop;
+	if (responsesBody.stream !== undefined) openaiBody.stream = responsesBody.stream;
+	if (responsesBody.parallel_tool_calls !== undefined) openaiBody.parallel_tool_calls = responsesBody.parallel_tool_calls;
+
+	// reasoning.effort（low/medium/high）→ chat 的 reasoning_effort
+	if (responsesBody.reasoning?.effort) openaiBody.reasoning_effort = responsesBody.reasoning.effort;
+
+	// text.format 的 json_schema（结构化输出）→ response_format，其余 text 配置忽略
+	const textFormat = responsesBody.text?.format;
+	if (textFormat?.type === 'json_schema' && textFormat.schema) {
+		const jsonSchema = {
+			name: textFormat.name || 'response',
+			schema: textFormat.schema
+		};
+		if (textFormat.strict !== undefined) jsonSchema.strict = textFormat.strict;
+		openaiBody.response_format = { type: 'json_schema', json_schema: jsonSchema };
+	}
+
+	// tool_choice：字符串透传；对象形式 {type:'function',name} → 嵌套 {type:'function',function:{name}}
+	if (responsesBody.tool_choice !== undefined) {
+		const tc = responsesBody.tool_choice;
+		if (typeof tc === 'string') {
+			openaiBody.tool_choice = tc;
+		} else if (tc && tc.type === 'function' && tc.name) {
+			openaiBody.tool_choice = { type: 'function', function: { name: tc.name } };
+		} else {
+			openaiBody.tool_choice = tc;
+		}
+	}
+
+	const openaiMessages = [];
+
+	// instructions（系统提示词）→ 开头的 system 消息
+	if (typeof responsesBody.instructions === 'string' && responsesBody.instructions) {
+		openaiMessages.push({ role: 'system', content: responsesBody.instructions });
+	}
+
+	// input：字符串 → 单条 user 消息；数组 → 逐 item 转换
+	if (typeof responsesBody.input === 'string') {
+		openaiMessages.push({ role: 'user', content: responsesBody.input });
+	} else if (Array.isArray(responsesBody.input)) {
+		for (const item of responsesBody.input) {
+			if (!item || typeof item !== 'object') continue;
+
+			if (item.type === 'message') {
+				// content: [{type:'input_text'|'output_text', text}] → 文本拼接为字符串（input_image 暂不支持，拼占位符）
+				const role = item.role === 'assistant' ? 'assistant' : 'user';
+				let textContent = '';
+				if (typeof item.content === 'string') {
+					textContent = item.content;
+				} else if (Array.isArray(item.content)) {
+					for (const part of item.content) {
+						if ((part.type === 'input_text' || part.type === 'output_text' || part.type === 'text') && part.text) {
+							textContent += part.text;
+						} else if (part.type === 'input_image') {
+							textContent += '[to be added]';
+						}
+					}
+				}
+				openaiMessages.push({ role, content: textContent });
+			} else if (item.type === 'function_call') {
+				// chat 协议要求 tool 消息前紧跟带 tool_calls 的 assistant 消息，
+				// 连续多个 function_call 合并进同一条 assistant 消息的 tool_calls 数组
+				const toolCall = {
+					id: item.call_id,
+					type: 'function',
+					function: { name: item.name, arguments: item.arguments || '{}' }
+				};
+				const lastMsg = openaiMessages[openaiMessages.length - 1];
+				if (lastMsg && lastMsg.role === 'assistant' && Array.isArray(lastMsg.tool_calls)) {
+					lastMsg.tool_calls.push(toolCall);
+				} else {
+					openaiMessages.push({ role: 'assistant', content: null, tool_calls: [toolCall] });
+				}
+			} else if (item.type === 'function_call_output') {
+				// output 可能是字符串或 [{type:'output_text', text}] 数组，统一转字符串
+				let outputContent = '';
+				if (typeof item.output === 'string') {
+					outputContent = item.output;
+				} else if (Array.isArray(item.output)) {
+					for (const part of item.output) {
+						if (part && part.text) outputContent += part.text;
+					}
+				} else if (item.output && typeof item.output === 'object') {
+					outputContent = JSON.stringify(item.output);
+				}
+				openaiMessages.push({ role: 'tool', tool_call_id: item.call_id, content: outputContent });
+			}
+			// type === 'reasoning'（encrypted_content/summary）：store=false 无状态思考，跳过忽略
+		}
+	}
+
+	// 首条非 system 消息是 assistant 时插一条占位 user（部分上游要求以 user 开头）
+	const firstNonSystemMsg = openaiMessages.find(m => m.role !== 'system');
+	if (firstNonSystemMsg && firstNonSystemMsg.role === 'assistant') {
+		const systemCount = openaiMessages.filter(m => m.role === 'system').length;
+		openaiMessages.splice(systemCount, 0, { role: 'user', content: ' ' });
+	}
+
+	openaiBody.messages = openaiMessages;
+
+	// tools：Responses 扁平格式 → chat 嵌套格式（无 parameters 时给空 object schema）
+	if (Array.isArray(responsesBody.tools)) {
+		openaiBody.tools = responsesBody.tools
+			.filter(t => t && t.type === 'function')
+			.map(t => ({
+				type: 'function',
+				function: {
+					name: t.name,
+					description: t.description || '',
+					parameters: t.parameters || { type: 'object', properties: {} }
+				}
+			}));
+	}
+
+	return openaiBody;
+}
+
+// ===== OpenAI Chat Completion 响应 → Responses 格式转换 =====
+function convertOpenAIToResponses(openaiResponse, originalModel) {
+	const choice = openaiResponse.choices?.[0] || {};
+	const message = choice.message || {};
+	const usage = openaiResponse.usage || {};
+
+	const output = [];
+
+	// 思考内容 → reasoning item（codex 容忍 summary 为空，这里放思考全文）
+	if (message.reasoning_content) {
+		output.push({
+			type: 'reasoning',
+			id: `rs_${crypto.randomUUID()}`,
+			summary: [{ type: 'summary_text', text: message.reasoning_content }]
+		});
+	}
+
+	// 正文 → message item
+	if (message.content) {
+		output.push({
+			type: 'message',
+			id: `msg_${crypto.randomUUID()}`,
+			role: 'assistant',
+			status: 'completed',
+			content: [{ type: 'output_text', text: message.content, annotations: [] }]
+		});
+	}
+
+	// 工具调用 → function_call item
+	if (Array.isArray(message.tool_calls)) {
+		for (const tc of message.tool_calls) {
+			output.push({
+				type: 'function_call',
+				id: `fc_${crypto.randomUUID()}`,
+				call_id: tc.id,
+				name: tc.function?.name || '',
+				arguments: tc.function?.arguments || '{}',
+				status: 'completed'
+			});
+		}
+	}
+
+	const incomplete = choice.finish_reason === 'length';
+
+	// codex 主要读 status/output/usage/id/model/error
+	return {
+		id: `resp_${crypto.randomUUID()}`,
+		object: 'response',
+		created_at: Math.floor(Date.now() / 1000),
+		status: incomplete ? 'incomplete' : 'completed',
+		model: originalModel,
+		output,
+		usage: {
+			input_tokens: usage.prompt_tokens || 0,
+			input_tokens_details: { cached_tokens: usage.prompt_tokens_details?.cached_tokens || 0 },
+			output_tokens: usage.completion_tokens || 0,
+			output_tokens_details: { reasoning_tokens: usage.completion_tokens_details?.reasoning_tokens || 0 },
+			total_tokens: usage.total_tokens || 0
+		},
+		error: null,
+		incomplete_details: incomplete ? { reason: 'max_output_tokens' } : null,
+		instructions: null,
+		parallel_tool_calls: null,
+		temperature: null,
+		top_p: null,
+		tool_choice: null,
+		tools: null
+	};
+}
+
+// ===== handleResponses（/v1/responses，OpenAI Responses 协议入口） =====
+async function handleResponses(request, env, ctx) {
+	const requestStartTime = Date.now();
+	const responsesBody = await safeJsonBody(request);
+	if (!responsesBody) return jsonError("Invalid or missing JSON body", 400, "invalid_request_error");
+
+	if (responsesBody.input === undefined) {
+		return jsonError("input field is required", 400, "invalid_request_error");
+	}
+
+	const model = responsesBody.model;
+	const { cfModel, isFallback, tokens } = await resolveModelName(model, env);
+	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+
+	const openaiBody = convertResponsesToOpenAI(responsesBody);
+	openaiBody.model = cfModel;
+
+	const stream = !!responsesBody.stream;
+	if (stream) {
+		openaiBody.stream_options = { include_usage: true };
+	}
+
+	// Token 上限 clamp
+	if (tokens) {
+		if (openaiBody.max_tokens && openaiBody.max_tokens > tokens) {
+			openaiBody.max_tokens = tokens;
+		}
+		if (openaiBody.max_completion_tokens && openaiBody.max_completion_tokens > tokens) {
+			openaiBody.max_completion_tokens = tokens;
+		}
+	}
+
+	const result = await callOpenAICompatibleAPI(openaiBody, env, stream);
+
+	if (!result.success) {
+		return jsonError(result.error, result.status || 502, "server_error");
+	}
+
+	if (stream) {
+		return streamResponse(
+			responsesStreamTransform(result.stream, model, env, ctx, requestStartTime),
+			fallbackWarning
+		);
+	}
+	const openaiResponse = result.data;
+	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime);
+	return jsonResponse(convertOpenAIToResponses(openaiResponse, model), fallbackWarning);
+}
+
+// ===== Responses SSE 流式转换：OpenAI Chat SSE → Responses SSE =====
+// 事件序列：response.created → output_item/content_part/output_text/reasoning_summary/function_call_arguments
+// 系列增量 → flush 所有未闭合 item → response.completed（含完整 output 数组 + usage）
+function responsesStreamTransform(upstreamBody, originalModel, env, ctx, requestStartTime) {
+	const reader = upstreamBody.getReader();
+	const decoder = new TextDecoder();
+	const encoder = new TextEncoder();
+	let buffer = '';
+	let pingInterval = null;
+
+	const responseId = `resp_${crypto.randomUUID()}`;
+	const createdAt = Math.floor(Date.now() / 1000);
+	let finalEventSent = false;
+	let finishReason = null;
+	let inputTokens = 0;
+	let outputTokens = 0;
+	let reasoningTokens = 0;
+	let cacheReadTokens = 0;
+	let totalTokens = 0;
+
+	// output item 状态：message/reasoning 各至多一个未闭合 item，tool_calls 按 index 分组
+	let nextOutputIndex = 0; // 给每个产出 item 分配递增 output_index（0,1,2...），item 开始到结束保持一致
+	let msgItem = null;       // {id, outputIndex, text}
+	let reasoningItem = null; // {id, outputIndex, text}
+	const toolItems = new Map(); // delta.tool_calls 的 index → {id, callId, outputIndex, name, args}
+	const finalOutput = [];     // 已闭合 item 全量数组（response.completed 用）
+
+	let enqueuedAny = false;
+
+	return new ReadableStream({
+		start(controller) {
+			// 流开始即发 response.created（codex-cli 等客户端等待此事件后才开始消费增量）
+			controller.enqueue(encoder.encode(sseEvent('response.created', {
+				type: 'response.created',
+				response: {
+					id: responseId,
+					object: 'response',
+					created_at: createdAt,
+					status: 'in_progress',
+					model: originalModel,
+					output: []
+				}
+			})));
+			// 定时 ping 保持连接（推理模型首 token 延迟可能较长）
+			pingInterval = setInterval(() => {
+				try {
+					controller.enqueue(encoder.encode(': ping\n\n'));
+				} catch (_) { /* controller 已关闭 */ }
+			}, 10000);
+		},
+		async pull(controller) {
+			enqueuedAny = false;
+			const originalEnqueue = controller.enqueue.bind(controller);
+			controller.enqueue = (chunk) => {
+				enqueuedAny = true;
+				originalEnqueue(chunk);
+			};
+
+			try {
+				while (true) {
+					const result = await readWithTimeout(reader, 120000);
+					if (result.done) {
+						if (buffer.trim()) {
+							buffer = processLines(buffer, controller);
+							// 流结束，剩余不完整行视为完整事件发送
+							if (buffer.trim()) {
+								controller.enqueue(encoder.encode(`${buffer.trim()}\n\n`));
+							}
+						}
+						if (!finalEventSent) {
+							sendFinalEvent(controller);
+						}
+						controller.close();
+						if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+						break;
+					}
+
+					buffer += decoder.decode(result.value, { stream: true });
+					buffer = processLines(buffer, controller);
+
+					if (buffer.indexOf('\n') === -1) {
+						if (enqueuedAny) {
+							break;
+						}
+					}
+				}
+			} catch (e) {
+				console.error(`responsesStreamTransform upstream error: ${e?.message || e}`);
+				try {
+					if (buffer.trim()) {
+						buffer = processLines(buffer, controller);
+					}
+					if (!finalEventSent) {
+						sendFailedEvent(controller, e);
+					}
+				} catch (e2) { console.error('responsesStreamTransform secondary error:', e2?.message || e2); }
+				if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+				try { controller.close(); } catch (_) { }
+			}
+		},
+		cancel() {
+			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+			return reader.cancel();
+		},
+	});
+
+	// SSE 事件格式：event 行 + data 行
+	function sseEvent(eventType, payload) {
+		return `event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`;
+	}
+
+	function processLines(data, controller) {
+		const lines = data.split('\n');
+		const remaining = lines.pop();
+
+		for (const line of lines) {
+			const trimmed = line.trim();
+			if (!trimmed) continue;
+
+			if (trimmed.startsWith('data: ')) {
+				const dataStr = trimmed.slice(6);
+				if (dataStr === '[DONE]') {
+					// 发送最终事件
+					sendFinalEvent(controller);
+					continue;
+				}
+
+				try {
+				let chunk = JSON.parse(dataStr);
+				// 流式格式归一化：CF Binding 流式返回原生格式 {response, usage, tool_calls}，
+				// 转成 OpenAI streaming chunk {choices: [{delta: {content}, finish_reason: null}]}
+				if (!chunk.choices && chunk.response !== undefined) {
+					const originalUsage = chunk.usage;
+					chunk = {
+						id: chunk.id || `chatcmpl-${crypto.randomUUID()}`,
+						object: 'chat.completion.chunk',
+						created: chunk.created || Math.floor(Date.now() / 1000),
+						model: originalModel,
+						choices: [{ index: 0, delta: { content: chunk.response }, finish_reason: null }]
+					};
+					if (originalUsage) chunk.usage = originalUsage;
+				}
+
+				// usage 记录放在 choice 校验前：usage 尾块（choices 为空）也能累计
+				if (chunk.usage) {
+					inputTokens = chunk.usage.prompt_tokens || 0;
+					outputTokens = chunk.usage.completion_tokens || 0;
+					reasoningTokens = chunk.usage.reasoning_tokens || chunk.usage.completion_tokens_details?.reasoning_tokens || 0;
+					cacheReadTokens = (chunk.usage.prompt_tokens_details?.cached_tokens ?? chunk.usage.cache_read_tokens ?? 0);
+					totalTokens = chunk.usage.total_tokens || 0;
+				}
+
+					const choice = chunk.choices?.[0];
+					if (!choice) continue;
+
+					const delta = choice.delta || {};
+					if (choice.finish_reason) finishReason = choice.finish_reason;
+
+					if (delta.reasoning_content) {
+						// 思考增量 → reasoning item 的 summary delta
+						closeMessageItem(controller);
+						if (!reasoningItem) {
+							openReasoningItem(controller);
+						}
+						sendReasoningSummaryDelta(controller, delta.reasoning_content);
+					}
+
+					if (delta.content) {
+						// 正文增量 → message item 的 output_text delta
+						closeReasoningItem(controller);
+						if (!msgItem) {
+							openMessageItem(controller);
+						}
+						sendOutputTextDelta(controller, delta.content);
+					}
+
+					if (Array.isArray(delta.tool_calls)) {
+						// 工具调用增量 → function_call item 的 arguments delta（id/name 在首块出现，arguments 增量拼接）
+						closeMessageItem(controller);
+						closeReasoningItem(controller);
+						for (const tc of delta.tool_calls) {
+							const tcIndex = tc.index ?? 0;
+							let item = toolItems.get(tcIndex);
+							if (!item) {
+								item = openToolItem(controller, tcIndex, tc);
+							} else if (tc.function?.name && !item.name) {
+								// 函数名可能在后续块补齐
+								item.name = tc.function.name;
+							}
+							if (tc.function?.arguments) {
+								item.args += tc.function.arguments;
+								sendToolArgsDelta(controller, item, tc.function.arguments);
+							}
+						}
+					}
+
+					if (choice.finish_reason) {
+						// 上游可能不发各 item 的结束信号，finish_reason 时统一 flush 所有未闭合 item
+						flushOpenItems(controller);
+					}
+				} catch (e) { console.error('Responses processLines error:', e?.message || e); }
+			}
+		}
+		return remaining;
+	}
+
+	// 开 message item：output_item.added + content_part.added
+	function openMessageItem(controller) {
+		const id = `msg_${crypto.randomUUID()}`;
+		const outputIndex = nextOutputIndex++;
+		msgItem = { id, outputIndex, text: '' };
+		controller.enqueue(encoder.encode(sseEvent('response.output_item.added', {
+			type: 'response.output_item.added',
+			output_index: outputIndex,
+			item: { type: 'message', id, role: 'assistant', status: 'in_progress', content: [] }
+		})));
+		controller.enqueue(encoder.encode(sseEvent('response.content_part.added', {
+			type: 'response.content_part.added',
+			item_id: id,
+			output_index: outputIndex,
+			content_index: 0,
+			part: { type: 'output_text', text: '', annotations: [] }
+		})));
+	}
+
+	// 闭 message item：output_text.done（text=累计全文）+ content_part.done + output_item.done
+	function closeMessageItem(controller) {
+		if (!msgItem) return;
+		const { id, outputIndex, text } = msgItem;
+		controller.enqueue(encoder.encode(sseEvent('response.output_text.done', {
+			type: 'response.output_text.done',
+			item_id: id,
+			output_index: outputIndex,
+			content_index: 0,
+			text
+		})));
+		controller.enqueue(encoder.encode(sseEvent('response.content_part.done', {
+			type: 'response.content_part.done',
+			item_id: id,
+			output_index: outputIndex,
+			content_index: 0,
+			part: { type: 'output_text', text, annotations: [] }
+		})));
+		const item = { type: 'message', id, role: 'assistant', status: 'completed', content: [{ type: 'output_text', text, annotations: [] }] };
+		controller.enqueue(encoder.encode(sseEvent('response.output_item.done', {
+			type: 'response.output_item.done',
+			output_index: outputIndex,
+			item
+		})));
+		finalOutput.push(item);
+		msgItem = null;
+	}
+
+	// 开 reasoning item：output_item.added + reasoning_summary_part.added
+	function openReasoningItem(controller) {
+		const id = `rs_${crypto.randomUUID()}`;
+		const outputIndex = nextOutputIndex++;
+		reasoningItem = { id, outputIndex, text: '' };
+		controller.enqueue(encoder.encode(sseEvent('response.output_item.added', {
+			type: 'response.output_item.added',
+			output_index: outputIndex,
+			item: { type: 'reasoning', id, summary: [] }
+		})));
+		controller.enqueue(encoder.encode(sseEvent('response.reasoning_summary_part.added', {
+			type: 'response.reasoning_summary_part.added',
+			item_id: id,
+			output_index: outputIndex,
+			summary_index: 0,
+			part: { type: 'summary_text', text: '' }
+		})));
+	}
+
+	// 闭 reasoning item：reasoning_summary_text/part.done + output_item.done（summary 含累计思考全文）
+	function closeReasoningItem(controller) {
+		if (!reasoningItem) return;
+		const { id, outputIndex, text } = reasoningItem;
+		controller.enqueue(encoder.encode(sseEvent('response.reasoning_summary_text.done', {
+			type: 'response.reasoning_summary_text.done',
+			item_id: id,
+			output_index: outputIndex,
+			summary_index: 0,
+			text
+		})));
+		controller.enqueue(encoder.encode(sseEvent('response.reasoning_summary_part.done', {
+			type: 'response.reasoning_summary_part.done',
+			item_id: id,
+			output_index: outputIndex,
+			summary_index: 0,
+			part: { type: 'summary_text', text }
+		})));
+		const item = { type: 'reasoning', id, summary: [{ type: 'summary_text', text }] };
+		controller.enqueue(encoder.encode(sseEvent('response.output_item.done', {
+			type: 'response.output_item.done',
+			output_index: outputIndex,
+			item
+		})));
+		finalOutput.push(item);
+		reasoningItem = null;
+	}
+
+	function sendReasoningSummaryDelta(controller, delta) {
+		reasoningItem.text += delta;
+		controller.enqueue(encoder.encode(sseEvent('response.reasoning_summary_text.delta', {
+			type: 'response.reasoning_summary_text.delta',
+			item_id: reasoningItem.id,
+			output_index: reasoningItem.outputIndex,
+			summary_index: 0,
+			delta
+		})));
+	}
+
+	function sendOutputTextDelta(controller, delta) {
+		msgItem.text += delta;
+		controller.enqueue(encoder.encode(sseEvent('response.output_text.delta', {
+			type: 'response.output_text.delta',
+			item_id: msgItem.id,
+			output_index: msgItem.outputIndex,
+			content_index: 0,
+			delta
+		})));
+	}
+
+	// 开 function_call item：output_item.added（arguments 空、status in_progress）
+	function openToolItem(controller, tcIndex, tc) {
+		const id = `fc_${crypto.randomUUID()}`;
+		const outputIndex = nextOutputIndex++;
+		const item = { id, callId: tc.id || '', outputIndex, name: tc.function?.name || '', args: '' };
+		toolItems.set(tcIndex, item);
+		controller.enqueue(encoder.encode(sseEvent('response.output_item.added', {
+			type: 'response.output_item.added',
+			output_index: outputIndex,
+			item: { type: 'function_call', id, call_id: item.callId, name: item.name, arguments: '', status: 'in_progress' }
+		})));
+		return item;
+	}
+
+	function sendToolArgsDelta(controller, item, delta) {
+		controller.enqueue(encoder.encode(sseEvent('response.function_call_arguments.delta', {
+			type: 'response.function_call_arguments.delta',
+			item_id: item.id,
+			output_index: item.outputIndex,
+			delta
+		})));
+	}
+
+	// 闭 function_call item：function_call_arguments.done（arguments=累计全串）+ output_item.done
+	function closeToolItem(controller, item) {
+		controller.enqueue(encoder.encode(sseEvent('response.function_call_arguments.done', {
+			type: 'response.function_call_arguments.done',
+			item_id: item.id,
+			output_index: item.outputIndex,
+			arguments: item.args
+		})));
+		const doneItem = { type: 'function_call', id: item.id, call_id: item.callId, name: item.name, arguments: item.args, status: 'completed' };
+		controller.enqueue(encoder.encode(sseEvent('response.output_item.done', {
+			type: 'response.output_item.done',
+			output_index: item.outputIndex,
+			item: doneItem
+		})));
+		finalOutput.push(doneItem);
+	}
+
+	// flush 所有未闭合 item（finish_reason 或流结束时调用；上游可能不发 function_call 的结束信号）
+	function flushOpenItems(controller) {
+		closeReasoningItem(controller);
+		closeMessageItem(controller);
+		for (const item of toolItems.values()) {
+			closeToolItem(controller, item);
+		}
+		toolItems.clear();
+	}
+
+	function buildResponseObject(status) {
+		return {
+			id: responseId,
+			object: 'response',
+			created_at: createdAt,
+			status,
+			model: originalModel,
+			output: finalOutput,
+			usage: {
+				input_tokens: inputTokens,
+				input_tokens_details: { cached_tokens: cacheReadTokens },
+				output_tokens: outputTokens,
+				output_tokens_details: { reasoning_tokens: reasoningTokens },
+				total_tokens: totalTokens || (inputTokens + outputTokens)
+			},
+			error: null,
+			incomplete_details: status === 'incomplete' ? { reason: 'max_output_tokens' } : null,
+			instructions: null,
+			parallel_tool_calls: null,
+			temperature: null,
+			top_p: null,
+			tool_choice: null,
+			tools: null
+		};
+	}
+
+	function sendFinalEvent(controller) {
+		if (finalEventSent) return;
+		// flush 所有未闭合 item（完整数据用累计值构造）
+		flushOpenItems(controller);
+
+		// 上游未产生任何内容（空响应）→ 兜底发一个空 message item
+		if (finalOutput.length === 0) {
+			const id = `msg_${crypto.randomUUID()}`;
+			const outputIndex = nextOutputIndex++;
+			controller.enqueue(encoder.encode(sseEvent('response.output_item.added', {
+				type: 'response.output_item.added',
+				output_index: outputIndex,
+				item: { type: 'message', id, role: 'assistant', status: 'in_progress', content: [] }
+			})));
+			controller.enqueue(encoder.encode(sseEvent('response.content_part.added', {
+				type: 'response.content_part.added',
+				item_id: id,
+				output_index: outputIndex,
+				content_index: 0,
+				part: { type: 'output_text', text: '', annotations: [] }
+			})));
+			controller.enqueue(encoder.encode(sseEvent('response.content_part.done', {
+				type: 'response.content_part.done',
+				item_id: id,
+				output_index: outputIndex,
+				content_index: 0,
+				part: { type: 'output_text', text: '', annotations: [] }
+			})));
+			const emptyItem = { type: 'message', id, role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '', annotations: [] }] };
+			controller.enqueue(encoder.encode(sseEvent('response.output_item.done', {
+				type: 'response.output_item.done',
+				output_index: outputIndex,
+				item: emptyItem
+			})));
+			finalOutput.push(emptyItem);
+		}
+
+		const status = finishReason === 'length' ? 'incomplete' : 'completed';
+		try { controller.enqueue(encoder.encode(sseEvent('response.completed', {
+			type: 'response.completed',
+			response: buildResponseObject(status)
+		}))); } catch (_) { /* 忽略 enqueue 异常 */ }
+		finalEventSent = true;
+
+		// 流结束时累加 token 统计
+		if (env && ctx && (inputTokens > 0 || outputTokens > 0)) {
+			accumulateTokens(env, ctx, {
+				input: inputTokens,
+				output: outputTokens,
+				reasoning: reasoningTokens,
+				cacheRead: cacheReadTokens,
+				cacheWrite: 0,
+				durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
+			});
+		}
+	}
+
+	// 上游异常兜底：尽力发 response.failed 后关闭流
+	function sendFailedEvent(controller, e) {
+		finalEventSent = true;
+		const response = buildResponseObject('failed');
+		response.error = { code: 'server_error', message: e?.message || String(e) };
+		try { controller.enqueue(encoder.encode(sseEvent('response.failed', {
+			type: 'response.failed',
+			response
+		}))); } catch (_) { /* 忽略 enqueue 异常 */ }
 	}
 }
 
@@ -5034,11 +5752,15 @@ async function handleAdminPage(request, env, ctx) {
 					<!-- Proxy URL Info -->
 					<div class="section-card" style="margin-bottom: 24px;">
 						<div class="section-title">接入信息</div>
-						<div class="section-note">OpenAI SDK 和 Anthropic Messages 都可直接接入，点击 URL 即可复制。</div>
+						<div class="section-note">OpenAI SDK、Responses（codex-cli）和 Anthropic Messages 都可直接接入，点击 URL 即可复制。</div>
 						<div class="access-endpoint-grid" style="margin-top: 18px;">
 							<div class="access-endpoint-card">
 								<div class="endpoint-badge">OpenAI 兼容格式</div>
 								<button type="button" class="endpoint-url" id="openai-endpoint-url" data-endpoint-url="" onclick="copyEndpointUrl(this.dataset.endpointUrl)">https://domain/v1/chat/completions</button>
+							</div>
+							<div class="access-endpoint-card">
+								<div class="endpoint-badge">Responses 格式（codex-cli）</div>
+								<button type="button" class="endpoint-url" id="responses-endpoint-url" data-endpoint-url="" onclick="copyEndpointUrl(this.dataset.endpointUrl)">https://domain/v1/responses</button>
 							</div>
 							<div class="access-endpoint-card">
 								<div class="endpoint-badge">Anthropic 兼容格式</div>
@@ -5585,12 +6307,18 @@ async function handleAdminPage(request, env, ctx) {
 
 		window.onload = function() {
 			const openaiUrl = window.location.origin + '/v1/chat/completions';
+			const responsesUrl = window.location.origin + '/v1/responses';
 			const anthropicUrl = window.location.origin + '/v1/messages';
 			const openaiUrlEl = document.getElementById('openai-endpoint-url');
+			const responsesUrlEl = document.getElementById('responses-endpoint-url');
 			const anthropicUrlEl = document.getElementById('anthropic-endpoint-url');
 			if (openaiUrlEl) {
 				openaiUrlEl.dataset.endpointUrl = openaiUrl;
 				openaiUrlEl.textContent = openaiUrl;
+			}
+			if (responsesUrlEl) {
+				responsesUrlEl.dataset.endpointUrl = responsesUrl;
+				responsesUrlEl.textContent = responsesUrl;
 			}
 			if (anthropicUrlEl) {
 				anthropicUrlEl.dataset.endpointUrl = anthropicUrl;
