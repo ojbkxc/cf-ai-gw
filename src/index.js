@@ -65,7 +65,7 @@ async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0
 			monthly.reasoning = (monthly.reasoning || 0) + reasoning;
 			monthly.requests += 1;
 			await env.KV.put(monthlyKey, JSON.stringify(monthly), { expirationTtl: 32 * 86400 });
-		} catch (e) {
+		// 历史记录（过去7天）：保存每日总 token 消耗到 history KV		const todayStr = getTodayStr();		const historyKey = \	okens_history_\;		const historyRaw = await env.KV.get(historyKey);		const historyData = historyRaw ? JSON.parse(historyRaw) : [];		historyData.push({			date: todayStr,			total: cur.input + cur.output,			requests: cur.requests,			input: cur.input,			output: cur.output		});		// 只保留过去7天数据，避免 KV 存储		if (historyData.length > 7) {			historyData.shift();		}		await env.KV.put(historyKey, JSON.stringify(historyData), { expirationTtl: TOKEN_KV_TTL_SEC });		} catch (e) {
 			console.error('Failed to accumulate tokens:', e?.message || e);
 		}
 	})());
