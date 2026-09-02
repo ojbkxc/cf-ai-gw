@@ -22,7 +22,7 @@ function getTodayStr() {
 	return new Date().toISOString().split('T')[0];
 }
 
-const TOKEN_KV_TTL_SEC = 86400 * 2;    // KV 键保留 2 天
+const TOKEN_KV_TTL_SEC = 86400 * 8;    // KV 键保留 8 天（看板 7 日走势需要历史数据）
 const MAX_TIMEOUT_RETRIES = 5;          // 流读取超时最大重试次数
 
 // 获取 token 统计 KV 键名
@@ -37,13 +37,13 @@ function getTokenMonthlyKey() {
 }
 
 // 累加 token 直接写入 KV（无内存缓冲，避免冷启动丢失）
-async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0, cacheRead = 0, cacheWrite = 0, durationSec = 0 }) {
+async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0, cacheRead = 0, cacheWrite = 0, durationSec = 0, model = null }) {
 	ctx.waitUntil((async () => {
 		try {
 			// 今日统计
 			const dailyKey = getTokenDailyKey();
 			const raw = await env.KV.get(dailyKey);
-			const cur = raw ? JSON.parse(raw) : { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0 };
+			const cur = raw ? JSON.parse(raw) : { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0, models: {} };
 			cur.input += input;
 			cur.output += output;
 			cur.reasoning = (cur.reasoning || 0) + reasoning;
@@ -53,6 +53,13 @@ async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0
 			if (durationSec > 0 && output > 0) {
 				cur.tokPerSecSum = (cur.tokPerSecSum || 0) + Math.round(output / durationSec);
 				cur.tokPerSecCount = (cur.tokPerSecCount || 0) + 1;
+			}
+			// 按模型维度统计（看板"今日模型消耗占比"）
+			if (model) {
+				cur.models = cur.models || {};
+				const m = cur.models[model] || (cur.models[model] = { input: 0, output: 0 });
+				m.input += input;
+				m.output += output;
 			}
 			await env.KV.put(dailyKey, JSON.stringify(cur), { expirationTtl: TOKEN_KV_TTL_SEC });
 
@@ -72,7 +79,7 @@ async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0
 }
 
 // 从 usage 对象提取字段并累加 token 统计
-function accumulateFromUsage(env, ctx, usage, requestStartTime) {
+function accumulateFromUsage(env, ctx, usage, requestStartTime, model = null) {
 	if (!ctx || !usage) return;
 	const pd = usage.prompt_tokens_details || {};
 	accumulateTokens(env, ctx, {
@@ -82,6 +89,7 @@ function accumulateFromUsage(env, ctx, usage, requestStartTime) {
 		cacheRead: pd.cached_tokens ?? usage.cache_read_tokens ?? 0,
 		cacheWrite: usage.cache_write_tokens || 0,
 		durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
+		model,
 	});
 }
 
@@ -1058,7 +1066,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 	}
 	const cfJson = result.data;
 	if (cfJson.model !== undefined) cfJson.model = model;
-	accumulateFromUsage(env, ctx, cfJson.usage, requestStartTime);
+	accumulateFromUsage(env, ctx, cfJson.usage, requestStartTime, model);
 	if (pathname === '/v1/completions') {
 		const textChoices = (cfJson.choices || []).map(c => ({
 			text: c.message?.content || '',
@@ -1398,7 +1406,7 @@ async function handleMessages(request, env, ctx) {
 		);
 	}
 	const openaiResponse = result.data;
-	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime);
+	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime, model);
 	return jsonResponse(convertOpenAIToAnthropic(openaiResponse, model, anthropicBody.stop_sequences), fallbackWarning);
 }
 
@@ -1738,6 +1746,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				cacheRead: cacheReadTokens,
 				cacheWrite: cacheWriteTokens,
 				durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
+				model,
 			});
 		}
 	}
@@ -2001,7 +2010,7 @@ async function handleResponses(request, env, ctx) {
 		);
 	}
 	const openaiResponse = result.data;
-	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime);
+	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime, model);
 	return jsonResponse(convertOpenAIToResponses(openaiResponse, model, {
 		instructions: responsesBody.instructions,
 		parallel_tool_calls: responsesBody.parallel_tool_calls,
@@ -2463,6 +2472,7 @@ function responsesStreamTransform(upstreamBody, originalModel, env, ctx, request
 				cacheRead: cacheReadTokens,
 				cacheWrite: 0,
 				durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
+				model,
 			});
 		}
 	}
@@ -2520,7 +2530,7 @@ async function handleEmbeddings(request, env, ctx) {
 		};
 
 		if (ctx) {
-			accumulateTokens(env, ctx, { input: response.usage.prompt_tokens, durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0 });
+			accumulateTokens(env, ctx, { input: response.usage.prompt_tokens, durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0, model });
 		}
 
 		const embHeaders = { 'Content-Type': 'application/json' };
@@ -2596,7 +2606,7 @@ async function handleImageGenerations(request, env, ctx) {
 
 		if (fallbackWarning) imgHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
 		if (ctx && prompt) {
-			accumulateTokens(env, ctx, { input: Math.ceil(prompt.length / 3), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0 });
+			accumulateTokens(env, ctx, { input: Math.ceil(prompt.length / 3), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0, model });
 		}
 		return new Response(JSON.stringify(responseData), { headers: imgHeaders });
 	} catch (e) {
@@ -2671,7 +2681,7 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 		const text = result.text || '';
 
 		if (ctx && text) {
-			accumulateTokens(env, ctx, { output: Math.ceil(text.length / 3), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0 });
+			accumulateTokens(env, ctx, { output: Math.ceil(text.length / 3), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0, model });
 		}
 
 		const audioHeaders = { 'Content-Type': 'application/json' };
@@ -2712,7 +2722,7 @@ async function handleAudioSpeech(request, env, ctx) {
 		const audioBuffer = await resp.arrayBuffer();
 		const contentType = resp.headers.get('Content-Type') || 'audio/wav';
 		if (ctx) {
-			accumulateTokens(env, ctx, { input: Math.ceil(input.length / 4), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0 });
+			accumulateTokens(env, ctx, { input: Math.ceil(input.length / 4), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0, model });
 		}
 		return new Response(audioBuffer, {
 			headers: {
@@ -2851,8 +2861,8 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 						ensureFinishReason(controller, 'stop');
 						controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 						controller.close();
-						if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-						accumulateFromUsage(env, ctx, streamUsage, requestStartTime);
+					if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+					accumulateFromUsage(env, ctx, streamUsage, requestStartTime, model);
 						break;
 					}
 
@@ -3071,6 +3081,33 @@ async function handleDashboardApi(request, env, ctx) {
 		const stats = await getTodayTokenStats(env);
 		const monthlyUsage = await getMonthlyUsage(env);
 
+		// 过去 7 天历史（含今日）：读取 tokens_daily_* 逐日键组装（看板"近 7 日消耗走势"）
+		const historyEntries = await Promise.all(
+			Array.from({ length: 7 }, (_, i) => {
+				const d = new Date(Date.now() - (6 - i) * 86400000);
+				const dateStr = d.toISOString().split('T')[0];
+				return env.KV.get(`tokens_daily_${dateStr}`).then(raw => {
+					if (!raw) return null;
+					try {
+						const day = JSON.parse(raw);
+						return { date: dateStr, neurons: (day.input || 0) + (day.output || 0), requests: day.requests || 0 };
+					} catch (_) { return null; }
+				}).catch(() => null);
+			})
+		);
+		const history = historyEntries.filter(Boolean);
+
+		// 今日模型消耗占比：从今日统计的 models 字段提取
+		let modelsToday = [];
+		try {
+			const rawToday = await env.KV.get(getTokenDailyKey());
+			if (rawToday) {
+				const todayData = JSON.parse(rawToday);
+				const models = todayData.models || {};
+				modelsToday = Object.entries(models).map(([name, m]) => ({ model: name, neurons: (m.input || 0) + (m.output || 0) }));
+			}
+		} catch (_) { /* 忽略解析错误 */ }
+
 		return new Response(JSON.stringify({
 			accounts: [{
 				id: 'binding-single',
@@ -3080,8 +3117,8 @@ async function handleDashboardApi(request, env, ctx) {
 				error: undefined,
 				usageToday: stats.total,
 				usageTodayRequests: stats.requests,
-				modelsToday: [],
-				history: [],
+				modelsToday,
+				history,
 				lastUpdated: Date.now()
 			}],
 			limits: {
