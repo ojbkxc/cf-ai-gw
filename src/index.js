@@ -3028,6 +3028,17 @@ async function handleDashboardApi(request, env, ctx) {
 			const stats = await getTodayTokenStats(env);
 			const monthlyUsage = await getMonthlyUsage(env);
 
+			// 今日模型消耗占比：从今日统计的 models 字段提取
+			let summaryModelsToday = [];
+			try {
+				const rawToday = await env.KV.get(getTokenDailyKey());
+				if (rawToday) {
+					const todayData = JSON.parse(rawToday);
+					const models = todayData.models || {};
+					summaryModelsToday = Object.entries(models).map(([name, m]) => ({ model: name, neurons: (m.input || 0) + (m.output || 0) }));
+				}
+			} catch (_) { /* 忽略解析错误 */ }
+
 			const summary = {
 				totalNeuronsToday: stats.total,
 				totalRequestsToday: stats.requests,
@@ -3035,7 +3046,7 @@ async function handleDashboardApi(request, env, ctx) {
 				totalAccounts: 1,
 				totalLimit: limits.dailyLimit,
 				usagePercentage: limits.dailyLimit > 0 ? parseFloat(((stats.total / limits.dailyLimit) * 100).toFixed(2)) : 0,
-				modelsToday: [],
+				modelsToday: summaryModelsToday,
 				dailyUsage: stats.total,
 				dailyLimit: limits.dailyLimit,
 				monthlyUsage: monthlyUsage,
