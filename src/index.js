@@ -5,7 +5,7 @@
  */
 
 // 用量限额配置（环境变量覆盖，未设置则用默认值）
-const DEFAULT_DAILY_LIMIT = 10000;
+// TEMP_MODIFICATION const DEFAULT_DAILY_LIMIT = 10000;
 const DEFAULT_MONTHLY_LIMIT = 100000;
 const DEFAULT_USAGE_THRESHOLD = 0; // 0 表示关闭限额拦截（仅统计不拦截）
 
