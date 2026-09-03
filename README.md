@@ -1,6 +1,6 @@
 # cf-ai-gw
 
-将 Cloudflare Workers AI 转成 OpenAI / Anthropic 兼容 API 的网关，自带管理面板。支持多账号负载均衡、故障自动切换。
+将 Cloudflare Workers AI 转成 OpenAI / Anthropic 兼容 API 的网关，自带可视化管理面板。支持多账号负载均衡、故障自动切换、真实 Neurons 用量看板。
 
 ## 部署模式
 
@@ -8,6 +8,8 @@
 |------|---------|---------|---------|---------|
 | **模式 A：Worker + AI Binding** | `src/index.js` | `env.AI.run()` 内部 RPC | 单账号 | ⭐⭐⭐ 最佳 |
 | **模式 B：Worker + REST API** | `_worker.js` | `fetch()` 公网 REST | 多账号 failover | ⭐⭐ 良好 |
+
+> 两模式共用同一 KV 时数据互通：API Key、模型映射、限额配置、账号列表、用量看板完全一致。
 
 ## 快速部署（推荐：模式 A — Worker + AI Binding）
 
@@ -21,6 +23,12 @@
 3. 授权 GitHub，选择 `cf-ai-gw` 仓库，分支 `main`
 4. 保存并部署
 
+或使用 wrangler 直连部署：
+
+```bash
+npx wrangler deploy
+```
+
 ### 2. 配置绑定和环境变量
 
 部署完成后，进入 Worker 的 **Settings**：
@@ -28,6 +36,7 @@
 | 配置项 | 位置 | 说明 |
 |--------|------|------|
 | KV 绑定 | Settings → **Bindings** | 添加 KV 命名空间，Variable name 填 `KV` |
+| AI 绑定 | Settings → **Bindings** | 添加 Workers AI Binding，Variable name 填 `AI`（模式 A 必需） |
 | `ADMIN_PASSWORD` | Settings → **Variables & Secrets** | 管理面板登录密码（必填） |
 
 > **注意**：`wrangler.toml` 已精简，不再包含 KV/AI/环境变量配置。所有绑定和变量均在 Dashboard 中配置，推代码不会覆盖。
@@ -38,10 +47,11 @@
 2. 输入 `ADMIN_PASSWORD` 登录
 3. 在「账号管理」中添加 Cloudflare 账号：
    - **Account ID**：Cloudflare 账号 ID
-   - **API Token**：有 Workers AI 权限的 API Token
+   - **API Token**：有 Workers AI + Account Analytics 权限的 API Token
    - **名称**：任意，用于区分多个账号
 
 > 支持添加多个账号，自动负载均衡和故障切换。账号信息以明文存储在 KV 中。
+> 模式 A 无需配置账号（AI Binding 即账号），但看板的真实 Neurons 数据同样来自账号列表的 GraphQL 查询——建议配置至少一个账号以获得完整看板。
 
 ### 4. 创建 API Key
 
@@ -53,6 +63,19 @@ curl https://cf-ai-gw.YOUR_SUBDOMAIN.workers.dev/v1/chat/completions \
   -H "Authorization: Bearer <API_KEY>" \
   -d '{"model": "glm-4.7-flash", "messages": [{"role": "user", "content": "你好"}]}'
 ```
+
+## 数据看板
+
+管理面板「数据看板」展示真实神经元消耗（与 Cloudflare 计费一致）：
+
+- **今日消耗 / 请求次数**：CF GraphQL Analytics API 查询的 `totalNeurons`（真实计费数据，模式 A/B 的消耗均计入）
+- **今日模型消耗占比**：按 CF 真实 modelId 维度的 Neurons 分布
+- **近 7 日消耗走势**：逐日 Neurons 消耗与请求数
+- **本月用量 / 月度请求**：月初起累计
+- **今日 Token 统计**：网关本地 token 统计（input/output/推理/缓存读，与 Neurons 口径不同）
+
+> 用量数据来自 GraphQL（有数分钟延迟），单次刷新至多更新 3 个账号（防风控），账号按最后更新时间轮转刷新。
+> 跨模式部署（A + B 共用 KV）时，两模式看板数值完全一致。
 
 ## 切换模式
 
@@ -75,7 +98,7 @@ main = "_worker.js"
 | HTTP 开销 | 无 TLS / 无网关跳转 | 每次请求经 Cloudflare 网关 |
 | 账号管理 | 单账号（绑定即账号） | 多账号 failover（KV 存 Token） |
 | 风控规避 | ⭐⭐⭐ 内部 RPC，不触发网关检测 | ⭐⭐ 默认 Worker UA + 串行请求 + 退避重试 |
-| 用量查询 | 无需 | 调 GraphQL 拉取 Neurons |
+| 用量查询 | GraphQL（共用模式B账号配置） | GraphQL 拉取 Neurons |
 | 模型列表 | 仅 `@cf/` 开头，按 token 降序 | 全部映射模型，按 token 降序 |
 | 安全增强 | 熔断器 + 断供闩 + 过大闸 | 多账号 failover + 可恢复流 |
 
@@ -113,6 +136,7 @@ npx wrangler pages deploy dist-pages --project-name cf-ai-gw --branch main
 |------|------|
 | `/v1/chat/completions` | POST |
 | `/v1/completions` | POST |
+| `/v1/responses` | POST |
 | `/v1/embeddings` | POST |
 | `/v1/models` | GET |
 | `/v1/models/{model}` | GET |
@@ -120,6 +144,8 @@ npx wrangler pages deploy dist-pages --project-name cf-ai-gw --branch main
 | `/v1/audio/transcriptions` | POST |
 | `/v1/audio/translations` | POST |
 | `/v1/audio/speech` | POST |
+
+> `/v1/responses` 支持 OpenAI Responses 协议（新版 codex-cli 直连），含流式 SSE 事件状态机与 tool_calls 往返。
 
 ### Anthropic 兼容
 
@@ -134,21 +160,23 @@ npx wrangler pages deploy dist-pages --project-name cf-ai-gw --branch main
 |------|------|
 | `/admin` | 可视化管理面板 |
 | `/api/auth/login` | 登录 |
-| `/api/tokens/today` | 今日 Token 统计 |
-| `/api/usage/summary` | 用量汇总 |
+| `/api/tokens/today` | 今日 Token 统计（本地 token 口径） |
+| `/api/usage/summary` | 用量汇总（真实 Neurons） |
+| `/api/accounts/usage` | 账号用量明细（真实 Neurons） |
 | `/api/keys` | API Key 管理 |
 | `/api/settings` | 模型映射配置 |
 | `/api/limits` | 限额配置 |
-| `/api/accounts` | 账号管理（仅模式 B） |
-| `/api/models/search` | 搜索 CF 可用模型（仅模式 B） |
+| `/api/accounts` | 账号管理 |
+| `/api/models/search` | 搜索 CF 可用模型 |
 
 ## 可选环境变量
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `DAILY_LIMIT` | 10000 | 每日 token 限额 |
-| `MONTHLY_LIMIT` | 100000 | 每月 token 限额 |
+| `DAILY_LIMIT` | 10000 | 每日限额 |
+| `MONTHLY_LIMIT` | 100000 | 每月限额 |
 | `USAGE_THRESHOLD` | 0 | 限额拦截阈值（0=仅统计不拦截） |
+| `STRICT_MODEL_MATCH` | 关 | 设为 `true` 时无效模型名返回 404（默认回退兜底模型） |
 | `OVERSIZE_TOKENS` | 200000 | 请求过大 token 闸（仅模式 A） |
 | `CB_WINDOW_MS` | 10000 | 熔断器窗口（毫秒，仅模式 A） |
 | `CB_FAIL_THRESHOLD` | 8 | 熔断器失败阈值（仅模式 A） |
@@ -164,10 +192,10 @@ npx wrangler pages deploy dist-pages --project-name cf-ai-gw --branch main
 
 | 模型名 | Cloudflare 模型 | Tokens |
 |--------|----------------|--------|
-| `deepseek-v4-pro-0813` | `@cf/deepseek-ai/deepseek-v4-pro-0813` | 1,048,576 |
 | `deepseek-v4-flash-0731` | `@cf/deepseek-ai/deepseek-v4-flash-0731` | 1,310,720 |
 | `glm-5.3` | `@cf/zai-org/glm-5.3` | 1,310,720 |
 | `glm-5.3-flash` | `@cf/zai-org/glm-5.3-flash` | 1,310,720 |
+| `deepseek-v4-pro-0813` | `@cf/deepseek-ai/deepseek-v4-pro-0813` | 1,048,576 |
 | `glm-5.2` | `@cf/zai-org/glm-5.2` | 262,144 |
 | `kimi-k2.7-code` | `@cf/moonshotai/kimi-k2.7-code` | 262,144 |
 | `kimi-k2.6` | `@cf/moonshotai/kimi-k2.6` | 262,144 |
@@ -205,9 +233,8 @@ npx wrangler pages deploy dist-pages --project-name cf-ai-gw --branch main
 | 模型名 | Cloudflare 模型 |
 |--------|----------------|
 | `llava-1.5-7b` | `@cf/llava-hf/llava-1.5-7b-hf` |
-| `moondream3.1-9B-A2B` | `@cf/moondream/moondream3.1-9B-A2B` |
 | `flux-1-schnell` | `@cf/black-forest-labs/flux-1-schnell` |
-| `flux` | `@cf/deepgram/flux` |
+| `flux` | `@cf/black-forest-labs/flux-1-schnell`（别名） |
 | `sdxl` | `@cf/stabilityai/stable-diffusion-xl-base-1.0` |
 
 ### 语音模型
@@ -218,7 +245,21 @@ npx wrangler pages deploy dist-pages --project-name cf-ai-gw --branch main
 | `whisper-tiny-en` | `@cf/openai/whisper-tiny-en` |
 | `whisper-large-v3-turbo` | `@cf/openai/whisper-large-v3-turbo` |
 | `nova-3` | `@cf/deepgram/nova-3` |
-| `tts` | `@cf/myshell-ai/tts` |
+| `tts` | `@cf/deepgram/aura-2-en`（TTS） |
 | `aura-2-en` | `@cf/deepgram/aura-2-en` |
 
 > `owned_by` 字段由 `getModelOwnedBy` 从 `@cf/` 路径自动提取（如 `@cf/meta/xxx` → `meta`），无需维护前缀表。完整列表见代码中的 `DEFAULT_MODEL_MAP`。
+
+## 发版说明
+
+发布新版本时同时发 **GitHub Release（`/releases`）和 tag（`/tags`）**：
+
+```bash
+# 1. 在目标提交上打附注 tag 并推送
+git tag -a vX.Y.Z -m "版本说明" <commit> && git push origin vX.Y.Z
+
+# 2. 通过 API 创建 Release（Release 会自动引用已推送的 tag）
+#    本机无 gh CLI 时可用 git credential 里的 token 调 GitHub API
+```
+
+> 只推 tag 不会出现在 `/releases` 页面——Release 是独立对象，必须单独创建（会引用 tag 并挂发布说明）。
