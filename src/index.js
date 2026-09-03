@@ -24,6 +24,7 @@ function getTodayStr() {
 
 const TOKEN_KV_TTL_SEC = 86400 * 8;    // KV 键保留 8 天（看板 7 日走势需要历史数据）
 const MAX_TIMEOUT_RETRIES = 5;          // 流读取超时最大重试次数
+const USAGE_REFRESH_LIMIT = 3;         // 单次刷新的账号数上限（防 CF 风控，与模式 B 一致）
 
 // 获取 token 统计 KV 键名
 function getTokenDailyKey() {
@@ -370,6 +371,8 @@ const getApiKeys = createKVGetter('cfg_api_keys', []);
 const getCustomModelMap = createKVGetter('cfg_model_map', {});
 const getModelTokens = createKVGetter('cfg_model_tokens', {});
 const getUsageLimitsConfig = createKVGetter('cfg_limits', {});
+// 模式B账号配置（共用KV，模式A读取用于 GraphQL 真实 Neurons 查询，不写入）
+const getAccounts = createKVGetter('cfg_accounts', []);
 
 async function saveUsageLimitsConfig(env, limits) {
 	const existing = await getUsageLimitsConfig(env);
@@ -531,6 +534,234 @@ function getMonthlyUsageKey() {
 async function getMonthlyUsage(env) {
 	const raw = await env.KV.get(getMonthlyUsageKey());
 	return raw ? parseInt(raw, 10) : 0;
+}
+
+// ===== 模式A真实用量（与模式B同口径：CF GraphQL Analytics API 查询真实 Neurons） =====
+// 模式A此前从 tokens_daily_*（本地token统计）读取用量，与模式B（CF GraphQL真实Neurons）口径不一致：
+// 1) token数≠Neurons（CF按模型计费神经元，与token不是1:1）；2) 模式A无法感知模式B请求。
+// 修复：模式A看板同样走 GraphQL 查询真实 Neurons（AI Binding 计入同一账户的 aiInferenceAdaptiveGroups）。
+
+function browserHeaders(token, contentType = 'application/json') {
+	const headers = {
+		'Authorization': `Bearer ${token}`,
+		'Accept': 'application/json',
+	};
+	if (contentType) headers['Content-Type'] = contentType;
+	return headers;
+}
+
+async function queryGraphQL(accountId, apiToken, startDateTime) {
+	const query = `
+		query GetAIUsage($accountId: String!, $start: String!) {
+			viewer {
+				accounts(filter: { accountTag: $accountId }) {
+					aiInferenceAdaptiveGroups(
+						filter: { datetime_geq: $start }
+						limit: 1000
+					) {
+						count
+						sum {
+							totalNeurons
+						}
+						dimensions {
+							date
+							modelId
+						}
+					}
+				}
+			}
+		}
+	`;
+	const response = await fetch(`https://api.cloudflare.com/client/v4/graphql`, {
+		method: 'POST',
+		headers: browserHeaders(apiToken),
+		body: JSON.stringify({
+			query,
+			variables: {
+				accountId,
+				start: startDateTime
+			}
+		}),
+		signal: AbortSignal.timeout(20000),
+	});
+
+	if (!response.ok) {
+		throw new Error(`GraphQL API error: ${response.statusText}`);
+	}
+
+	const result = await response.json();
+	if (result.errors && result.errors.length > 0) {
+		throw new Error(result.errors[0].message);
+	}
+
+	return result?.data?.viewer?.accounts?.[0]?.aiInferenceAdaptiveGroups || [];
+}
+
+function processAnalytics(groups) {
+	const todayStr = getTodayStr();
+
+	let todayTotalNeurons = 0, todayTotalRequests = 0;
+	const todayModelsMap = {}, historyMap = {}, historyRequestsMap = {};
+
+	// 先把最近 7 天的历史数据全部初始化为 0
+	for (let i = 6; i >= 0; i--) {
+		const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000);
+		const dStr = d.toISOString().split('T')[0];
+		historyMap[dStr] = 0;
+		historyRequestsMap[dStr] = 0;
+	}
+
+	for (const group of groups) {
+		const date = group.dimensions.date;
+		const model = group.dimensions.modelId;
+		const neurons = group.sum?.totalNeurons || 0;
+		const count = group.count || 0;
+
+		if (date === todayStr) {
+			todayTotalNeurons += neurons;
+			todayTotalRequests += count;
+			if (!todayModelsMap[model]) {
+				todayModelsMap[model] = { model, neurons: 0, requests: 0 };
+			}
+			todayModelsMap[model].neurons += neurons;
+			todayModelsMap[model].requests += count;
+		}
+
+		if (historyMap[date] !== undefined) {
+			historyMap[date] += neurons;
+			historyRequestsMap[date] += count;
+		}
+	}
+
+	const todayModels = Object.values(todayModelsMap).sort((a, b) => b.neurons - a.neurons);
+	const history = Object.keys(historyMap)
+		.sort()
+		.map(date => ({ date, neurons: historyMap[date], requests: historyRequestsMap[date] }));
+
+	return {
+		todayTotalNeurons,
+		todayTotalRequests,
+		todayModels,
+		history
+	};
+}
+
+// 刷新模式B账号列表的 GraphQL 用量缓存（cache_usage_details），与模式B refreshAccountsUsage 同逻辑。
+// 模式A共用同一KV，读同一缓存键保证两模式看板一致。
+async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) {
+	const cachedDetailsRaw = await env.KV.get('cache_usage_details');
+	let cacheMap = {};
+	if (cachedDetailsRaw) {
+		try {
+			cacheMap = JSON.parse(cachedDetailsRaw) || {};
+		} catch (e) {
+			cacheMap = {};
+		}
+	}
+
+	// 按最后更新时间升序，优先更新最旧数据
+	const sortedAccounts = [...accounts].sort((a, b) => {
+		const tA = cacheMap[a.id]?.timestamp || 0;
+		const tB = cacheMap[b.id]?.timestamp || 0;
+		return tA - tB;
+	});
+
+	const accountsToUpdate = sortedAccounts.slice(0, limit);
+
+	const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+	sevenDaysAgo.setUTCHours(0, 0, 0, 0);
+	const startSevenDays = sevenDaysAgo.toISOString().split('.')[0] + 'Z';
+
+	const todayUTC = new Date();
+	todayUTC.setUTCHours(0, 0, 0, 0);
+
+	// 月初日期
+	const monthStart = new Date(Date.UTC(todayUTC.getUTCFullYear(), todayUTC.getUTCMonth(), 1));
+	const startMonth = monthStart.toISOString().split('.')[0] + 'Z';
+
+	for (const account of accountsToUpdate) {
+		try {
+			// 7 天窗口单次查询，提取今日+历史数据
+			const historyGroups = await queryGraphQL(account.accountId, account.apiToken, startSevenDays);
+			const historyParsed = processAnalytics(historyGroups);
+
+			const todayUsage = historyParsed.todayTotalNeurons;
+			const todayRequests = historyParsed.todayTotalRequests;
+			const todayModels = historyParsed.todayModels;
+			const todayDateStr = getTodayStr();
+
+			// 月初在窗口内则从同一查询提取，否则独立查
+			let monthlyTotal;
+			let monthlyRequests = 0;
+			const monthStartStr = monthStart.toISOString().split('T')[0];
+			if (historyParsed.history.some(h => h.date === monthStartStr)) {
+				// 汇总本月数据
+				monthlyTotal = historyGroups.reduce((sum, g) => {
+					if (g.dimensions.date >= monthStartStr) return sum + (g.sum?.totalNeurons || 0);
+					return sum;
+				}, 0);
+				monthlyRequests = historyGroups.reduce((sum, g) => {
+					if (g.dimensions.date >= monthStartStr) return sum + (g.count || 0);
+					return sum;
+				}, 0);
+			} else {
+				// 月初不在窗口内，独立查询
+				const monthGroups = await queryGraphQL(account.accountId, account.apiToken, startMonth)
+					.catch(e => {
+						// 仅记录账号名与错误消息，避免异常对象可能携带请求头/token 被 tail workers 捕获
+						console.error(`Monthly query failed for ${account.name}: ${e?.message || e}`);
+						return null;
+					});
+				if (monthGroups) {
+					monthlyTotal = monthGroups.reduce((sum, g) => sum + (g.sum?.totalNeurons || 0), 0);
+					monthlyRequests = monthGroups.reduce((sum, g) => sum + (g.count || 0), 0);
+				} else {
+					monthlyTotal = cacheMap[account.id]?.usageThisMonth || 0;
+					monthlyRequests = cacheMap[account.id]?.usageThisMonthRequests || 0;
+				}
+			}
+
+			cacheMap[account.id] = {
+				status: 'active',
+				error: null,
+				todayDate: todayDateStr,
+				usageToday: todayUsage,
+				usageTodayRequests: todayRequests,
+				modelsToday: todayModels,
+				history: historyParsed.history,
+				usageThisMonth: monthlyTotal,
+				usageThisMonthRequests: monthlyRequests,
+				timestamp: Date.now()
+			};
+		} catch (e) {
+			// 仅记录账号名与错误消息，避免异常对象可能携带请求头/token 被 tail workers 捕获
+			console.error(`Error querying GraphQL for ${account.name}: ${e?.message || e}`);
+			cacheMap[account.id] = {
+				status: 'error',
+				error: e.message,
+				todayDate: cacheMap[account.id]?.todayDate || '',
+				usageToday: cacheMap[account.id]?.usageToday || 0,
+				usageTodayRequests: cacheMap[account.id]?.usageTodayRequests || 0,
+				modelsToday: cacheMap[account.id]?.modelsToday || [],
+				history: cacheMap[account.id]?.history || [],
+				usageThisMonth: cacheMap[account.id]?.usageThisMonth || 0,
+				usageThisMonthRequests: cacheMap[account.id]?.usageThisMonthRequests || 0,
+				timestamp: Date.now() // 即使出错也更新时间戳，以便其他账号轮转刷新
+			};
+		}
+		// 串行查询，每个账号之间加间隔，避免触发风控
+		await new Promise(r => setTimeout(r, 500 + Math.random() * 300));
+	}
+	await env.KV.put('cache_usage_details', JSON.stringify(cacheMap));
+
+	// 汇总月度用量写入 KV
+	let totalMonthly = 0;
+	for (const [, data] of Object.entries(cacheMap)) {
+		totalMonthly += data.usageThisMonth || 0;
+	}
+	await env.KV.put(getMonthlyUsageKey(), String(totalMonthly), { expirationTtl: MONTHLY_USAGE_TTL_SEC });
+
+	return cacheMap;
 }
 
 // 用量限额检查（简化版：从 token 统计 KV 获取用量）
@@ -3016,7 +3247,7 @@ async function handleDashboardApi(request, env, ctx) {
 		});
 	}
 
-	// 用量汇总（简化版：从 token 统计 KV 获取）
+	// 用量汇总（真实 Neurons 口径：GraphQL Analytics，与模式B一致）
 	if (url.pathname === '/api/usage/summary' && method === 'GET') {
 		const isAuthorized = await checkAdminAuth(request, env);
 		if (!isAuthorized) {
@@ -3025,35 +3256,57 @@ async function handleDashboardApi(request, env, ctx) {
 
 		{
 			const limits = await getUsageLimits(env);
-			const stats = await getTodayTokenStats(env);
+			const accounts = await getAccounts(env);
 			const monthlyUsage = await getMonthlyUsage(env);
 
-			// 今日模型消耗占比：从今日统计的 models 字段提取
-			let summaryModelsToday = [];
-			try {
-				const rawToday = await env.KV.get(getTokenDailyKey());
-				if (rawToday) {
-					const todayData = JSON.parse(rawToday);
-					const models = todayData.models || {};
-					summaryModelsToday = Object.entries(models).map(([name, m]) => ({ model: name, neurons: (m.input || 0) + (m.output || 0) }));
+			// 汇总缓存中各账号今日数据（模式B写入的 cache_usage_details，两模式共用KV同口径）
+			const cachedDetailsRaw = await env.KV.get('cache_usage_details');
+			let cacheMap = {};
+			if (cachedDetailsRaw) {
+				try { cacheMap = JSON.parse(cachedDetailsRaw) || {}; } catch (e) { cacheMap = {}; }
+			}
+			const todayStr = getTodayStr();
+			let totalNeuronsToday = 0;
+			let totalRequestsToday = 0;
+			let totalRequestsMonth = 0;
+			const modelsToday = {};
+			for (const account of accounts) {
+				const cachedItem = cacheMap[account.id];
+				if (!cachedItem) continue;
+				if (cachedItem.todayDate === todayStr) {
+					totalNeuronsToday += cachedItem.usageToday || 0;
+					totalRequestsToday += cachedItem.usageTodayRequests || 0;
+					if (cachedItem.modelsToday) {
+						cachedItem.modelsToday.forEach(m => {
+							modelsToday[m.model] = (modelsToday[m.model] || 0) + m.neurons;
+						});
+					}
+				} else if (cachedItem.history) {
+					const todayEntry = cachedItem.history.find(h => h.date === todayStr);
+					if (todayEntry) {
+						totalNeuronsToday += todayEntry.neurons;
+						if (todayEntry.requests) totalRequestsToday += todayEntry.requests;
+					}
 				}
-			} catch (_) { /* 忽略解析错误 */ }
+				if (cachedItem.usageThisMonthRequests) totalRequestsMonth += cachedItem.usageThisMonthRequests;
+			}
+			const formattedModelsToday = Object.keys(modelsToday).map(model => ({ model, neurons: modelsToday[model] }));
 
 			const summary = {
-				totalNeuronsToday: stats.total,
-				totalRequestsToday: stats.requests,
-				totalRequestsMonth: 0,
-				totalAccounts: 1,
+				totalNeuronsToday,
+				totalRequestsToday,
+				totalRequestsMonth,
+				totalAccounts: accounts.length,
 				totalLimit: limits.dailyLimit,
-				usagePercentage: limits.dailyLimit > 0 ? parseFloat(((stats.total / limits.dailyLimit) * 100).toFixed(2)) : 0,
-				modelsToday: summaryModelsToday,
-				dailyUsage: stats.total,
+				usagePercentage: limits.dailyLimit > 0 ? parseFloat(((totalNeuronsToday / limits.dailyLimit) * 100).toFixed(2)) : 0,
+				modelsToday: formattedModelsToday,
+				dailyUsage: totalNeuronsToday,
 				dailyLimit: limits.dailyLimit,
 				monthlyUsage: monthlyUsage,
 				monthlyLimit: limits.monthlyLimit,
 				threshold: limits.threshold,
-				dailyRequests: stats.requests,
-				monthlyRequests: 0
+				dailyRequests: totalRequestsToday,
+				monthlyRequests: totalRequestsMonth
 			};
 			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
 		}
@@ -3086,61 +3339,65 @@ async function handleDashboardApi(request, env, ctx) {
 		}]), { headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 账号用量（简化版：返回空数据）
+	// 账号用量（真实 Neurons 口径：GraphQL Analytics，与模式B一致）
 	if (url.pathname === '/api/accounts/usage' && method === 'GET') {
 		const limits = await getUsageLimits(env);
-		const stats = await getTodayTokenStats(env);
+		const accounts = await getAccounts(env);
 		const monthlyUsage = await getMonthlyUsage(env);
 
-		// 过去 7 天历史（含今日）：读取 tokens_daily_* 逐日键组装（看板"近 7 日消耗走势"）
-		const historyEntries = await Promise.all(
-			Array.from({ length: 7 }, (_, i) => {
-				const d = new Date(Date.now() - (6 - i) * 86400000);
-				const dateStr = d.toISOString().split('T')[0];
-				return env.KV.get(`tokens_daily_${dateStr}`).then(raw => {
-					if (!raw) return null;
-					try {
-						const day = JSON.parse(raw);
-						return { date: dateStr, neurons: (day.input || 0) + (day.output || 0), requests: day.requests || 0 };
-					} catch (_) { return null; }
-				}).catch(() => null);
-			})
-		);
-		const history = historyEntries.filter(Boolean);
+		// 无模式B账号配置时返回空数据（兼容模式A单账号部署）
+		if (accounts.length === 0) {
+			return new Response(JSON.stringify({
+				accounts: [],
+				limits: { dailyUsage: 0, dailyRequests: 0, dailyLimit: limits.dailyLimit, monthlyUsage: 0, monthlyRequests: 0, monthlyLimit: limits.monthlyLimit, threshold: limits.threshold }
+			}), { headers: { 'Content-Type': 'application/json' } });
+		}
 
-		// 今日模型消耗占比：从今日统计的 models 字段提取
-		let modelsToday = [];
-		try {
-			const rawToday = await env.KV.get(getTokenDailyKey());
-			if (rawToday) {
-				const todayData = JSON.parse(rawToday);
-				const models = todayData.models || {};
-				modelsToday = Object.entries(models).map(([name, m]) => ({ model: name, neurons: (m.input || 0) + (m.output || 0) }));
+		// 刷新 GraphQL 缓存（与模式B refreshAccountsUsage 同逻辑同KV键，保证两模式看板一致）
+		const cacheMap = await refreshAccountsUsage(env, accounts);
+
+		const todayStr = getTodayStr();
+		const results = accounts.map(account => {
+			const cached = cacheMap[account.id];
+			let usageToday = 0;
+			let usageTodayRequests = 0;
+			if (cached) {
+				if (cached.todayDate === todayStr) {
+					usageToday = cached.usageToday || 0;
+					usageTodayRequests = cached.usageTodayRequests || 0;
+				} else if (cached.history) {
+					const todayEntry = cached.history.find(h => h.date === todayStr);
+					usageToday = todayEntry ? todayEntry.neurons : 0;
+					usageTodayRequests = todayEntry && todayEntry.requests ? todayEntry.requests : 0;
+				}
 			}
-		} catch (_) { /* 忽略解析错误 */ }
+			return {
+				id: account.id,
+				name: account.name,
+				accountId: account.accountId,
+				status: cached ? cached.status : 'pending',
+				error: cached ? cached.error : undefined,
+				usageToday,
+				usageTodayRequests,
+				modelsToday: cached && cached.todayDate === todayStr ? (cached.modelsToday || []) : [],
+				history: cached ? cached.history : [],
+				lastUpdated: cached ? cached.timestamp : 0
+			};
+		});
+
+		// 汇总今日用量和请求次数
+		let dailyUsage = 0;
+		let dailyRequests = 0;
+		let monthlyRequests = 0;
+		results.forEach(a => { dailyUsage += a.usageToday || 0; dailyRequests += a.usageTodayRequests || 0; });
+		// 月度数据
+		for (const [, data] of Object.entries(cacheMap)) {
+			if (data.usageThisMonthRequests) monthlyRequests += data.usageThisMonthRequests;
+		}
 
 		return new Response(JSON.stringify({
-			accounts: [{
-				id: 'binding-single',
-				name: 'AI Binding',
-				accountId: 'binding',
-				status: 'active',
-				error: undefined,
-				usageToday: stats.total,
-				usageTodayRequests: stats.requests,
-				modelsToday,
-				history,
-				lastUpdated: Date.now()
-			}],
-			limits: {
-				dailyUsage: stats.total,
-				dailyRequests: stats.requests,
-				dailyLimit: limits.dailyLimit,
-				monthlyUsage: monthlyUsage,
-				monthlyRequests: 0,
-				monthlyLimit: limits.monthlyLimit,
-				threshold: limits.threshold
-			}
+			accounts: results,
+			limits: { dailyUsage, dailyRequests, dailyLimit: limits.dailyLimit, monthlyUsage, monthlyRequests, monthlyLimit: limits.monthlyLimit, threshold: limits.threshold }
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
