@@ -972,13 +972,15 @@ function estimateReqTokens(options) {
 	return n;
 }
 
-function oversizeTokenLimit(env) {
+function oversizeTokenLimit(env, modelTokens) {
 	const n = Number(env && env.OVERSIZE_TOKENS);
-	return Number.isFinite(n) && n >= 0 ? Math.floor(n) : OVERSIZE_TOKENS;
+	if (Number.isFinite(n) && n >= 0) return Math.floor(n);
+	if (Number.isFinite(modelTokens) && modelTokens > 0) return Math.floor(modelTokens);
+	return OVERSIZE_TOKENS;
 }
 
-function shouldRejectOversize(options, env) {
-	const tokenLimit = oversizeTokenLimit(env);
+function shouldRejectOversize(options, env, modelTokens) {
+	const tokenLimit = oversizeTokenLimit(env, modelTokens);
 	return tokenLimit > 0 && estimateReqTokens(options) > tokenLimit;
 }
 
@@ -1269,9 +1271,9 @@ async function handleCompletions(request, env, ctx, pathname) {
 		}
 	}
 
-	// P3: 过大闸检查
-	if (shouldRejectOversize(cfPayload, env)) {
-		const wan = Math.max(1, Math.round(oversizeTokenLimit(env) / 10000));
+	// P3: 过大闸检查（闸值优先级：env 显式配置 > 模型自身 tokens > 默认 20 万）
+	if (shouldRejectOversize(cfPayload, env, tokens)) {
+		const wan = Math.max(1, Math.round(oversizeTokenLimit(env, tokens) / 10000));
 		return jsonError(`上下文过长：一轮最多发 ${wan} 万 token。请在客户端压缩对话或开新会话后重试。`, 400, 'invalid_request_error');
 	}
 
@@ -1604,9 +1606,9 @@ async function handleMessages(request, env, ctx) {
 		}
 	}
 
-	// P3: 过大闸检查
-	if (shouldRejectOversize(openaiBody, env)) {
-		const wan = Math.max(1, Math.round(oversizeTokenLimit(env) / 10000));
+	// P3: 过大闸检查（闸值优先级：env 显式配置 > 模型自身 tokens > 默认 20 万）
+	if (shouldRejectOversize(openaiBody, env, tokens)) {
+		const wan = Math.max(1, Math.round(oversizeTokenLimit(env, tokens) / 10000));
 		return anthropicError(`上下文过长：一轮最多发 ${wan} 万 token。请在客户端压缩对话或开新会话后重试。`, 400);
 	}
 
@@ -2215,9 +2217,9 @@ async function handleResponses(request, env, ctx) {
 		}
 	}
 
-	// P3: 过大闸检查
-	if (shouldRejectOversize(openaiBody, env)) {
-		const wan = Math.max(1, Math.round(oversizeTokenLimit(env) / 10000));
+	// P3: 过大闸检查（闸值优先级：env 显式配置 > 模型自身 tokens > 默认 20 万）
+	if (shouldRejectOversize(openaiBody, env, tokens)) {
+		const wan = Math.max(1, Math.round(oversizeTokenLimit(env, tokens) / 10000));
 		return jsonError(`上下文过长：一轮最多发 ${wan} 万 token。请在客户端压缩对话或开新会话后重试。`, 400, 'invalid_request_error');
 	}
 
