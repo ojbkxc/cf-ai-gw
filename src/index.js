@@ -1021,6 +1021,14 @@ function normalizeBindingResult(result, cfModel) {
 	return result;
 }
 
+// env.AI.run 第 3 参挂 AI Gateway 选项：gateway.id=ojbkxc（用户已有网关，平台侧记录日志）
+// + cacheTtl 3600 响应缓存（相同前缀请求 1 小时内命中缓存，免费返回，长会话场景省额度）
+function aiRunOptions(env, base) {
+	const gwId = env && env.AI_GATEWAY_ID;
+	if (gwId === 'off') return base;
+	return { ...base, gateway: { id: gwId || 'ojbkxc', cacheTtl: 3600 } };
+}
+
 async function callBindingChat(cfModel, cfPayload, env, stream) {
 	// 熔断器开闸 → 快速失败
 	if (cbOpen()) {
@@ -1031,7 +1039,7 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 	try {
 		if (stream) {
 			const inputs = { ...cfPayload, stream: true };
-			const resp = await env.AI.run(cfModel, inputs, { returnRawResponse: true, signal: AbortSignal.timeout(600000) });
+			const resp = await env.AI.run(cfModel, inputs, aiRunOptions(env, { returnRawResponse: true, signal: AbortSignal.timeout(600000) }));
 			if (!resp.ok) {
 				const errText = await resp.text();
 				let parsedErr;
@@ -1050,7 +1058,7 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 			noteModelOk(cfModel);
 			return { success: true, status: resp.status, stream: resp.body };
 		}
-		const result = await env.AI.run(cfModel, cfPayload, { signal: AbortSignal.timeout(120000) });
+		const result = await env.AI.run(cfModel, cfPayload, aiRunOptions(env, { signal: AbortSignal.timeout(120000) }));
 		cbOnSuccess(env);
 		noteModelOk(cfModel);
 		return { success: true, status: 200, data: normalizeBindingResult(result, cfModel) };
@@ -2744,7 +2752,7 @@ async function handleEmbeddings(request, env, ctx) {
 	const textArray = Array.isArray(input) ? input : [input];
 
 	try {
-		const result = await env.AI.run(cfModel, { text: textArray }, { signal: AbortSignal.timeout(120000) });
+		const result = await env.AI.run(cfModel, { text: textArray }, aiRunOptions(env, { signal: AbortSignal.timeout(120000) }));
 		// AI Binding 返回格式: { data: [[...embeddings]] } 或直接是 embedding 数组
 		let data;
 		if (result.data && Array.isArray(result.data)) {
@@ -2808,7 +2816,7 @@ async function handleImageGenerations(request, env, ctx) {
 		// flux 系列 schema 仅接受 prompt（多传 width/height/num_steps 会 400 Additional properties not allowed）
 		const cfPayload = cfModel.includes('flux') ? { prompt } : { prompt, width, height };
 
-		const result = await env.AI.run(cfModel, cfPayload, { signal: AbortSignal.timeout(120000) });
+		const result = await env.AI.run(cfModel, cfPayload, aiRunOptions(env, { signal: AbortSignal.timeout(120000) }));
 
 		// AI Binding 返回格式: flux 系列 JSON { image: "base64string" }；sdxl 等二进制模型返回 ReadableStream（官方文档）
 		let rawImage;
@@ -2914,7 +2922,7 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 		// translations 加 task 参数
 		const whisperInput = { audio: [...audioUint8] };
 		if (isTranslation) whisperInput.task = 'translate';
-		const result = await env.AI.run(actualCfModel, whisperInput, { signal: AbortSignal.timeout(120000) });
+		const result = await env.AI.run(actualCfModel, whisperInput, aiRunOptions(env, { signal: AbortSignal.timeout(120000) }));
 
 		const text = result.text || '';
 
