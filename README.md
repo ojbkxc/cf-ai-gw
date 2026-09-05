@@ -39,7 +39,7 @@ npx wrangler deploy
 | AI 绑定 | Settings → **Bindings** | 添加 Workers AI Binding，Variable name 填 `AI`（模式 A 必需） |
 | `ADMIN_PASSWORD` | Settings → **Variables & Secrets** | 管理面板登录密码（必填） |
 
-> **注意**：`wrangler.toml` 已精简，不再包含 KV/AI/环境变量配置。所有绑定和变量均在 Dashboard 中配置，推代码不会覆盖。
+> **注意**：`wrangler.toml` 中已声明 KV/AI 绑定与 `[vars] ADMIN_PASSWORD`，`npx wrangler deploy` 会按 toml 部署；Dashboard 中手工添加的绑定/变量（如自定义域 routes）在 deploy 时可能被覆盖，diff 警告需仔细确认。
 
 ### 3. 配置 Cloudflare 账号（模式 B）
 
@@ -51,7 +51,7 @@ npx wrangler deploy
    - **名称**：任意，用于区分多个账号
 
 > 支持添加多个账号，自动负载均衡和故障切换。账号信息以明文存储在 KV 中。
-> 模式 A 无需配置账号（AI Binding 即账号），但看板的真实 Neurons 数据同样来自账号列表的 GraphQL 查询——建议配置至少一个账号以获得完整看板。
+> 模式 A 无需配置账号（AI Binding 即账号），但看板的真实 Neurons 数据同样来自账号列表的 GraphQL 查询——模式 A 的管理面板**只读**展示账号（无法增删），需先在模式 B 面板添加账号（两者共用同一 KV），或模式 A 面板配置为空时看板显示空数据。
 
 ### 4. 创建 API Key
 
@@ -160,13 +160,15 @@ npx wrangler pages deploy dist-pages --project-name cf-ai-gw --branch main
 |------|------|
 | `/admin` | 可视化管理面板 |
 | `/api/auth/login` | 登录 |
+| `/api/auth/logout` | 退出登录 |
 | `/api/tokens/today` | 今日 Token 统计（本地 token 口径） |
 | `/api/usage/summary` | 用量汇总（真实 Neurons） |
 | `/api/accounts/usage` | 账号用量明细（真实 Neurons） |
 | `/api/keys` | API Key 管理 |
 | `/api/settings` | 模型映射配置 |
 | `/api/limits` | 限额配置 |
-| `/api/accounts` | 账号管理 |
+| `/api/accounts` | 账号管理（模式 A 只读） |
+| `/api/accounts/test` | 账号连通性测试 |
 | `/api/models/search` | 搜索 CF 可用模型 |
 
 ## 可选环境变量
@@ -177,7 +179,7 @@ npx wrangler pages deploy dist-pages --project-name cf-ai-gw --branch main
 | `MONTHLY_LIMIT` | 100000 | 每月限额 |
 | `USAGE_THRESHOLD` | 0 | 限额拦截阈值（0=仅统计不拦截） |
 | `STRICT_MODEL_MATCH` | 关 | 设为 `true` 时无效模型名返回 404（默认回退兜底模型） |
-| `OVERSIZE_TOKENS` | 200000 | 请求过大 token 闸（仅模式 A） |
+| `OVERSIZE_TOKENS` | 按模型 | 请求过大 token 闸（仅模式 A）。闸值优先级：显式配置值 > 模型自身 token 上限（含 KV 自定义）> 默认 200000；设 `0` 关闭 |
 | `CB_WINDOW_MS` | 10000 | 熔断器窗口（毫秒，仅模式 A） |
 | `CB_FAIL_THRESHOLD` | 8 | 熔断器失败阈值（仅模式 A） |
 | `CB_COOLDOWN_MS` | 4000 | 熔断器冷却时间（毫秒，仅模式 A） |
@@ -233,6 +235,7 @@ npx wrangler pages deploy dist-pages --project-name cf-ai-gw --branch main
 | 模型名 | Cloudflare 模型 |
 |--------|----------------|
 | `llava-1.5-7b` | `@cf/llava-hf/llava-1.5-7b-hf` |
+| `moondream3.1-9B-A2B` | `@cf/moondream/moondream3.1-9B-A2B` |
 | `flux-1-schnell` | `@cf/black-forest-labs/flux-1-schnell` |
 | `flux` | `@cf/black-forest-labs/flux-1-schnell`（别名） |
 | `sdxl` | `@cf/stabilityai/stable-diffusion-xl-base-1.0` |

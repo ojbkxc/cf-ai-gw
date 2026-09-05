@@ -23,7 +23,6 @@ function getTodayStr() {
 }
 
 const TOKEN_KV_TTL_SEC = 86400 * 8;    // KV 键保留 8 天（看板 7 日走势需要历史数据）
-const MAX_TIMEOUT_RETRIES = 5;          // 流读取超时最大重试次数
 const USAGE_REFRESH_LIMIT = 3;         // 单次刷新的账号数上限（防 CF 风控，与模式 B 一致）
 
 // 获取 token 统计 KV 键名
@@ -118,6 +117,12 @@ async function getTodayTokenStats(env) {
 
 // 找不到模型映射时的兜底模型
 const DEFAULT_FALLBACK_MODEL = '@cf/zai-org/glm-4.7-flash';
+
+// 响应头只允许 Latin-1，含中文等非 Latin-1 字符时 Headers 构造会抛 TypeError → 全局 500
+function sanitizeHeaderValue(v) {
+	if (!v) return v;
+	return v.replace(/[^\x20-\x7E\xA0-\xFF]/g, '?');
+}
 
 // 默认模型映射表
 const DEFAULT_MODEL_MAP = {
@@ -1235,7 +1240,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 	}
 
 	const { cfModel, isFallback, tokens } = await resolveModelName(model, env);
-	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model}" not found in mapping, fell back to ${cfModel}`) : null;
 	if (isFallback && model && (env.STRICT_MODEL_MATCH || '').toLowerCase() === 'true') {
 		return jsonError(`Model '${model}' not found`, 404, "invalid_request_error", "model_not_found");
 	}
@@ -1583,7 +1588,7 @@ async function handleMessages(request, env, ctx) {
 
 	const model = anthropicBody.model;
 	const { cfModel, isFallback, tokens } = await resolveModelName(model, env);
-	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model}" not found in mapping, fell back to ${cfModel}`) : null;
 	if (isFallback && model && (env.STRICT_MODEL_MATCH || '').toLowerCase() === 'true') {
 		return anthropicError(`Model '${model}' not found`, 404);
 	}
@@ -2194,7 +2199,7 @@ async function handleResponses(request, env, ctx) {
 
 	const model = responsesBody.model;
 	const { cfModel, isFallback, tokens } = await resolveModelName(model, env);
-	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model}" not found in mapping, fell back to ${cfModel}`) : null;
 	if (isFallback && model && (env.STRICT_MODEL_MATCH || '').toLowerCase() === 'true') {
 		return jsonError(`Model '${model}' not found`, 404, "invalid_request_error", "model_not_found");
 	}
@@ -2735,7 +2740,7 @@ async function handleEmbeddings(request, env, ctx) {
 	}
 
 	const { cfModel, isFallback, tokens } = await resolveModelName(model, env);
-	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model}" not found in mapping, fell back to ${cfModel}`) : null;
 	const textArray = Array.isArray(input) ? input : [input];
 
 	try {
@@ -2787,7 +2792,7 @@ async function handleImageGenerations(request, env, ctx) {
 	}
 
 	const { cfModel, isFallback, tokens } = await resolveModelName(model || 'flux-1-schnell', env);
-	const fallbackWarning = isFallback ? `Model "${model || 'flux-1-schnell'}" not found in mapping, fell back to ${cfModel}` : null;
+	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model || 'flux-1-schnell'}" not found in mapping, fell back to ${cfModel}`) : null;
 
 	let width = 1024, height = 1024;
 	if (body.size && typeof body.size === 'string') {
@@ -2889,7 +2894,7 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 		}
 
 		const { cfModel, isFallback, tokens } = await resolveModelName(model, env);
-		const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+		const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model}" not found in mapping, fell back to ${cfModel}`) : null;
 
 		const WHISPER_MODEL = '@cf/openai/whisper-large-v3-turbo';
 		const actualCfModel = cfModel.includes('whisper') ? cfModel : WHISPER_MODEL;
@@ -2938,7 +2943,7 @@ async function handleAudioSpeech(request, env, ctx) {
 	}
 
 	const { cfModel, isFallback, tokens } = await resolveModelName(model || 'tts', env);
-	const fallbackWarning = isFallback ? `Model "${model || 'tts'}" not found in mapping, fell back to ${cfModel}` : null;
+	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model || 'tts'}" not found in mapping, fell back to ${cfModel}`) : null;
 
 	// aura-2 的输入字段是 text 且 schema 严格（透传 OpenAI 的 voice/speed 等字段会 400）
 	const cfPayload = cfModel.includes('aura') ? { text: input } : { prompt: input };
@@ -5559,41 +5564,6 @@ async function handleAdminPage(request, env, ctx) {
 		</main>
 	</div>
 
-	<!-- Modal: Add Cloudflare Account -->
-	<div class="modal-overlay" id="account-modal">
-		<div class="modal-card">
-			<div class="modal-header">
-				<h3 id="account-modal-title">添加 Cloudflare 账号</h3>
-				<button onclick="closeAccountModal()" class="close-btn">${SVG_CLOSE}</button>
-			</div>
-			<input type="hidden" id="account-id-edit">
-			<div class="form-group">
-				<label for="account-name">账号别名 (如: 主账号 A)</label>
-				<input type="text" id="account-name" placeholder="请输入备注名">
-			</div>
-			<div class="form-group">
-				<label for="account-id">Account ID</label>
-				<input type="text" id="account-id" placeholder="获取于 CF 控制台 Workers AI 页面" oninput="onAccountInfoChange()">
-			</div>
-			<div class="form-group">
-				<label for="account-token">API Token (需要创建并赋予以下 3 个权限):</label>
-				<div style="font-size: 12px; color: var(--text-muted); background: rgba(0,0,0,0.15); padding: 8px 12px; border-radius: 6px; margin-top: 4px; margin-bottom: 4px; line-height: 1.5; font-family: monospace;">
-					• Workers AI &gt; Read <span id="perm-wa-read" style="margin-left: 8px;"></span><br>
-					• Workers AI &gt; Edit <span id="perm-wa-edit" style="margin-left: 8px;"></span><br>
-					• Account Analytics &gt; Read <span id="perm-aa-read" style="margin-left: 8px;"></span>
-				</div>
-				<input type="text" id="account-token" placeholder="CF 账号 API Token (会安全遮蔽保存)" oninput="onAccountInfoChange()">
-			</div>
-			
-			<div id="test-result-alert" style="display: none; padding: 12px 16px; border-radius: 8px; font-size: 13px; font-weight: 500; word-break: break-word; overflow-wrap: break-word; max-height: 200px; overflow-y: auto; line-height: 1.6; border: 1px solid transparent;"></div>
-
-			<div class="modal-footer">
-				<button class="btn btn-success" onclick="testConnection()" id="btn-test-conn">测试连接</button>
-				<button class="btn btn-primary" onclick="saveAccount()" id="btn-save-account" disabled>保存账号</button>
-			</div>
-		</div>
-	</div>
-
 	<!-- Modal: Add API Key -->
 	<div class="modal-overlay" id="key-modal">
 		<div class="modal-card">
@@ -5696,7 +5666,7 @@ async function handleAdminPage(request, env, ctx) {
 			const newAccountIds = new Set();
 
 			if (accounts.length === 0) {
-				usageList.innerHTML = '<div style="color: var(--text-muted); font-size:14px; text-align:center; padding: 20px; width: 100%;">没有绑定的账号，请前往\u201c账号管理\u201d添加账号。</div>';
+				usageList.innerHTML = '<div style="color: var(--text-muted); font-size:14px; text-align:center; padding: 20px; width: 100%;">暂无账号数据。模式 A 用量数据来自模式 B 面板配置的账号（共用 KV）；仅部署模式 A 时看板显示空数据。</div>';
 				updateLimitCards(limits);
 				return;
 			}
@@ -6048,7 +6018,6 @@ async function handleAdminPage(request, env, ctx) {
 
 			const titles = {
 				overview: '数据看板',
-				accounts: '账号管理',
 				keys: 'API 密钥',
 				limits: '限额配置',
 				settings: '模型映射'
@@ -6059,8 +6028,6 @@ async function handleAdminPage(request, env, ctx) {
 			if (tabName === 'overview') {
 				loadUsageDetails();
 				loadTokenStats();
-			} else if (tabName === 'accounts') {
-				loadAccounts();
 			} else if (tabName === 'keys') {
 				loadKeys();
 			} else if (tabName === 'limits') {
@@ -6216,201 +6183,6 @@ async function handleAdminPage(request, env, ctx) {
 			}
 		}
 
-		async function loadAccounts() {
-			await loadTableData('/api/accounts', 'accounts-table-body', '暂无配置的 Cloudflare 账号', (acc) => {
-				const maskedToken = acc.apiToken.length > 8 ? acc.apiToken.substring(0, 4) + '...' + acc.apiToken.substring(acc.apiToken.length - 4) : '********';
-				// P3-6: 模式 A 单账号（id='binding-single'）由 Cloudflare Binding 配置，不支持 CRUD，隐藏编辑/删除按钮
-				const isBindingMode = acc.id === 'binding-single';
-				return \`
-					<td><strong style="font-weight:600;">\${escapeHtml(acc.name)}</strong></td>
-					<td><code>\${escapeHtml(acc.accountId)}</code></td>
-					<td><code>\${escapeHtml(maskedToken)}</code></td>
-					<td>
-						\${isBindingMode ? '<span style="color: var(--text-muted); font-size: 12px;">由 Binding 配置（只读）</span>' : \`<div style="display:flex; gap:8px;">
-							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" onclick="editAccount(\${attrEscape(acc.id)}, \${attrEscape(acc.name)}, \${attrEscape(acc.accountId)}, \${attrEscape(acc.apiToken)})">编辑</button>
-							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteAccount(\${attrEscape(acc.id)})">删除</button>
-						</div>\`}
-					</td>
-				\`;
-			});
-		}
-
-		function openAddAccountModal() {
-			document.getElementById('account-modal-title').innerText = '添加 Cloudflare 账号';
-			document.getElementById('account-id-edit').value = '';
-			document.getElementById('account-name').value = '';
-			document.getElementById('account-id').value = '';
-			document.getElementById('account-token').value = '';
-			document.getElementById('test-result-alert').style.display = 'none';
-			document.getElementById('perm-wa-read').innerHTML = '';
-			document.getElementById('perm-wa-edit').innerHTML = '';
-			document.getElementById('perm-aa-read').innerHTML = '';
-			document.getElementById('btn-save-account').disabled = true;
-			document.getElementById('account-modal').classList.add('active');
-		}
-
-		function closeAccountModal() {
-			document.getElementById('account-modal').classList.remove('active');
-		}
-
-		function editAccount(id, name, accountId, apiToken) {
-			document.getElementById('account-modal-title').innerText = '编辑 Cloudflare 账号';
-			document.getElementById('account-id-edit').value = id;
-			document.getElementById('account-name').value = name;
-			document.getElementById('account-id').value = accountId;
-			document.getElementById('account-token').value = apiToken;
-			document.getElementById('test-result-alert').style.display = 'none';
-			document.getElementById('perm-wa-read').innerHTML = '';
-			document.getElementById('perm-wa-edit').innerHTML = '';
-			document.getElementById('perm-aa-read').innerHTML = '';
-			document.getElementById('btn-save-account').disabled = true;
-			document.getElementById('account-modal').classList.add('active');
-		}
-
-		function onAccountInfoChange() {
-			document.getElementById('btn-save-account').disabled = true;
-			document.getElementById('test-result-alert').style.display = 'none';
-			document.getElementById('perm-wa-read').innerHTML = '';
-			document.getElementById('perm-wa-edit').innerHTML = '';
-			document.getElementById('perm-aa-read').innerHTML = '';
-		}
-
-		function updatePermissionStatus(elementId, statusObj) {
-			const el = document.getElementById(elementId);
-			if (!el) return;
-			if (statusObj && statusObj.success) {
-				el.innerHTML = '<span style="color: #10b981; font-weight: bold; margin-left: 6px;">✅ 有效</span>';
-			} else {
-				const err = (statusObj && statusObj.error) ? statusObj.error : '测试失败';
-			el.innerHTML = '<span style="color: #ef4444; font-weight: bold; margin-left: 6px;" title="' + escapeHtml(err) + '">🔴 无效</span>';
-			}
-		}
-
-		function setAlertStyle(el, type) {
-			const styles = {
-				warning: { bg: 'rgba(245, 158, 11, 0.12)', color: '#f59e0b', border: 'rgba(245, 158, 11, 0.3)' },
-				success: { bg: 'rgba(16, 185, 129, 0.12)', color: '#10b981', border: 'rgba(16, 185, 129, 0.3)' },
-				danger:  { bg: 'rgba(239, 68, 68, 0.12)', color: '#ef4444', border: 'rgba(239, 68, 68, 0.3)' }
-			};
-			const s = styles[type] || styles.danger;
-			el.style.backgroundColor = s.bg;
-			el.style.color = s.color;
-			el.style.borderColor = s.border;
-		}
-
-		const ALERT_ICONS = {
-			spinner: '<svg style="width:16px;height:16px;animation:spinner-border 1s linear infinite;flex-shrink:0;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>',
-			check:    '<svg style="width:18px;height:18px;flex-shrink:0;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>',
-			warning: '<svg style="width:18px;height:18px;flex-shrink:0;margin-top:1px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>'
-		};
-
-		async function testConnection() {
-			const accountId = document.getElementById('account-id').value;
-			const apiToken = document.getElementById('account-token').value;
-			const id = document.getElementById('account-id-edit').value;
-			const alertEl = document.getElementById('test-result-alert');
-			alertEl.style.display = 'block';
-			setAlertStyle(alertEl, 'warning');
-			alertEl.innerHTML = '<div style="display:flex;align-items:center;gap:8px;">' + ALERT_ICONS.spinner + '<span>测试中...</span></div>';
-
-			document.getElementById('perm-wa-read').innerHTML = '';
-			document.getElementById('perm-wa-edit').innerHTML = '';
-			document.getElementById('perm-aa-read').innerHTML = '';
-			document.getElementById('btn-save-account').disabled = true;
-
-			try {
-				const res = await apiFetch('/api/accounts/test', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ id, accountId, apiToken })
-				});
-				const data = await res.json();
-				if (data.permissions) {
-					updatePermissionStatus('perm-wa-read', data.permissions.workersAiRead);
-					updatePermissionStatus('perm-wa-edit', data.permissions.workersAiEdit);
-					updatePermissionStatus('perm-aa-read', data.permissions.accountAnalyticsRead);
-				}
-				if (data.success) {
-					setAlertStyle(alertEl, 'success');
-					alertEl.innerHTML = '<div style="display:flex;align-items:center;gap:8px;">' + ALERT_ICONS.check + '<span>连接成功！API 权限全部有效</span></div>';
-					showToast('连接测试成功！');
-					document.getElementById('btn-save-account').disabled = false;
-				} else {
-					setAlertStyle(alertEl, 'danger');
-
-					// Build structured error details from permissions data
-					let errorDetailHtml = '';
-					if (data.permissions) {
-						const permList = [
-							{ key: 'workersAiRead',       label: 'Workers AI > Read' },
-							{ key: 'workersAiEdit',       label: 'Workers AI > Edit' },
-							{ key: 'accountAnalyticsRead', label: 'Account Analytics > Read' }
-						];
-						const failedItems = permList.filter(p => {
-							const perm = data.permissions[p.key];
-							return perm && !perm.success;
-						});
-						if (failedItems.length > 0) {
-							errorDetailHtml = failedItems.map(p => {
-								const perm = data.permissions[p.key];
-								const errMsg = escapeHtml(perm.error || '未知错误');
-								return '<div style="padding:3px 0;word-break:break-all;overflow-wrap:break-word;"><span style="opacity:0.6;">●</span> <strong>' + p.label + '</strong>: ' + errMsg + '</div>';
-							}).join('');
-						}
-					}
-					if (!errorDetailHtml) {
-						errorDetailHtml = '<div style="padding:3px 0;word-break:break-all;overflow-wrap:break-word;">' + escapeHtml(data.error || '部分权限验证未通过') + '</div>';
-					}
-
-					alertEl.innerHTML = '<div style="display:flex;align-items:flex-start;gap:8px;">' +
-						ALERT_ICONS.warning +
-						'<div style="flex:1;min-width:0;">' +
-						'<div style="font-weight:700;margin-bottom:4px;">连接失败 — 以下权限验证未通过：</div>' +
-						'<div style="font-size:12px;opacity:0.85;line-height:1.7;">' + errorDetailHtml + '</div>' +
-						'</div>' +
-						'</div>';
-
-					showToast('测试连接失败，请检查 Token 权限', 'error');
-					document.getElementById('btn-save-account').disabled = true;
-				}
-			} catch (e) {
-				setAlertStyle(alertEl, 'danger');
-				alertEl.innerHTML = '<div style="display:flex;align-items:center;gap:8px;">' + ALERT_ICONS.warning + '<span>连接超时或异常，请重试</span></div>';
-				showToast('连接异常，请重试', 'error');
-				document.getElementById('btn-save-account').disabled = true;
-			}
-		}
-
-		async function saveAccount() {
-			const id = document.getElementById('account-id-edit').value;
-			const name = document.getElementById('account-name').value;
-			const accountId = document.getElementById('account-id').value;
-			const apiToken = document.getElementById('account-token').value;
-			if (!accountId || !apiToken) {
-				showToast('Account ID 和 API Token 均为必填项！', 'warning');
-				return;
-			}
-			const isEdit = id && id.trim();
-			const apiUrl = isEdit ? '/api/accounts/' + encodeURIComponent(id) : '/api/accounts';
-			const res = await apiFetch(apiUrl, {
-				method: isEdit ? 'PUT' : 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ name, accountId, apiToken })
-			});
-			if (res.ok) {
-				closeAccountModal();
-				loadAccounts();
-				showToast(isEdit ? '账号更新成功！' : '账号创建成功！');
-			} else {
-				showToast('保存失败！', 'error');
-			}
-		}
-
-		async function deleteAccount(id) {
-			if (!confirm('确定要删除这个 Cloudflare 账号吗？')) return;
-			await deleteResource('/api/accounts/', id, loadAccounts, '账号已成功删除', '删除失败');
-		}
-
 		async function loadKeys() {
 			await loadTableData('/api/keys', 'keys-table-body', '暂无配置的 API 密钥', (k) => {
 				const dateStr = new Date(k.createdAt).toLocaleString();
@@ -6418,7 +6190,7 @@ async function handleAdminPage(request, env, ctx) {
 					<td><strong style="font-weight:600;">\${escapeHtml(k.name)}</strong></td>
 					<td>
 						<div style="display:flex; align-items:center; gap:8px;">
-							<code id="key-val-\${k.id}">\${k.key.length > 6 ? k.key.substring(0, 5) + '...' + k.key.substring(k.key.length - 1) : k.key.substring(0, Math.min(3, k.key.length)) + '...'}</code>
+							<code id="key-val-\${k.id}">\${escapeHtml(k.key.length > 6 ? k.key.substring(0, 5) + '...' + k.key.substring(k.key.length - 1) : k.key.substring(0, Math.min(3, k.key.length)) + '...')}</code>
 							<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" onclick="copyKeyText(\${attrEscape(k.key)})">复制</button>
 						</div>
 					</td>

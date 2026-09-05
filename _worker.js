@@ -88,6 +88,18 @@ function isRetryableStatus(status) {
 	return status === 408 || status === 409 || status === 429 || status >= 500;
 }
 
+// 从错误响应体提取 CF 网关错误码（如 4006 断供），供模型断供闩判定
+function extractErrorCode(raw) {
+	if (typeof raw === 'string') {
+		const trimmed = raw.trim();
+		if (!trimmed) return undefined;
+		try { return extractErrorCode(JSON.parse(trimmed)); } catch { return undefined; }
+	}
+	if (!raw || typeof raw !== 'object') return undefined;
+	const first = Array.isArray(raw.errors) && raw.errors[0];
+	return first?.code;
+}
+
 // 从各种错误响应体中提取人类可读的错误信息
 // 支持 CF 网关格式: { errors: [{ code, message }] }
 // 提供商格式: { error: { message } } / { error: "..." } / { message }
@@ -116,6 +128,34 @@ function extractErrorMessage(raw) {
 	if (typeof obj.error === 'string') return obj.error;
 	if (typeof obj.message === 'string') return obj.message;
 	return undefined;
+}
+
+// ===== 模型断供快速失败闩（从模式 A 移植，键为 cfModel 全局维度） =====
+// 连续 MODEL_DOWN_FAILS 次请求都是断供错且持续 > MODEL_DOWN_AFTER_MS → 判死，
+// 后续请求跳过整个 failover 链路直接返回 503，避免 N 账号 × 3 次重试全打满
+const MODEL_DOWN = new Map();
+const MODEL_DOWN_FAILS = 3, MODEL_DOWN_AFTER_MS = 60000;
+function modelDownFails(env) { return Math.max(1, Number(env && env.MODEL_DOWN_FAILS) || MODEL_DOWN_FAILS); }
+function modelDownAfterMs(env) { return Number(env && env.MODEL_DOWN_AFTER_MS) || MODEL_DOWN_AFTER_MS; }
+function isModelDownError(e) {
+	const low = String((e && e.message) || e).toLowerCase();
+	if (low.includes('gate full') || low.includes('circuit open')) return false;
+	return low.includes('4006') || (e && e.code === 4006) || low.includes('temporarily at capacity');
+}
+function noteModelFail(model, e) {
+	if (!model) return;
+	if (!isModelDownError(e)) { MODEL_DOWN.delete(model); return; }
+	const s = MODEL_DOWN.get(model) || { fails: 0, firstAt: Date.now() };
+	s.fails++;
+	if (!s.firstAt) s.firstAt = Date.now();
+	MODEL_DOWN.set(model, s);
+}
+function noteModelOk(model) { if (model) MODEL_DOWN.delete(model); }
+function modelDown(env, model) {
+	if (!model) return false;
+	const s = MODEL_DOWN.get(model);
+	if (!s) return false;
+	return s.fails >= modelDownFails(env) && Date.now() - s.firstAt >= modelDownAfterMs(env);
 }
 
 // 可恢复流：跟踪 SSE 事件边界，在流中断时自动重连。
@@ -295,7 +335,6 @@ function createResumableStream(reader, options) {
 }
 
 const TOKEN_KV_TTL_SEC = 86400 * 2;    // KV 键保留 2 天
-const MAX_TIMEOUT_RETRIES = 5;          // 流读取超时最大重试次数
 
 // 获取 token 统计 KV 键名
 function getTokenDailyKey() {
@@ -381,6 +420,12 @@ async function getTodayTokenStats(env) {
 
 // 找不到模型映射时的兜底模型（resolveModelName 与 DEFAULT_MODEL_MAP 共用，改默认模型只改这里）
 const DEFAULT_FALLBACK_MODEL = '@cf/zai-org/glm-4.7-flash';
+
+// 响应头只允许 Latin-1，含中文等非 Latin-1 字符时 Headers 构造会抛 TypeError → 全局 500
+function sanitizeHeaderValue(v) {
+	if (!v) return v;
+	return v.replace(/[^\x20-\x7E\xA0-\xFF]/g, '?');
+}
 
 // 默认模型映射表（左边是客户端请求的模型名，右边是 Cloudflare 上对应的真实模型）
 const DEFAULT_MODEL_MAP = {
@@ -1296,7 +1341,11 @@ async function handleV1Proxy(request, env, ctx) {
 
 // 可复用的核心 API 调用：OpenAI Chat Completions → Workers AI，支持多账号 failover
 async function callOpenAICompatibleAPI(cfPayload, env, stream) {
-	return withFailover(env, async (account, attempt, accountIndex, activeAccounts) => {
+	// 模型断供闩：判死期间跳过整个 failover 链路，直接快速失败
+	if (modelDown(env, cfPayload.model)) {
+		return { success: false, status: 503, error: '4006: Service temporarily at capacity (model gate)' };
+	}
+	const result = await withFailover(env, async (account, attempt, accountIndex, activeAccounts) => {
 		if (attempt > 0) {
 			console.warn(`[Retry] Retrying account ${accountIndex} (attempt ${attempt + 1}/3)...`);
 		}
@@ -1369,11 +1418,14 @@ async function callOpenAICompatibleAPI(cfPayload, env, stream) {
 
 		const errorText = await cfResponse.text();
 		const error = `CF API returned ${cfResponse.status}: ${extractErrorMessage(errorText) || errorText}`;
+		noteModelFail(cfPayload.model, { message: extractErrorMessage(errorText) || errorText, code: extractErrorCode(errorText) });
 		if (!isRetryableStatus(cfResponse.status)) {
 			return { success: false, status: cfResponse.status, error };
 		}
 		return { retry: true, error, status: cfResponse.status };
 	});
+	if (result.success) noteModelOk(cfPayload.model);
+	return result;
 }
 
 // 共享的模型名解析函数：根据用户传入的模型名，映射到 Cloudflare 实际模型
@@ -1403,7 +1455,11 @@ async function resolveModelName(model, env) {
 // 通用的 CF /ai/run/{model} failover 调用函数
 // 用于 embeddings、images、audio 等非 chat 端点，统一多账号 failover 逻辑
 async function callCFRunAPI(cfModel, buildPayload, processResult, env, { rawResponse = false } = {}) {
-	return withFailover(env, async (account, attempt, accountIndex) => {
+	// 模型断供闩：判死期间跳过整个 failover 链路，直接快速失败
+	if (modelDown(env, cfModel)) {
+		return { success: false, status: 503, error: '4006: Service temporarily at capacity (model gate)' };
+	}
+	const result = await withFailover(env, async (account, attempt, accountIndex) => {
 		let cfPayload = buildPayload(account);
 		// 合并 browserHeaders 确保请求头一致性，Content-Type 由调用方设置（如 FormData 不需要手动设）
 		const { headers: _buildHeaders, ...restPayload } = cfPayload;
@@ -1434,11 +1490,14 @@ async function callCFRunAPI(cfModel, buildPayload, processResult, env, { rawResp
 
 		const errorText = await cfResponse.text();
 		const error = `CF API status ${cfResponse.status}: ${extractErrorMessage(errorText) || errorText}`;
+		noteModelFail(cfModel, { message: extractErrorMessage(errorText) || errorText, code: extractErrorCode(errorText) });
 		if (!isRetryableStatus(cfResponse.status)) {
 			return { success: false, status: cfResponse.status, error };
 		}
 		return { retry: true, error, status: cfResponse.status };
 	});
+	if (result.success) noteModelOk(cfModel);
+	return result;
 }
 
 async function handleCompletions(request, env, ctx, pathname) {
@@ -1457,7 +1516,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 	}
 
 	const { cfModel, isFallback, tokens } = await resolveModelName(model, env);
-	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model}" not found in mapping, fell back to ${cfModel}`) : null;
 	if (isFallback && model && (env.STRICT_MODEL_MATCH || '').toLowerCase() === 'true') {
 		return jsonError(`Model '${model}' not found`, 404, "invalid_request_error", "model_not_found");
 	}
@@ -1822,7 +1881,7 @@ async function handleMessages(request, env, ctx) {
 
 	const model = anthropicBody.model;
 	const { cfModel, isFallback, tokens } = await resolveModelName(model, env);
-	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model}" not found in mapping, fell back to ${cfModel}`) : null;
 	if (isFallback && model && (env.STRICT_MODEL_MATCH || '').toLowerCase() === 'true') {
 		return anthropicError(`Model '${model}' not found`, 404);
 	}
@@ -2430,7 +2489,7 @@ async function handleResponses(request, env, ctx) {
 
 	const model = responsesBody.model;
 	const { cfModel, isFallback, tokens } = await resolveModelName(model, env);
-	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model}" not found in mapping, fell back to ${cfModel}`) : null;
 	if (isFallback && model && (env.STRICT_MODEL_MATCH || '').toLowerCase() === 'true') {
 		return jsonError(`Model '${model}' not found`, 404, "invalid_request_error", "model_not_found");
 	}
@@ -2957,7 +3016,7 @@ async function handleEmbeddings(request, env, ctx) {
 	}
 
 	const { cfModel, isFallback } = await resolveModelName(model, env);
-	const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model}" not found in mapping, fell back to ${cfModel}`) : null;
 	const textArray = Array.isArray(input) ? input : [input];
 
 	const result = await callCFRunAPI(
@@ -3008,7 +3067,7 @@ async function handleImageGenerations(request, env, ctx) {
 
 	// 模型映射：默认使用 flux-1-schnell
 	const { cfModel, isFallback } = await resolveModelName(model || 'flux-1-schnell', env);
-	const fallbackWarning = isFallback ? `Model "${model || 'flux-1-schnell'}" not found in mapping, fell back to ${cfModel}` : null;
+	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model || 'flux-1-schnell'}" not found in mapping, fell back to ${cfModel}`) : null;
 
 	// 解析尺寸参数 (e.g. "1024x1024") → CF 的 width/height
 	let width = 1024, height = 1024;
@@ -3104,7 +3163,7 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 		}
 
 		const { cfModel, isFallback } = await resolveModelName(model, env);
-		const fallbackWarning = isFallback ? `Model "${model}" not found in mapping, fell back to ${cfModel}` : null;
+		const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model}" not found in mapping, fell back to ${cfModel}`) : null;
 
 		// 非 whisper 模型强制回退，避免音频发给文字模型导致 "Invalid input"
 		const WHISPER_MODEL = '@cf/openai/whisper-large-v3-turbo';
@@ -3160,7 +3219,7 @@ async function handleAudioSpeech(request, env, ctx) {
 	}
 
 	const { cfModel, isFallback } = await resolveModelName(model || 'tts', env);
-	const fallbackWarning = isFallback ? `Model "${model || 'tts'}" not found in mapping, fell back to ${cfModel}` : null;
+	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model || 'tts'}" not found in mapping, fell back to ${cfModel}`) : null;
 
 	// aura-2 的输入字段是 text 且 schema 严格（透传 OpenAI 的 voice/speed 等字段会 400）
 	const cfPayload = cfModel.includes('aura') ? { text: input } : { prompt: input };
@@ -6783,7 +6842,7 @@ async function handleAdminPage(request, env, ctx) {
 					<td><strong style="font-weight:600;">\${escapeHtml(k.name)}</strong></td>
 					<td>
 						<div style="display:flex; align-items:center; gap:8px;">
-							<code id="key-val-\${k.id}">\${k.key.length > 6 ? k.key.substring(0, 5) + '...' + k.key.substring(k.key.length - 1) : k.key.substring(0, Math.min(3, k.key.length)) + '...'}</code>
+							<code id="key-val-\${k.id}">\${escapeHtml(k.key.length > 6 ? k.key.substring(0, 5) + '...' + k.key.substring(k.key.length - 1) : k.key.substring(0, Math.min(3, k.key.length)) + '...')}</code>
 							<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" onclick="copyKeyText(\${attrEscape(k.key)})">复制</button>
 						</div>
 					</td>
