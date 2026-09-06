@@ -374,6 +374,7 @@ function createKVGetter(kvKey, defaultValue) {
 }
 const getApiKeys = createKVGetter('cfg_api_keys', []);
 const getCustomModelMap = createKVGetter('cfg_model_map', {});
+const getGptAliasMap = createKVGetter('cfg_gpt_alias', {});
 const getModelTokens = createKVGetter('cfg_model_tokens', {});
 const getUsageLimitsConfig = createKVGetter('cfg_limits', {});
 // 模式B账号配置（共用KV，模式A读取用于 GraphQL 真实 Neurons 查询，不写入）
@@ -389,6 +390,17 @@ async function saveUsageLimitsConfig(env, limits) {
 async function saveCustomModelMap(env, map) {
 	await env.KV.put('cfg_model_map', JSON.stringify(map));
 	getCustomModelMap.invalidate();
+}
+
+async function saveGptAliasMap(env, map) {
+	await env.KV.put('cfg_gpt_alias', JSON.stringify(map));
+	getGptAliasMap.invalidate();
+}
+
+// 合并 GPT 假名到模型映射（模型映射优先级 > 假名表：同名请求模型以映射表为准）
+async function getCombinedModelMap(env) {
+	const [customMap, aliasMap] = await Promise.all([getCustomModelMap(env), getGptAliasMap(env)]);
+	return { ...DEFAULT_MODEL_MAP, ...aliasMap, ...customMap };
 }
 
 async function saveModelTokens(env, tokens) {
@@ -1080,8 +1092,7 @@ async function resolveModelName(model, env) {
 		const tokens = customTokens[model] || DEFAULT_MODEL_TOKENS[model] || null;
 		return { cfModel: model, isFallback: false, tokens };
 	}
-	const customMap = await getCustomModelMap(env);
-	const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
+	const combinedMap = await getCombinedModelMap(env);
 	const mapped = combinedMap[model];
 	if (mapped) {
 		const customTokens = await getModelTokens(env);
@@ -1123,9 +1134,8 @@ async function handleV1Proxy(request, env, ctx) {
 	}
 
 	if (url.pathname === '/v1/models' && request.method === 'GET') {
-		const customMap = await getCustomModelMap(env);
 		const customTokens = await getModelTokens(env);
-		const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
+		const combinedMap = await getCombinedModelMap(env);
 
 		const modelsData = Object.keys(combinedMap).map(id => {
 			const cfModel = combinedMap[id] || '';
@@ -1153,8 +1163,7 @@ async function handleV1Proxy(request, env, ctx) {
 			return jsonError("Model ID is required", 400, "invalid_request_error");
 		}
 
-		const customMap = await getCustomModelMap(env);
-		const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
+		const combinedMap = await getCombinedModelMap(env);
 		const cfModel = combinedMap[modelId];
 
 		if (!cfModel) {
@@ -3479,22 +3488,44 @@ async function handleDashboardApi(request, env, ctx) {
 
 	if (url.pathname === '/api/settings') {
 		if (method === 'GET') {
-			const customMap = await getCustomModelMap(env);
-			const modelTokens = await getModelTokens(env);
-			return new Response(JSON.stringify({ customModelMap: customMap, modelTokens }), { headers: { 'Content-Type': 'application/json' } });
+			const [customMap, aliasMap, modelTokens] = await Promise.all([getCustomModelMap(env), getGptAliasMap(env), getModelTokens(env)]);
+			return new Response(JSON.stringify({ customModelMap: customMap, gptAliasMap: aliasMap, modelTokens }), { headers: { 'Content-Type': 'application/json' } });
 		}
 
 		if (method === 'PUT') {
 			const body = await safeJsonBody(request) || {};
-			const { customModelMap, modelTokens } = body;
+			const { customModelMap, gptAliasMap, modelTokens } = body;
 			if (modelTokens && typeof modelTokens === 'object') {
 				await saveModelTokens(env, modelTokens);
 			}
+
+			// GPT 假名表查重：请求模型名全局唯一（不能与模型映射表/默认表/假名表自身的其它条目重复）
+			if (gptAliasMap && typeof gptAliasMap === 'object') {
+				const otherMap = await getCustomModelMap(env);
+				for (const [src, target] of Object.entries(gptAliasMap)) {
+					if (!target || !String(target).startsWith('@cf/')) {
+						return new Response(JSON.stringify({ error: `假名 "${src}" 的目标模型必须以 @cf/ 开头` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+					}
+					if (Object.prototype.hasOwnProperty.call(DEFAULT_MODEL_MAP, src) || (otherMap && Object.prototype.hasOwnProperty.call(otherMap, src))) {
+						return new Response(JSON.stringify({ error: `请求模型名 "${src}" 已存在于模型映射中，不能在假名表重复使用` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+					}
+				}
+				await saveGptAliasMap(env, gptAliasMap);
+			}
+
+			// 模型映射表查重：不能占用已有假名表里的请求模型名
 			if (customModelMap && typeof customModelMap === 'object') {
+				const aliasMap = await getGptAliasMap(env);
+				for (const src of Object.keys(customModelMap)) {
+					if (aliasMap && Object.prototype.hasOwnProperty.call(aliasMap, src)) {
+						return new Response(JSON.stringify({ error: `请求模型名 "${src}" 已存在于 GPT 假名表中，不能在模型映射中重复使用` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+					}
+				}
 				await saveCustomModelMap(env, customModelMap);
 			}
-			if (!customModelMap && !modelTokens) {
-				return new Response(JSON.stringify({ error: 'Invalid payload: need customModelMap or modelTokens' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+
+			if (!customModelMap && !gptAliasMap && !modelTokens) {
+				return new Response(JSON.stringify({ error: 'Invalid payload: need customModelMap or gptAliasMap or modelTokens' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 			}
 			return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
 		}
@@ -5526,9 +5557,42 @@ async function handleAdminPage(request, env, ctx) {
 							</tbody>
 						</table>
 					</div>
-				</div>
 
-				<div id="tab-limits" class="tab-content">
+					<!-- GPT 假名管理（与模型映射独立，多对一） -->
+					<div class="section-card" style="margin-top: 24px;">
+						<div class="section-title">GPT 假名 (GPT Aliases)</div>
+						<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">给目标模型起 GPT 风格的假名（如 gpt-6-astra），多个假名可指向同一目标模型。与模型映射相互独立：请求模型名两边不能重复；同名冲突时模型映射优先。</p>
+
+						<div style="display: grid; grid-template-columns: 1fr 1.5fr auto; gap: 15px; background-color: var(--section-item-bg); padding: 20px; border-radius: 12px; border: 1px solid var(--border-color); margin-top: 10px;">
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>GPT 假名</label>
+								<input type="text" id="gpt-alias-source" placeholder="如: gpt-6-astra">
+							</div>
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>目标模型</label>
+								<input type="text" id="gpt-alias-target" placeholder="如: @cf/zai-org/glm-5.3">
+							</div>
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>&nbsp;</label>
+								<button class="btn btn-primary" onclick="addGptAlias()" style="height: 45px;">添加</button>
+							</div>
+						</div>
+
+						<table class="mappings-table" style="margin-top: 20px;">
+							<thead>
+								<tr>
+									<th>GPT 假名</th>
+									<th>目标模型</th>
+									<th>Tokens</th>
+									<th class="col-op">操作</th>
+								</tr>
+							</thead>
+							<tbody id="gpt-alias-table-body">
+								<!-- GPT alias rows -->
+							</tbody>
+						</table>
+					</div>
+				</div>
 					<div class="section-card">
 						<div class="section-title">用量限额配置</div>
 						<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">
@@ -5649,6 +5713,7 @@ async function handleAdminPage(request, env, ctx) {
 		const defaultMappings = ${JSON.stringify(DEFAULT_MODEL_MAP)};
 		const defaultTokens = ${JSON.stringify(DEFAULT_MODEL_TOKENS)};
 		let customMappings = {};
+		let gptAliasMappings = {};
 		let modelTokensConfig = {};
 
 		function renderUsageDetails(data) {
@@ -6270,12 +6335,13 @@ async function handleAdminPage(request, env, ctx) {
 			await copyText(val, \`已复制模型: \${val}\`);
 		}
 
-		async function loadSettings() {
-			try {
-				const res = await apiFetch('/api/settings');
-				const data = await res.json();
-				customMappings = data.customModelMap || {};
-				modelTokensConfig = data.modelTokens || {};
+			async function loadSettings() {
+				try {
+					const res = await apiFetch('/api/settings');
+					const data = await res.json();
+					customMappings = data.customModelMap || {};
+					gptAliasMappings = data.gptAliasMap || {};
+					modelTokensConfig = data.modelTokens || {};
 				const items = Object.keys(customMappings).map(source => ({ source, target: customMappings[source] }));
 				items.sort((a, b) => {
 					const ta = modelTokensConfig[a.target] !== undefined ? modelTokensConfig[a.target] : (defaultTokens[a.target] || 0);
@@ -6313,13 +6379,12 @@ async function handleAdminPage(request, env, ctx) {
 					</td>
 					\`;
 					tbody.appendChild(tr);
-				});
-			} catch(e) {
-				console.error(e);
+					});
+				} catch(e) {
+					console.error(e);
+				}
+				loadGptAlias();
 			}
-		}
-
-		// 单独保存某一行的 Tokens 配置（按目标模型 target）
 		async function saveRowTokens(input) {
 			if (!input) return;
 			const target = input.getAttribute('data-target');
@@ -6359,6 +6424,11 @@ async function handleAdminPage(request, env, ctx) {
 				showToast('请求模型名称和目标模型路径不能为空！', 'warning');
 				return;
 			}
+			// 查重：不能与 GPT 假名表里的请求模型名重复
+			if (Object.prototype.hasOwnProperty.call(gptAliasMappings, source)) {
+				showToast('该请求模型名已存在于 GPT 假名表中，请先删除假名！', 'warning');
+				return;
+			}
 			customMappings[source] = target;
 
 			// 保存 Tokens：有值则保存，空值则删除
@@ -6387,6 +6457,88 @@ async function handleAdminPage(request, env, ctx) {
 				showToast('映射配置成功！');
 			} else {
 				showToast('添加映射失败！', 'error');
+			}
+		}
+
+		async function loadGptAlias() {
+			try {
+				const tbody = document.getElementById('gpt-alias-table-body');
+				if (!tbody) return;
+				const items = Object.keys(gptAliasMappings).map(source => ({ source, target: gptAliasMappings[source] }));
+				tbody.innerHTML = '';
+				if (items.length === 0) {
+					tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-muted); padding: 30px;">暂无 GPT 假名</td></tr>';
+					return;
+				}
+				items.forEach(({ source, target }) => {
+					const tokenVal = modelTokensConfig[target] !== undefined ? modelTokensConfig[target] : (defaultTokens[target] || 0);
+					const tr = document.createElement('tr');
+					tr.innerHTML = \`
+					<td><code style="cursor: pointer; word-break: break-all;" title="点击复制" onclick="copyModelId(\${attrEscape(source)})">\${escapeHtml(source)}</code></td>
+					<td><code style="cursor: pointer; word-break: break-all;" title="点击复制" onclick="copyModelId(\${attrEscape(target)})">\${escapeHtml(target)}</code></td>
+					<td>\${tokenVal ? tokenVal.toLocaleString() : '-'}</td>
+					<td>
+						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteGptAlias(\${attrEscape(source)})">删除</button>
+					</td>
+					\`;
+					tbody.appendChild(tr);
+				});
+			} catch(e) {
+				console.error(e);
+			}
+		}
+
+		async function addGptAlias() {
+			const source = document.getElementById('gpt-alias-source').value.trim();
+			const target = document.getElementById('gpt-alias-target').value.trim();
+			if (!source || !target) {
+				showToast('GPT 假名和目标模型路径不能为空！', 'warning');
+				return;
+			}
+			if (!target.startsWith('@cf/')) {
+				showToast('目标模型必须以 @cf/ 开头！', 'warning');
+				return;
+			}
+			// 查重：不能与模型映射（预设/自定义）或已有假名重复
+			if (Object.prototype.hasOwnProperty.call(defaultMappings, source) || Object.prototype.hasOwnProperty.call(customMappings, source)) {
+				showToast('该请求模型名已存在于模型映射中，不能重复！', 'warning');
+				return;
+			}
+			if (Object.prototype.hasOwnProperty.call(gptAliasMappings, source)) {
+				showToast('该 GPT 假名已存在！', 'warning');
+				return;
+			}
+			gptAliasMappings[source] = target;
+			const res = await apiFetch('/api/settings', {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ gptAliasMap: gptAliasMappings })
+			});
+			if (res.ok) {
+				document.getElementById('gpt-alias-source').value = '';
+				document.getElementById('gpt-alias-target').value = '';
+				loadSettings();
+				showToast('GPT 假名添加成功！');
+			} else {
+				const err = await res.json().catch(() => ({}));
+				showToast(err.error || '添加 GPT 假名失败！', 'error');
+				delete gptAliasMappings[source];
+			}
+		}
+
+		async function deleteGptAlias(source) {
+			if (!confirm('确定要删除这个 GPT 假名吗？')) return;
+			delete gptAliasMappings[source];
+			const res = await apiFetch('/api/settings', {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ gptAliasMap: gptAliasMappings })
+			});
+			if (res.ok) {
+				loadSettings();
+				showToast('GPT 假名已删除');
+			} else {
+				showToast('删除失败！', 'error');
 			}
 		}
 
