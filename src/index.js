@@ -5321,6 +5321,10 @@ async function handleAdminPage(request, env, ctx) {
 					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
 					模型映射
 				</div>
+				<div class="nav-item" id="menu-gptalias" onclick="switchTab('gptalias')">
+					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 5h14a2 2 0 012 2v10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2z"></path></svg>
+					GPT 假名
+				</div>
 			</div>
 
 			<div class="aside-footer">
@@ -5558,10 +5562,18 @@ async function handleAdminPage(request, env, ctx) {
 						</table>
 					</div>
 
-					<!-- GPT 假名管理（与模型映射独立，多对一） -->
-					<div class="section-card" style="margin-top: 24px;">
+					<!-- GPT 假名管理 → 独立 Tab, 见 id="tab-gptalias" -->
+				</div>
+
+				<!-- TAB: GPT Alias (独立页, 与模型映射分列) -->
+				<div id="tab-gptalias" class="tab-content">
+					<div class="section-card" style="margin-top: 0;">
 						<div class="section-title">GPT 假名 (GPT Aliases)</div>
-						<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">给目标模型起 GPT 风格的假名（如 gpt-6-astra），多个假名可指向同一目标模型。与模型映射相互独立：请求模型名两边不能重复；同名冲突时模型映射优先。</p>
+						<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">
+							给目标模型起 GPT 风格的假名（如 <code>gpt-6-astra</code>），多个假名可指向同一目标模型。<br>
+							与「模型映射」相互独立：<strong>请求模型名两边不能重复</strong>；同名冲突时<strong>模型映射优先</strong>。目标模型必须以 <code>@cf/</code> 开头。<br>
+							用途示例：Claude Code 的 modelPicker / Codex 编排 skill 等认死 GPT 模型名的客户端，直接填假名即可走真实模型。
+						</p>
 
 						<div style="display: grid; grid-template-columns: 1fr 1.5fr auto; gap: 15px; background-color: var(--section-item-bg); padding: 20px; border-radius: 12px; border: 1px solid var(--border-color); margin-top: 10px;">
 							<div class="form-group" style="margin-bottom: 0;">
@@ -6093,7 +6105,8 @@ async function handleAdminPage(request, env, ctx) {
 				overview: '数据看板',
 				keys: 'API 密钥',
 				limits: '限额配置',
-				settings: '模型映射'
+				settings: '模型映射',
+				gptalias: 'GPT 假名'
 			};
 			document.getElementById('view-title').innerText = titles[tabName];
 			document.getElementById('sidebar').classList.remove('active');
@@ -6106,6 +6119,8 @@ async function handleAdminPage(request, env, ctx) {
 			} else if (tabName === 'limits') {
 				loadLimits();
 			} else if (tabName === 'settings') {
+				loadSettings();
+			} else if (tabName === 'gptalias') {
 				loadSettings();
 			}
 		}
