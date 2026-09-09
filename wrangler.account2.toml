@@ -5,9 +5,8 @@
 #   workers.dev     = fiyou-216.cf-ai-gw.workers.dev（subdomain=fiyou-216）
 #   zone            = wei.de5.net（可挂自定义域，需在 Dashboard 加 route）
 #
-# 部署命令：
-#   CLOUDFLARE_API_TOKEN=cfat_dn9fAzCJgjP8xgvxCUf2fOuhQcc3kYJvacHLmhe6f12de4f9 \
-#     npx wrangler deploy --config wrangler.account2.toml
+# 部署命令（API Token 只经环境变量 CLOUDFLARE_API_TOKEN 传入，严禁写入文件）：
+#   npx wrangler deploy --config wrangler.account2.toml
 #
 # 模式 A（推荐）：main = "src/index.js" → 需 AI Binding（本配置已声明，wrangler 会自动绑）
 # 模式 B（多账号 failover）：main = "_worker.js" → 无需 AI Binding，在 /admin 面板加账号
