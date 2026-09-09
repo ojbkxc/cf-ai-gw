@@ -9,6 +9,44 @@ const DEFAULT_DAILY_LIMIT = 10000;
 const DEFAULT_MONTHLY_LIMIT = 100000;
 const DEFAULT_USAGE_THRESHOLD = 0; // 0 表示关闭限额拦截（仅统计不拦截）
 
+// ===== 每模型并发限制（Workers 单 isolate 内有效） =====
+const DEFAULT_MAX_CONCURRENCY_PER_MODEL = 3;
+const modelInflight = new Map(); // cfModel -> 当前 in-flight 请求数
+
+function getMaxConcurrencyPerModel(env) {
+	const v = env && env.MAX_CONCURRENCY_PER_MODEL;
+	if (v === undefined || v === null || v === '') return DEFAULT_MAX_CONCURRENCY_PER_MODEL;
+	const n = Number(v);
+	return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_MAX_CONCURRENCY_PER_MODEL;
+}
+
+// 尝试占用一个模型并发槽位。返回 true 表示成功；false 表示已达上限应拒绝。
+function tryAcquireModelSlot(cfModel, max) {
+	const cur = modelInflight.get(cfModel) || 0;
+	if (cur >= max) return false;
+	modelInflight.set(cfModel, cur + 1);
+	return true;
+}
+
+function releaseModelSlot(cfModel) {
+	const next = (modelInflight.get(cfModel) || 1) - 1;
+	if (next <= 0) modelInflight.delete(cfModel);
+	else modelInflight.set(cfModel, next);
+}
+
+// 包装异步调用：占用模型槽位，执行完后释放；超限返回 { rejected: true }。
+async function withModelConcurrency(cfModel, env, fn) {
+	const max = getMaxConcurrencyPerModel(env);
+	if (!tryAcquireModelSlot(cfModel, max)) {
+		return { rejected: true };
+	}
+	try {
+		return { rejected: false, result: await fn() };
+	} finally {
+		releaseModelSlot(cfModel);
+	}
+}
+
 // 缓存与刷新常量
 const MONTHLY_USAGE_TTL_SEC = 38 * 24 * 60 * 60;
 const MODEL_CREATED_TS = 1686935000;
@@ -860,6 +898,8 @@ function isCapacityError(e) {
 
 function friendlyError(e) {
 	const m = String((e && e.message) || e); const low = m.toLowerCase();
+	if ((e && e.code === 'concurrency_limit') || low.includes('concurrency limit'))
+		return { status: 429, type: 'rate_limit_error', message: '该模型并发已达上限，请稍后重试。' };
 	if (low.includes('longer than') || (low.includes('context') && low.includes('length')) || low.includes('too long') || low.includes('5021'))
 		return { status: 400, type: 'invalid_request_error', message: '上下文过长，请精简后重试。' };
 	if (low.includes('unexpected end of data') || low.includes('must be valid json') || low.includes('arguments must be valid'))
@@ -1048,37 +1088,47 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 		cbErr.code = 'circuit_open';
 		return { success: false, status: 503, error: cbErr };
 	}
-	try {
-		if (stream) {
-			const inputs = { ...cfPayload, stream: true };
-			const resp = await env.AI.run(cfModel, inputs, aiRunOptions(env, { returnRawResponse: true, signal: AbortSignal.timeout(600000) }));
-			if (!resp.ok) {
-				const errText = await resp.text();
-				let parsedErr;
-				try { parsedErr = JSON.parse(errText); } catch (_) { parsedErr = { message: errText }; }
-				const aiErr = new Error(parsedErr.message || errText);
-				if (parsedErr.code) aiErr.code = parsedErr.code;
-				aiErr.status = resp.status;
-				cbOnCapacityFail(env);
-				noteModelFail(cfModel, aiErr);
-				return { success: false, status: resp.status, error: aiErr };
+	// 模型级并发限制：超限直接拒绝
+	const concurrency = await withModelConcurrency(cfModel, env, async () => {
+		try {
+			if (stream) {
+				const inputs = { ...cfPayload, stream: true };
+				const resp = await env.AI.run(cfModel, inputs, aiRunOptions(env, { returnRawResponse: true, signal: AbortSignal.timeout(600000) }));
+				if (!resp.ok) {
+					const errText = await resp.text();
+					let parsedErr;
+					try { parsedErr = JSON.parse(errText); } catch (_) { parsedErr = { message: errText }; }
+					const aiErr = new Error(parsedErr.message || errText);
+					if (parsedErr.code) aiErr.code = parsedErr.code;
+					aiErr.status = resp.status;
+					cbOnCapacityFail(env);
+					noteModelFail(cfModel, aiErr);
+					return { success: false, status: resp.status, error: aiErr };
+				}
+				if (!resp.body) {
+					return { success: false, status: 502, error: new Error('AI Binding returned empty response body') };
+				}
+				cbOnSuccess(env);
+				noteModelOk(cfModel);
+				return { success: true, status: resp.status, stream: resp.body };
 			}
-			if (!resp.body) {
-				return { success: false, status: 502, error: new Error('AI Binding returned empty response body') };
-			}
+			const result = await env.AI.run(cfModel, cfPayload, aiRunOptions(env, { signal: AbortSignal.timeout(120000) }));
 			cbOnSuccess(env);
 			noteModelOk(cfModel);
-			return { success: true, status: resp.status, stream: resp.body };
+			return { success: true, status: 200, data: normalizeBindingResult(result, cfModel) };
+		} catch (e) {
+			cbOnCapacityFail(env);
+			noteModelFail(cfModel, e);
+			return { success: false, status: 502, error: e };
 		}
-		const result = await env.AI.run(cfModel, cfPayload, aiRunOptions(env, { signal: AbortSignal.timeout(120000) }));
-		cbOnSuccess(env);
-		noteModelOk(cfModel);
-		return { success: true, status: 200, data: normalizeBindingResult(result, cfModel) };
-	} catch (e) {
-		cbOnCapacityFail(env);
-		noteModelFail(cfModel, e);
-		return { success: false, status: 502, error: e };
+	});
+	if (concurrency.rejected) {
+		const limit = getMaxConcurrencyPerModel(env);
+		const err = new Error(`model concurrency limit exceeded (max=${limit})`);
+		err.code = 'concurrency_limit';
+		return { success: false, status: 429, error: err };
 	}
+	return concurrency.result;
 }
 
 // ===== 模型名解析 =====
@@ -2760,7 +2810,8 @@ async function handleEmbeddings(request, env, ctx) {
 	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model}" not found in mapping, fell back to ${cfModel}`) : null;
 	const textArray = Array.isArray(input) ? input : [input];
 
-	try {
+	// 模型级并发限制
+	const concurrency = await withModelConcurrency(cfModel, env, async () => {
 		const result = await env.AI.run(cfModel, { text: textArray }, aiRunOptions(env, { signal: AbortSignal.timeout(120000) }));
 		// AI Binding 返回格式: { data: [[...embeddings]] } 或直接是 embedding 数组
 		let data;
@@ -2788,9 +2839,18 @@ async function handleEmbeddings(request, env, ctx) {
 			accumulateTokens(env, ctx, { input: response.usage.prompt_tokens, durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0, model });
 		}
 
+		return { embeddingsResponse: response };
+	});
+
+	if (concurrency.rejected) {
+		const limit = getMaxConcurrencyPerModel(env);
+		return jsonError(`Model "${model}" concurrency limit reached (max=${limit} concurrent requests). Please retry later.`, 429, 'rate_limit_error');
+	}
+
+	try {
 		const embHeaders = { 'Content-Type': 'application/json' };
 		if (fallbackWarning) embHeaders['X-Model-Fallback-Warning'] = fallbackWarning;
-		return new Response(JSON.stringify(response), { headers: embHeaders });
+		return new Response(JSON.stringify(concurrency.result.embeddingsResponse), { headers: embHeaders });
 	} catch (e) {
 		const fe = friendlyError(e);
 		return jsonError(fe.message, fe.status || 502, fe.type);
