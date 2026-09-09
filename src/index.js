@@ -9,6 +9,64 @@ const DEFAULT_DAILY_LIMIT = 10000;
 const DEFAULT_MONTHLY_LIMIT = 100000;
 const DEFAULT_USAGE_THRESHOLD = 0; // 0 表示关闭限额拦截（仅统计不拦截）
 
+// ===== 每模型并发限制（Workers 单 isolate 内有效）=====
+const DEFAULT_MAX_CONCURRENCY_PER_MODEL = 3;
+const modelInflight = new Map(); // cfModel -> 当前 in-flight 请求数
+
+function getMaxConcurrencyPerModel(env) {
+	const v = env && env.MAX_CONCURRENCY_PER_MODEL;
+	if (v === undefined || v === null || v === '') return DEFAULT_MAX_CONCURRENCY_PER_MODEL;
+	const n = Number(v);
+	return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_MAX_CONCURRENCY_PER_MODEL;
+}
+
+// 尝试占用槽位。成功返回 true，超限返回 false
+function acquireModelSlot(cfModel, max) {
+	const cur = modelInflight.get(cfModel) || 0;
+	if (cur >= max) return false;
+	modelInflight.set(cfModel, cur + 1);
+	return true;
+}
+
+// 释放槽位
+function releaseModelSlot(cfModel) {
+	const next = (modelInflight.get(cfModel) || 1) - 1;
+	if (next <= 0) modelInflight.delete(cfModel);
+	else modelInflight.set(cfModel, next);
+}
+
+// 包装 stream：在流完全读取或取消时自动释放槽位
+function wrapStreamWithRelease(stream, cfModel) {
+	const reader = stream.getReader();
+	return new ReadableStream({
+		async pull(controller) {
+			try {
+				const { done, value } = await reader.read();
+				if (done) {
+					releaseModelSlot(cfModel);
+					controller.close();
+				} else {
+					controller.enqueue(value);
+				}
+			} catch (e) {
+				releaseModelSlot(cfModel);
+				controller.error(e);
+			}
+		},
+		async cancel(reason) {
+			releaseModelSlot(cfModel);
+			await reader.cancel(reason);
+		}
+	});
+}
+
+// 生成并发超限错误（用于各端点快速失败）
+function concurrencyLimitError(cfModel, max) {
+	const err = new Error(`Model "${cfModel}" concurrency limit reached (max=${max})`);
+	err.code = 'concurrency_limit';
+	return err;
+}
+
 // 缓存与刷新常量
 const MONTHLY_USAGE_TTL_SEC = 38 * 24 * 60 * 60;
 const MODEL_CREATED_TS = 1686935000;
@@ -1048,11 +1106,19 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 		cbErr.code = 'circuit_open';
 		return { success: false, status: 503, error: cbErr };
 	}
+
+	// 模型级并发限制：先占槽位
+	const max = getMaxConcurrencyPerModel(env);
+	if (!acquireModelSlot(cfModel, max)) {
+		return { success: false, status: 429, error: concurrencyLimitError(cfModel, max) };
+	}
+
 	try {
 		if (stream) {
 			const inputs = { ...cfPayload, stream: true };
 			const resp = await env.AI.run(cfModel, inputs, aiRunOptions(env, { returnRawResponse: true, signal: AbortSignal.timeout(600000) }));
 			if (!resp.ok) {
+				releaseModelSlot(cfModel);
 				const errText = await resp.text();
 				let parsedErr;
 				try { parsedErr = JSON.parse(errText); } catch (_) { parsedErr = { message: errText }; }
@@ -1064,16 +1130,23 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 				return { success: false, status: resp.status, error: aiErr };
 			}
 			if (!resp.body) {
+				releaseModelSlot(cfModel);
 				return { success: false, status: 502, error: new Error('AI Binding returned empty response body') };
 			}
 			cbOnSuccess(env);
 			noteModelOk(cfModel);
-			return { success: true, status: resp.status, stream: resp.body };
+			// 关键：流式响应要用 wrapper 包起来，等流完全读完才释放槽位
+			return { success: true, status: resp.status, stream: wrapStreamWithRelease(resp.body, cfModel) };
 		}
-		const result = await env.AI.run(cfModel, cfPayload, aiRunOptions(env, { signal: AbortSignal.timeout(120000) }));
-		cbOnSuccess(env);
-		noteModelOk(cfModel);
-		return { success: true, status: 200, data: normalizeBindingResult(result, cfModel) };
+		// 非流式：try/finally 确保释放
+		try {
+			const result = await env.AI.run(cfModel, cfPayload, aiRunOptions(env, { signal: AbortSignal.timeout(120000) }));
+			cbOnSuccess(env);
+			noteModelOk(cfModel);
+			return { success: true, status: 200, data: normalizeBindingResult(result, cfModel) };
+		} finally {
+			releaseModelSlot(cfModel);
+		}
 	} catch (e) {
 		cbOnCapacityFail(env);
 		noteModelFail(cfModel, e);
@@ -2760,6 +2833,13 @@ async function handleEmbeddings(request, env, ctx) {
 	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model}" not found in mapping, fell back to ${cfModel}`) : null;
 	const textArray = Array.isArray(input) ? input : [input];
 
+	// 模型级并发限制
+	const max = getMaxConcurrencyPerModel(env);
+	if (!acquireModelSlot(cfModel, max)) {
+		const fe = { status: 429, type: 'rate_limit_error', message: `模型并发已达上限 (${max})，请稍后重试` };
+		return jsonError(fe.message, fe.status, fe.type);
+	}
+
 	try {
 		const result = await env.AI.run(cfModel, { text: textArray }, aiRunOptions(env, { signal: AbortSignal.timeout(120000) }));
 		// AI Binding 返回格式: { data: [[...embeddings]] } 或直接是 embedding 数组
@@ -2794,6 +2874,8 @@ async function handleEmbeddings(request, env, ctx) {
 	} catch (e) {
 		const fe = friendlyError(e);
 		return jsonError(fe.message, fe.status || 502, fe.type);
+	} finally {
+		releaseModelSlot(cfModel);
 	}
 }
 
@@ -2819,6 +2901,12 @@ async function handleImageGenerations(request, env, ctx) {
 			width = Math.min(Math.max(parseInt(parts[0]) || 1024, 64), 2048);
 			height = Math.min(Math.max(parseInt(parts[1]) || 1024, 64), 2048);
 		}
+	}
+
+	// 模型级并发限制
+	const max = getMaxConcurrencyPerModel(env);
+	if (!acquireModelSlot(cfModel, max)) {
+		return jsonError(`模型并发已达上限 (${max})，请稍后重试`, 429, 'rate_limit_error');
 	}
 
 	try {
@@ -2867,6 +2955,8 @@ async function handleImageGenerations(request, env, ctx) {
 	} catch (e) {
 		const fe = friendlyError(e);
 		return jsonError(fe.message, fe.status || 502, fe.type);
+	} finally {
+		releaseModelSlot(cfModel);
 	}
 }
 
@@ -2926,22 +3016,35 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 			return jsonError("File size exceeds 8MB limit", 413, "invalid_request_error");
 		}
 
-		// AI Binding 的 Whisper 要求 { audio: [...字节数组展开] }：传 Uint8Array 会报「未识别的上游错误」
-		// （REST 实测：二进制 body 直传与 multipart 可用，JSON int 数组不可用；Binding 内部将数组编码为二进制流）
-		// translations 加 task 参数
-		const whisperInput = { audio: [...audioUint8] };
-		if (isTranslation) whisperInput.task = 'translate';
-		const result = await env.AI.run(actualCfModel, whisperInput, aiRunOptions(env, { signal: AbortSignal.timeout(120000) }));
-
-		const text = result.text || '';
-
-		if (ctx && text) {
-			accumulateTokens(env, ctx, { output: Math.ceil(text.length / 3), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0, model });
+		// 模型级并发限制
+		const max = getMaxConcurrencyPerModel(env);
+		if (!acquireModelSlot(actualCfModel, max)) {
+			return jsonError(`模型并发已达上限 (${max})，请稍后重试`, 429, 'rate_limit_error');
 		}
 
-		const audioHeaders = { 'Content-Type': 'application/json' };
-		if (actualFallbackWarning) audioHeaders['X-Model-Fallback-Warning'] = actualFallbackWarning;
-		return new Response(JSON.stringify({ text }), { headers: audioHeaders });
+		try {
+			// AI Binding 的 Whisper 要求 { audio: [...字节数组展开] }：传 Uint8Array 会报「未识别的上游错误」
+			// （REST 实测：二进制 body 直传与 multipart 可用，JSON int 数组不可用；Binding 内部将数组编码为二进制流）
+			// translations 加 task 参数
+			const whisperInput = { audio: [...audioUint8] };
+			if (isTranslation) whisperInput.task = 'translate';
+			const result = await env.AI.run(actualCfModel, whisperInput, aiRunOptions(env, { signal: AbortSignal.timeout(120000) }));
+
+			const text = result.text || '';
+
+			if (ctx && text) {
+				accumulateTokens(env, ctx, { output: Math.ceil(text.length / 3), durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0, model });
+			}
+
+			const audioHeaders = { 'Content-Type': 'application/json' };
+			if (actualFallbackWarning) audioHeaders['X-Model-Fallback-Warning'] = actualFallbackWarning;
+			return new Response(JSON.stringify({ text }), { headers: audioHeaders });
+		} catch (e) {
+			const fe = friendlyError(e);
+			return jsonError(fe.message, fe.status || 400, fe.type);
+		} finally {
+			releaseModelSlot(actualCfModel);
+		}
 	} catch (e) {
 		const fe = friendlyError(e);
 		return jsonError(fe.message, fe.status || 400, fe.type);
