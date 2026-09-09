@@ -10,7 +10,7 @@ const DEFAULT_MONTHLY_LIMIT = 100000;
 const DEFAULT_USAGE_THRESHOLD = 0; // 0 表示关闭限额拦截（仅统计不拦截）
 
 // ===== 每模型并发限制（Workers 单 isolate 内有效）=====
-const DEFAULT_MAX_CONCURRENCY_PER_MODEL = 3;
+const DEFAULT_MAX_CONCURRENCY_PER_MODEL = 4;
 const modelInflight = new Map(); // cfModel -> 当前 in-flight 请求数
 
 function getMaxConcurrencyPerModel(env) {
