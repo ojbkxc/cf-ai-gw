@@ -1,4 +1,4 @@
-﻿/**
+/**
  * cf-ai-gw (Binding Edition)
  * 使用 Workers AI Binding 的单账号版本，用 env.AI.run() 替代 REST API 调用。
  * 无多账号 failover，无账号管理，直接使用 Worker 绑定的 AI 服务。
@@ -19,14 +19,6 @@ const DEFAULT_GLOBAL_CONCURRENCY = 10;         // 全局总并发上限默认 10
 const modelInflight = new Map();             // cfModel -> 当前 in-flight 请求数
 let globalInflight = 0;                      // 全局 in-flight 请求数
 
-function getMaxConcurrencyPerModel(env, cfModel) {
-	const v = env && env.MAX_CONCURRENCY_PER_MODEL;
-	if (v === undefined || v === null || v === '') return DEFAULT_MAX_CONCURRENCY_PER_MODEL;
-	const n = Number(v);
-	return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_MAX_CONCURRENCY_PER_MODEL;
-}
-
-// 尝试占用全局+模型双槽位。成功返回 true，超限返回 false（不占用）
 function acquireModelSlot(cfModel, max, globalMax) {
 	const cur = modelInflight.get(cfModel) || 0;
 	if (cur >= max) return false;
@@ -634,24 +626,24 @@ function getEnvNum(env, key, defaultVal, parseFn) {
 	return isNaN(val) ? defaultVal : val;
 }
 
-// 读取限额配置（优先级：环境变量 > KV > 默认值）
-// 两维度：请求次数(日/月) + 并发(全局/按模型)；Token 用量仅统计不拦截
+// 读取限额配置：仅两维度并发（每模型 / 全局）。
+// 请求次数与 Token 阈值已废除（恒为 0 不拦截），Token 用量仅做看板统计。
 async function getUsageLimits(env) {
 	const kvLimits = await getUsageLimitsConfig(env);
 
 	return {
-		// 旧字段（向后兼容，看板仍引用）
+		// 旧字段（向后兼容，看板仍引用；已不参与拦截）
 		dailyLimit: getEnvNum(env, 'DAILY_LIMIT', kvLimits.dailyLimit ?? DEFAULT_DAILY_LIMIT, parseInt),
 		monthlyLimit: getEnvNum(env, 'MONTHLY_LIMIT', kvLimits.monthlyLimit ?? DEFAULT_MONTHLY_LIMIT, parseInt),
-		// 请求次数限额
-		dailyRequestLimit: getEnvNum(env, 'DAILY_REQUEST_LIMIT', kvLimits.dailyRequestLimit ?? DEFAULT_DAILY_REQUEST_LIMIT, parseInt),
-		monthlyRequestLimit: getEnvNum(env, 'MONTHLY_REQUEST_LIMIT', kvLimits.monthlyRequestLimit ?? DEFAULT_MONTHLY_REQUEST_LIMIT, parseInt),
-		// 拦截阈值
-		threshold: getEnvNum(env, 'USAGE_THRESHOLD', kvLimits.threshold ?? DEFAULT_USAGE_THRESHOLD, parseFloat),
-		// 按模型配置：{ [modelName]: { requestLimit, concurrency } }
-		perModel: kvLimits.perModel || {},
-		// 全局并发上限（0 = 不限；env MAX_CONCURRENCY_PER_MODEL 优先）
-		globalConcurrency: getEnvNum(env, 'GLOBAL_CONCURRENCY', kvLimits.globalConcurrency ?? DEFAULT_GLOBAL_CONCURRENCY, parseInt)
+		dailyRequestLimit: 0,
+		monthlyRequestLimit: 0,
+		threshold: 0,
+		// 按模型配置：{ [modelName]: { concurrency } }（requestLimit 固定 0）
+		perModel: Object.fromEntries(Object.entries(kvLimits.perModel || {}).map(([m, cfg]) => [m, { requestLimit: 0, concurrency: (cfg && Number(cfg.concurrency) > 0) ? Math.floor(cfg.concurrency) : 0 }])),
+		// 全局并发上限（0 = 不限；KV 持久化优先，其次环境变量）
+		globalConcurrency: kvLimits.globalConcurrency ?? getEnvNum(env, 'GLOBAL_CONCURRENCY', DEFAULT_GLOBAL_CONCURRENCY, parseInt),
+		// 每模型默认并发上限（默认 4；KV 持久化优先，其次环境变量）
+		perModelDefaultConcurrency: kvLimits.perModelDefaultConcurrency ?? getEnvNum(env, 'MAX_CONCURRENCY_PER_MODEL', DEFAULT_MAX_CONCURRENCY_PER_MODEL, parseInt)
 	};
 }
 
@@ -1324,7 +1316,7 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 	const globalMax = limits.globalConcurrency;  // 默认 10
 	const modelMax = (limits.perModel && cfPayload._userModelName && limits.perModel[cfPayload._userModelName] && limits.perModel[cfPayload._userModelName].concurrency > 0)
 		? limits.perModel[cfPayload._userModelName].concurrency
-		: getMaxConcurrencyPerModel(env);  // 默认 4
+		: limits.perModelDefaultConcurrency;  // 默认 4（面板可调）
 	if (!acquireModelSlot(cfModel, modelMax, globalMax)) {
 		return { success: false, status: 429, error: concurrencyLimitError(cfModel, modelMax) };
 	}
@@ -3084,7 +3076,7 @@ async function handleEmbeddings(request, env, ctx) {
 	const globalMax = limits.globalConcurrency;  // 默认 10
 	const max = (limits.perModel && limits.perModel[model] && limits.perModel[model].concurrency > 0)
 		? limits.perModel[model].concurrency
-		: getMaxConcurrencyPerModel(env);  // 默认 4
+		: limits.perModelDefaultConcurrency;  // 默认 4（面板可调）
 	if (!acquireModelSlot(cfModel, max, globalMax)) {
 		const fe = { status: 429, type: 'rate_limit_error', message: `并发已达上限 (模型${max}/全局${globalMax})，请稍后重试` };
 		return jsonError(fe.message, fe.status, fe.type);
@@ -3158,7 +3150,7 @@ async function handleImageGenerations(request, env, ctx) {
 	const globalMax = limits.globalConcurrency || 0;
 	const max = (limits.perModel && limits.perModel[model] && limits.perModel[model].concurrency > 0)
 		? limits.perModel[model].concurrency
-		: getMaxConcurrencyPerModel(env);
+		: limits.perModelDefaultConcurrency;
 	if (!acquireModelSlot(cfModel, max, globalMax)) {
 		return jsonError(`并发已达上限 (模型${max}/全局${globalMax})，请稍后重试`, 429, 'rate_limit_error');
 	}
@@ -3275,7 +3267,7 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 		const globalMax = limits.globalConcurrency;  // 默认 10
 		const max = (limits.perModel && limits.perModel[model] && limits.perModel[model].concurrency > 0)
 			? limits.perModel[model].concurrency
-			: getMaxConcurrencyPerModel(env);  // 默认 4
+			: limits.perModelDefaultConcurrency;  // 默认 4（面板可调）
 		if (!acquireModelSlot(actualCfModel, max, globalMax)) {
 			return jsonError(`并发已达上限 (模型${max}/全局${globalMax})，请稍后重试`, 429, 'rate_limit_error');
 		}
@@ -4065,22 +4057,17 @@ async function handleDashboardApi(request, env, ctx) {
 				if (val === null) return new Response(JSON.stringify({ error: 'monthlyLimit must be a non-negative integer' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 				updates.monthlyLimit = val;
 			}
-			// 新字段：请求次数限额 / 全局并发
-			for (const k of ['dailyRequestLimit', 'monthlyRequestLimit', 'globalConcurrency']) {
+			// 请求次数 / 阈值已废除：无论前端传什么都强制存 0，确保不参与拦截
+			for (const k of ['dailyRequestLimit', 'monthlyRequestLimit', 'threshold']) updates[k] = 0;
+			// 并发：全局总并发 / 每模型默认并发
+			for (const k of ['globalConcurrency', 'perModelDefaultConcurrency']) {
 				if (body[k] !== undefined) {
 					const val = nnInt(body[k]);
 					if (val === null) return new Response(JSON.stringify({ error: `${k} must be a non-negative integer` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 					updates[k] = val;
 				}
 			}
-			if (body.threshold !== undefined) {
-				const val = parseFloat(body.threshold);
-				if (isNaN(val) || val < 0 || val > 1) {
-					return new Response(JSON.stringify({ error: 'threshold must be a number between 0 and 1' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-				}
-				updates.threshold = val;
-			}
-			// 按模型配置：{ [modelName]: { requestLimit, concurrency } }
+			// 按模型配置：{ [modelName]: { concurrency } }（requestLimit 忽略）
 			if (body.perModel !== undefined) {
 				if (typeof body.perModel !== 'object' || body.perModel === null) {
 					return new Response(JSON.stringify({ error: 'perModel must be an object' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
@@ -4089,7 +4076,7 @@ async function handleDashboardApi(request, env, ctx) {
 				for (const [m, cfg] of Object.entries(body.perModel)) {
 					if (!m || typeof cfg !== 'object') continue;
 					cleaned[m] = {
-						requestLimit: nnInt(cfg.requestLimit) || 0,
+						requestLimit: 0,
 						concurrency: nnInt(cfg.concurrency) || 0
 					};
 				}
@@ -6195,50 +6182,34 @@ async function handleAdminPage(request, env, ctx) {
 					</div>
 				</div>
 					<div class="section-card">
-						<div class="section-title">用量限额配置</div>
+						<div class="section-title">并发配置</div>
 						<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">
-							两维度限额：<strong>请求次数</strong> / <strong>并发数</strong>，可按全局与按模型分别配置。Token 用量仅做看板统计不参与拦截。值设为 0 表示不限制。阈值设为 0 表示关闭限额拦截（仅统计不拦截）。
+							仅两维度并发控制：<strong>每模型并发</strong> / <strong>全局总并发</strong>。Token 用量仅做看板统计，不参与拦截、无使用限制。
 						</p>
 
-						<h4 style="margin-top: 18px; margin-bottom: 10px; font-size: 14px;">全局限额</h4>
 						<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;">
 							<div class="form-group" style="margin-bottom: 0;">
-								<label>每日请求次数</label>
-								<input type="number" id="limits-daily-req" min="0" step="1" placeholder="0=不限">
+								<label>每模型默认并发上限</label>
+								<input type="number" id="limits-permodel-default-concurrency" min="0" step="1" placeholder="4">
+								<span style="font-size: 11px; color: var(--text-muted);">单模型同时进行中的请求数（默认 4）</span>
 							</div>
-							<div class="form-group" style="margin-bottom: 0;">
-								<label>每月请求次数</label>
-								<input type="number" id="limits-monthly-req" min="0" step="1" placeholder="0=不限">
-							</div>
-						</div>
-
-						<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;">
 							<div class="form-group" style="margin-bottom: 0;">
 								<label>全局总并发上限</label>
 								<input type="number" id="limits-global-concurrency" min="0" step="1" placeholder="10">
 								<span style="font-size: 11px; color: var(--text-muted);">所有模型合计同时进行中的请求数（默认 10）</span>
 							</div>
-							<div class="form-group" style="margin-bottom: 0;">
-								<label>拦截阈值 (0-1)</label>
-								<input type="number" id="limits-threshold" min="0" max="1" step="0.05" placeholder="0.9">
-								<span style="font-size: 11px; color: var(--text-muted);">0 = 关闭限额拦截</span>
-							</div>
 						</div>
 
-						<h4 style="margin-top: 18px; margin-bottom: 10px; font-size: 14px;">按模型限额</h4>
-						<p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">为特定模型单独设置每日请求次数 / 并发上限（覆盖全局并发）。键名为用户请求的模型名（如 glm-5.3-flash）。</p>
-						<div style="display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 10px; background-color: var(--section-item-bg); padding: 16px; border-radius: 10px; border: 1px solid var(--border-color); margin-bottom: 12px;">
+						<h4 style="margin-top: 18px; margin-bottom: 10px; font-size: 14px;">按模型并发覆盖</h4>
+						<p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">为特定模型单独设置并发上限（覆盖每模型默认值）。键名为用户请求的模型名（如 glm-5.3-flash）。</p>
+						<div style="display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; background-color: var(--section-item-bg); padding: 16px; border-radius: 10px; border: 1px solid var(--border-color); margin-bottom: 12px;">
 							<div class="form-group" style="margin-bottom: 0;">
 								<label>模型名</label>
 								<input type="text" id="permodel-name" placeholder="如 glm-5.3-flash">
 							</div>
 							<div class="form-group" style="margin-bottom: 0;">
-								<label>日请求次数</label>
-								<input type="number" id="permodel-req" min="0" step="1" placeholder="0=不限">
-							</div>
-							<div class="form-group" style="margin-bottom: 0;">
 								<label>并发上限</label>
-								<input type="number" id="permodel-concurrency" min="0" step="1" placeholder="0=用全局">
+								<input type="number" id="permodel-concurrency" min="0" step="1" placeholder="0=用默认">
 							</div>
 							<div class="form-group" style="margin-bottom: 0;">
 								<label>&nbsp;</label>
@@ -6249,7 +6220,6 @@ async function handleAdminPage(request, env, ctx) {
 							<thead>
 								<tr>
 									<th>模型</th>
-									<th>日请求</th>
 									<th>并发</th>
 									<th>操作</th>
 								</tr>
@@ -6267,12 +6237,10 @@ async function handleAdminPage(request, env, ctx) {
 					<div class="section-card" style="margin-top: 20px;">
 						<div class="section-title">环境变量说明</div>
 						<p style="font-size: 13px; color: var(--text-muted); line-height: 1.8; margin-top: 8px;">
-							以下配置优先级：<strong>环境变量 > 面板配置 > 默认值</strong><br><br>
-							<code>DAILY_REQUEST_LIMIT</code> / <code>MONTHLY_REQUEST_LIMIT</code> — 日/月请求次数限额（默认 0=不限）<br>
-							<code>MAX_CONCURRENCY_PER_MODEL</code> — 每模型并发上限（默认 4）<br>
-							<code>GLOBAL_CONCURRENCY</code> — 全局总并发上限（默认 10）<br>
-							<code>USAGE_THRESHOLD</code> — 拦截阈值（0-1，默认 0，即关闭拦截）<br><br>
-							在 Cloudflare Workers 仪表盘的 Settings → Variables 中添加上述环境变量即可覆盖面板配置。
+							以下配置并发优先级：<strong>面板配置(KV) > 环境变量 > 默认值</strong><br><br>
+							<code>MAX_CONCURRENCY_PER_MODEL</code> — 每模型默认并发上限（默认 4）<br>
+							<code>GLOBAL_CONCURRENCY</code> — 全局总并发上限（默认 10）<br><br>
+							Token 用量不做任何限制，仅做看板统计展示。
 						</p>
 					</div>
 				</div>
@@ -7373,15 +7341,13 @@ async function handleAdminPage(request, env, ctx) {
 		let perModelLimitsCache = {};
 		async function loadLimits() {
 			try {
-				const res = await apiFetch('/api/limits');
-				const data = await res.json();
-				document.getElementById('limits-daily-req').value = data.dailyRequestLimit || 0;
-				document.getElementById('limits-monthly-req').value = data.monthlyRequestLimit || 0;
-				document.getElementById('limits-global-concurrency').value = data.globalConcurrency;
-				document.getElementById('limits-threshold').value = data.threshold || 0;
-				perModelLimitsCache = data.perModel || {};
-				renderPerModelTable();
-			} catch (e) {
+					const res = await apiFetch('/api/limits');
+					const data = await res.json();
+					document.getElementById('limits-permodel-default-concurrency').value = data.perModelDefaultConcurrency;
+					document.getElementById('limits-global-concurrency').value = data.globalConcurrency;
+					perModelLimitsCache = data.perModel || {};
+					renderPerModelTable();
+				} catch (e) {
 				console.error(e);
 				showToast('加载限额配置失败', 'error');
 			}
@@ -7391,14 +7357,13 @@ async function handleAdminPage(request, env, ctx) {
 			const tbody = document.getElementById('permodel-table-body');
 			const entries = Object.entries(perModelLimitsCache || {});
 			if (entries.length === 0) {
-				tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-muted); padding: 20px;">暂无按模型限额配置</td></tr>';
+				tbody.innerHTML = '<tr><td colspan="3" style="text-align:center; color: var(--text-muted); padding: 20px;">暂无按模型并发覆盖</td></tr>';
 				return;
 			}
 			tbody.innerHTML = entries.map(([m, cfg]) => \`
 				<tr>
 					<td><strong>\${escapeHtml(m)}</strong></td>
-					<td>\${cfg.requestLimit > 0 ? cfg.requestLimit : '不限'}</td>
-					<td>\${cfg.concurrency > 0 ? cfg.concurrency : '全局'}</td>
+					<td>\${cfg.concurrency > 0 ? cfg.concurrency : '默认'}</td>
 					<td><button class="btn btn-secondary" style="padding:4px 10px; font-size:11px; color: var(--danger-color);" onclick="removePerModelLimit(\${attrEscape(m)})">删除</button></td>
 				</tr>
 			\`).join('');
@@ -7409,11 +7374,10 @@ async function handleAdminPage(request, env, ctx) {
 			if (!name) { showToast('请输入模型名', 'warning'); return; }
 			perModelLimitsCache = perModelLimitsCache || {};
 			perModelLimitsCache[name] = {
-				requestLimit: parseInt(document.getElementById('permodel-req').value, 10) || 0,
+				requestLimit: 0,
 				concurrency: parseInt(document.getElementById('permodel-concurrency').value, 10) || 0
 			};
 			document.getElementById('permodel-name').value = '';
-			document.getElementById('permodel-req').value = '';
 			document.getElementById('permodel-concurrency').value = '';
 			renderPerModelTable();
 			showToast('已加入待保存列表，点击"保存配置"生效');
@@ -7425,25 +7389,17 @@ async function handleAdminPage(request, env, ctx) {
 		}
 
 		async function saveLimits() {
-			const dailyReq = parseInt(document.getElementById('limits-daily-req').value, 10) || 0;
-			const monthlyReq = parseInt(document.getElementById('limits-monthly-req').value, 10) || 0;
+			const perModelDefault = parseInt(document.getElementById('limits-permodel-default-concurrency').value, 10);
+			if (isNaN(perModelDefault) || perModelDefault < 0) { showToast('每模型默认并发上限必须是非负整数', 'error'); return; }
 			const globalConc = parseInt(document.getElementById('limits-global-concurrency').value, 10);
 			if (isNaN(globalConc) || globalConc < 0) { showToast('全局总并发上限必须是非负整数', 'error'); return; }
-			const threshold = parseFloat(document.getElementById('limits-threshold').value) || 0;
-
-			if (threshold < 0 || threshold > 1) {
-				showToast('阈值必须在 0-1 之间', 'error');
-				return;
-			}
 
 			const res = await apiFetch('/api/limits', {
 				method: 'PUT',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
-					dailyRequestLimit: dailyReq,
-					monthlyRequestLimit: monthlyReq,
+					perModelDefaultConcurrency: perModelDefault,
 					globalConcurrency: globalConc,
-					threshold,
 					perModel: perModelLimitsCache
 				})
 			});
