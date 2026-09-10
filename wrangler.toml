@@ -16,6 +16,13 @@ account_id = "cc4b64888d2bb80770ff42b0e3c1fad2"
 # 管理密码（用户要求明文 var，不用 secret）
 [vars]
 ADMIN_PASSWORD = "mzyxc8520#"
+# 可选：开启真实 Neurons 用量看板（仅部署模式 A 且未在面板配置 cfg_accounts 时生效）
+# 需注入一个"仅含 Account > Workers Analytics > Read 权限"的 API Token（最小权限，泄露只能读 Analytics）
+# 配置方式：
+#   wrangler secret put ANALYTICS_API_TOKEN   # 粘贴只读 Token
+#   在本 [vars] 填 ANALYTICS_ACCOUNT_ID（即下方 account_id，明文无敏感）
+# 不配置则看板走本地 token 兜底（开箱即用，但口径是 Token 不是 Neurons）
+# ANALYTICS_ACCOUNT_ID = "cc4b64888d2bb80770ff42b0e3c1fad2"
 
 # KV 绑定：存储配置、API Key、用量统计等
 [[kv_namespaces]]
