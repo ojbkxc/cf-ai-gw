@@ -5,15 +5,21 @@
  */
 
 // 用量限额配置（环境变量覆盖，未设置则用默认值）
+// 思想转变：不再以 Neurons 为核心，改为「请求次数 + Token 用量 + 并发」三维度
+const DEFAULT_DAILY_REQUEST_LIMIT = 0;       // 0 = 不限
+const DEFAULT_MONTHLY_REQUEST_LIMIT = 0;     // 0 = 不限
+const DEFAULT_DAILY_TOKEN_LIMIT = 0;         // 0 = 不限
+const DEFAULT_MONTHLY_TOKEN_LIMIT = 0;       // 0 = 不限
+const DEFAULT_USAGE_THRESHOLD = 0;           // 0 = 关闭拦截
+// 旧字段保留向后兼容（迁移期仍可读）
 const DEFAULT_DAILY_LIMIT = 10000;
 const DEFAULT_MONTHLY_LIMIT = 100000;
-const DEFAULT_USAGE_THRESHOLD = 0; // 0 表示关闭限额拦截（仅统计不拦截）
 
 // ===== 每模型并发限制（Workers 单 isolate 内有效）=====
 const DEFAULT_MAX_CONCURRENCY_PER_MODEL = 4;
 const modelInflight = new Map(); // cfModel -> 当前 in-flight 请求数
 
-function getMaxConcurrencyPerModel(env) {
+function getMaxConcurrencyPerModel(env, cfModel) {
 	const v = env && env.MAX_CONCURRENCY_PER_MODEL;
 	if (v === undefined || v === null || v === '') return DEFAULT_MAX_CONCURRENCY_PER_MODEL;
 	const n = Number(v);
@@ -625,14 +631,27 @@ function getEnvNum(env, key, defaultVal, parseFn) {
 	return isNaN(val) ? defaultVal : val;
 }
 
-// 读取日/月限额和阈值配置（优先级：环境变量 > KV > 默认值）
+// 读取限额配置（优先级：环境变量 > KV > 默认值）
+// 三维度：请求次数(日/月)、Token 用量(日/月)、并发(全局/按模型)
 async function getUsageLimits(env) {
 	const kvLimits = await getUsageLimitsConfig(env);
 
 	return {
+		// 旧字段（向后兼容，看板仍引用）
 		dailyLimit: getEnvNum(env, 'DAILY_LIMIT', kvLimits.dailyLimit ?? DEFAULT_DAILY_LIMIT, parseInt),
 		monthlyLimit: getEnvNum(env, 'MONTHLY_LIMIT', kvLimits.monthlyLimit ?? DEFAULT_MONTHLY_LIMIT, parseInt),
-		threshold: getEnvNum(env, 'USAGE_THRESHOLD', kvLimits.threshold ?? DEFAULT_USAGE_THRESHOLD, parseFloat)
+		// 新字段：请求次数限额
+		dailyRequestLimit: getEnvNum(env, 'DAILY_REQUEST_LIMIT', kvLimits.dailyRequestLimit ?? DEFAULT_DAILY_REQUEST_LIMIT, parseInt),
+		monthlyRequestLimit: getEnvNum(env, 'MONTHLY_REQUEST_LIMIT', kvLimits.monthlyRequestLimit ?? DEFAULT_MONTHLY_REQUEST_LIMIT, parseInt),
+		// 新字段：Token 用量限额
+		dailyTokenLimit: getEnvNum(env, 'DAILY_TOKEN_LIMIT', kvLimits.dailyTokenLimit ?? DEFAULT_DAILY_TOKEN_LIMIT, parseInt),
+		monthlyTokenLimit: getEnvNum(env, 'MONTHLY_TOKEN_LIMIT', kvLimits.monthlyTokenLimit ?? DEFAULT_MONTHLY_TOKEN_LIMIT, parseInt),
+		// 拦截阈值
+		threshold: getEnvNum(env, 'USAGE_THRESHOLD', kvLimits.threshold ?? DEFAULT_USAGE_THRESHOLD, parseFloat),
+		// 按模型配置：{ [modelName]: { requestLimit, tokenLimit, concurrency } }
+		perModel: kvLimits.perModel || {},
+		// 全局并发上限（0 = 用 env.MAX_CONCURRENCY_PER_MODEL 或默认 4）
+		globalConcurrency: getEnvNum(env, 'MAX_CONCURRENCY_PER_MODEL', kvLimits.globalConcurrency ?? DEFAULT_MAX_CONCURRENCY_PER_MODEL, parseInt)
 	};
 }
 
@@ -986,30 +1005,89 @@ async function buildLocalUsageFallback(env) {
 }
 
 // 用量限额检查（简化版：从 token 统计 KV 获取用量）
-async function checkUsageLimit(env) {
-	const { dailyLimit, monthlyLimit, threshold } = await getUsageLimits(env);
+// 聚合指定日期的 evt_ 事件键，返回 {requests, tokens, models:{m:{requests,tokens}}}
+async function aggregateEventsByDate(env, dateStr) {
+	const agg = { requests: 0, tokens: 0, models: {} };
+	try {
+		let cursor;
+		do {
+			const list = await env.KV.list({ prefix: `evt_${dateStr}_`, cursor });
+			for (const k of list.keys) {
+				try {
+					const raw = await env.KV.get(k.name);
+					if (!raw) continue;
+					const evt = JSON.parse(raw);
+					agg.requests += 1;
+					agg.tokens += (evt.i || 0) + (evt.o || 0);
+					if (evt.m) {
+						agg.models[evt.m] = agg.models[evt.m] || { requests: 0, tokens: 0 };
+						agg.models[evt.m].requests += 1;
+						agg.models[evt.m].tokens += (evt.i || 0) + (evt.o || 0);
+					}
+				} catch (_) {}
+			}
+			cursor = list.list_complete ? null : list.cursor;
+		} while (cursor);
+	} catch (e) { /* 容错 */ }
+	return agg;
+}
 
-	// threshold <= 0 表示关闭限额拦截：短路返回，跳过用量 KV 读取（性能优化）
+// 用量限额检查：三维度（请求次数 / Token 用量 / 并发）× 日/月 + 按模型
+async function checkUsageLimit(env, model = null) {
+	const limits = await getUsageLimits(env);
+	const { threshold } = limits;
+
+	// threshold <= 0 表示关闭限额拦截：短路返回
 	if (threshold <= 0) {
-		return { allowed: true, dailyUsage: 0, dailyLimit, monthlyUsage: 0, monthlyLimit, threshold };
+		return { allowed: true, limits };
 	}
 
-	// 当日用量从 token 统计 KV 获取
-	const stats = await getTodayTokenStats(env);
-	const dailyUsage = stats.total;
+	const todayStr = getTodayStr();
+	const todayAgg = await aggregateEventsByDate(env, todayStr);
 
-	const monthlyUsage = await getMonthlyUsage(env);
+	// 本月累计（聚合本月所有天的 evt_ 键；为性能只查今日 + tokens_monthly_ 汇总键兜底）
+	const monthlyKey = getTokenMonthlyKey();
+	let monthRequests = todayAgg.requests, monthTokens = todayAgg.tokens;
+	try {
+		const raw = await env.KV.get(monthlyKey);
+		if (raw) {
+			const m = JSON.parse(raw);
+			// tokens_monthly_ 是 best-effort 汇总，可能比 evt_ 聚合更全（含 8 天前数据）
+			if ((m.requests || 0) > monthRequests) monthRequests = m.requests || 0;
+			if (((m.input || 0) + (m.output || 0)) > monthTokens) monthTokens = (m.input || 0) + (m.output || 0);
+		}
+	} catch (_) {}
 
-	const dailyExceeded = dailyUsage >= dailyLimit * threshold;
-	const monthlyExceeded = monthlyUsage >= monthlyLimit * threshold;
-
-	if (dailyExceeded || monthlyExceeded) {
-		const reason = dailyExceeded
-			? `Daily usage (${dailyUsage}/${dailyLimit}) exceeds ${Math.round(threshold * 100)}% threshold`
-			: `Monthly usage (${monthlyUsage}/${monthlyLimit}) exceeds ${Math.round(threshold * 100)}% threshold`;
-		return { allowed: false, reason, dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold };
+	// 全局日请求数
+	if (limits.dailyRequestLimit > 0 && todayAgg.requests >= limits.dailyRequestLimit * threshold) {
+		return { allowed: false, reason: `Daily request limit reached (${todayAgg.requests}/${limits.dailyRequestLimit})`, limits };
 	}
-	return { allowed: true, dailyUsage, dailyLimit, monthlyUsage, monthlyLimit, threshold };
+	// 全局月请求数
+	if (limits.monthlyRequestLimit > 0 && monthRequests >= limits.monthlyRequestLimit * threshold) {
+		return { allowed: false, reason: `Monthly request limit reached (${monthRequests}/${limits.monthlyRequestLimit})`, limits };
+	}
+	// 全局日 Token
+	if (limits.dailyTokenLimit > 0 && todayAgg.tokens >= limits.dailyTokenLimit * threshold) {
+		return { allowed: false, reason: `Daily token limit reached (${todayAgg.tokens}/${limits.dailyTokenLimit})`, limits };
+	}
+	// 全局月 Token
+	if (limits.monthlyTokenLimit > 0 && monthTokens >= limits.monthlyTokenLimit * threshold) {
+		return { allowed: false, reason: `Monthly token limit reached (${monthTokens}/${limits.monthlyTokenLimit})`, limits };
+	}
+
+	// 按模型限额
+	if (model && limits.perModel && limits.perModel[model]) {
+		const pm = limits.perModel[model];
+		const modelAgg = todayAgg.models[model] || { requests: 0, tokens: 0 };
+		if (pm.requestLimit > 0 && modelAgg.requests >= pm.requestLimit * threshold) {
+			return { allowed: false, reason: `Model "${model}" daily request limit reached (${modelAgg.requests}/${pm.requestLimit})`, limits };
+		}
+		if (pm.tokenLimit > 0 && modelAgg.tokens >= pm.tokenLimit * threshold) {
+			return { allowed: false, reason: `Model "${model}" daily token limit reached (${modelAgg.tokens}/${pm.tokenLimit})`, limits };
+		}
+	}
+
+	return { allowed: true, limits, todayAgg, monthRequests, monthTokens };
 }
 
 // ===== P0: Workers AI 错误码映射 + friendlyError =====
@@ -1253,8 +1331,13 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 		return { success: false, status: 503, error: cbErr };
 	}
 
-	// 模型级并发限制：先占槽位
-	const max = getMaxConcurrencyPerModel(env);
+	// 并发限制：KV perModel 优先，否则 env 全局值
+	const limits = await getUsageLimits(env);
+	let max = limits.globalConcurrency || DEFAULT_MAX_CONCURRENCY_PER_MODEL;
+	const userModelName = cfPayload._userModelName;
+	if (userModelName && limits.perModel && limits.perModel[userModelName] && limits.perModel[userModelName].concurrency > 0) {
+		max = limits.perModel[userModelName].concurrency;
+	}
 	if (!acquireModelSlot(cfModel, max)) {
 		return { success: false, status: 429, error: concurrencyLimitError(cfModel, max) };
 	}
@@ -1348,7 +1431,7 @@ async function handleV1Proxy(request, env, ctx) {
 		ctx.waitUntil(incrementKeyUsage(env, authResult.keyId));
 	}
 
-	const limitCheck = await checkUsageLimit(env);
+	const limitCheck = await checkUsageLimit(env, model);
 	if (!limitCheck.allowed) {
 		const msg = `Request blocked: ${limitCheck.reason}. Please check your usage dashboard.`;
 
@@ -3954,28 +4037,50 @@ async function handleDashboardApi(request, env, ctx) {
 
 		if (method === 'PUT') {
 			const body = await safeJsonBody(request);
-			const { dailyLimit, monthlyLimit, threshold } = body || {};
 			const updates = {};
-			if (dailyLimit !== undefined) {
-				const val = parseInt(dailyLimit, 10);
-				if (isNaN(val) || val < 0) {
-					return new Response(JSON.stringify({ error: 'dailyLimit must be a non-negative integer' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-				}
+			// 非负整数校验器
+			const nnInt = (v) => { const n = parseInt(v, 10); return isNaN(n) || n < 0 ? null : n; };
+			// 旧字段（向后兼容）
+			if (body.dailyLimit !== undefined) {
+				const val = nnInt(body.dailyLimit);
+				if (val === null) return new Response(JSON.stringify({ error: 'dailyLimit must be a non-negative integer' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 				updates.dailyLimit = val;
 			}
-			if (monthlyLimit !== undefined) {
-				const val = parseInt(monthlyLimit, 10);
-				if (isNaN(val) || val < 0) {
-					return new Response(JSON.stringify({ error: 'monthlyLimit must be a non-negative integer' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-				}
+			if (body.monthlyLimit !== undefined) {
+				const val = nnInt(body.monthlyLimit);
+				if (val === null) return new Response(JSON.stringify({ error: 'monthlyLimit must be a non-negative integer' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 				updates.monthlyLimit = val;
 			}
-			if (threshold !== undefined) {
-				const val = parseFloat(threshold);
+			// 新字段：请求次数 / Token 用量限额
+			for (const k of ['dailyRequestLimit', 'monthlyRequestLimit', 'dailyTokenLimit', 'monthlyTokenLimit', 'globalConcurrency']) {
+				if (body[k] !== undefined) {
+					const val = nnInt(body[k]);
+					if (val === null) return new Response(JSON.stringify({ error: `${k} must be a non-negative integer` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+					updates[k] = val;
+				}
+			}
+			if (body.threshold !== undefined) {
+				const val = parseFloat(body.threshold);
 				if (isNaN(val) || val < 0 || val > 1) {
 					return new Response(JSON.stringify({ error: 'threshold must be a number between 0 and 1' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 				}
 				updates.threshold = val;
+			}
+			// 按模型配置：{ [modelName]: { requestLimit, tokenLimit, concurrency } }
+			if (body.perModel !== undefined) {
+				if (typeof body.perModel !== 'object' || body.perModel === null) {
+					return new Response(JSON.stringify({ error: 'perModel must be an object' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+				}
+				const cleaned = {};
+				for (const [m, cfg] of Object.entries(body.perModel)) {
+					if (!m || typeof cfg !== 'object') continue;
+					cleaned[m] = {
+						requestLimit: nnInt(cfg.requestLimit) || 0,
+						tokenLimit: nnInt(cfg.tokenLimit) || 0,
+						concurrency: nnInt(cfg.concurrency) || 0
+					};
+				}
+				updates.perModel = cleaned;
 			}
 			if (Object.keys(updates).length === 0) {
 				return new Response(JSON.stringify({ error: 'No valid fields provided' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
@@ -5856,14 +5961,14 @@ async function handleAdminPage(request, env, ctx) {
 						<div class="stat-card">
 							<div class="stat-title-row" style="display: flex; align-items: center; justify-content: space-between;">
 								<div class="stat-title">今日用量</div>
-								<span id="stat-total-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap; background: rgba(168, 85, 247, 0.08); padding: 3px 10px; border-radius: 12px;">0</span>
+								<span id="stat-total-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap; background: rgba(168, 85, 247, 0.08); padding: 3px 10px; border-radius: 12px;">0 次请求</span>
 							</div>
 							<div style="display: flex; align-items: baseline; gap: 4px;">
 								<div class="stat-value" id="stat-total-neurons" style="font-size: 42px;">0</div>
-								<span id="stat-total-unit" style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Neurons</span>
+								<span id="stat-total-unit" style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Tokens</span>
 							</div>
 							<div class="stat-desc" id="stat-neurons-desc" style="margin-top: auto; display: flex; justify-content: space-between; align-items: center;">
-								<span>0 / <span id="stat-neurons-limit">1w</span> Neurons</span>
+								<span>0 / <span id="stat-neurons-limit">不限</span> Tokens</span>
 								<span id="stat-neurons-pct" style="font-weight: 600; color: var(--primary-color);">0%</span>
 							</div>
 							<div class="stat-desc" id="stat-cost-saving" style="font-size: 11px; color: #22c55e;">$0.00 节省成本</div>
@@ -5888,12 +5993,12 @@ async function handleAdminPage(request, env, ctx) {
 
 						<div class="stat-card">
 							<div class="stat-title-row" style="display: flex; align-items: center; justify-content: space-between;">
-								<div class="stat-title">本月用量限额</div>
+								<div class="stat-title">本月 Token 用量</div>
 								<span id="stat-monthly-requests" style="font-size: 11px; color: var(--text-muted); white-space: nowrap; background: rgba(168, 85, 247, 0.08); padding: 3px 10px; border-radius: 12px;">0</span>
 							</div>
 							<div style="display: flex; align-items: baseline; gap: 4px;">
 								<div class="stat-value" id="stat-monthly-usage" style="font-size: 42px;">0</div>
-								<span id="stat-monthly-unit" style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Neurons</span>
+								<span id="stat-monthly-unit" style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Tokens</span>
 							</div>
 							<div class="stat-desc" id="stat-monthly-desc" style="margin-top: auto; display: flex; justify-content: space-between;">
 								<span>0 / 100K Neurons</span>
@@ -6079,18 +6184,34 @@ async function handleAdminPage(request, env, ctx) {
 					<div class="section-card">
 						<div class="section-title">用量限额配置</div>
 						<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">
-							配置每日/每月用量限额和拦截阈值。阈值设为 0 表示关闭限额拦截（仅统计不拦截）。<br>
-							环境变量 <code>DAILY_LIMIT</code>、<code>MONTHLY_LIMIT</code>、<code>USAGE_THRESHOLD</code> 优先级高于此处配置。
+							三维度限额：<strong>请求次数</strong> / <strong>Token 用量</strong> / <strong>并发数</strong>，可按全局与按模型分别配置。值设为 0 表示不限制。阈值设为 0 表示关闭限额拦截（仅统计不拦截）。
 						</p>
 
-						<div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 20px;">
+						<h4 style="margin-top: 18px; margin-bottom: 10px; font-size: 14px;">全局限额</h4>
+						<div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 16px; margin-bottom: 20px;">
 							<div class="form-group" style="margin-bottom: 0;">
-								<label>每日限额 (Neurons)</label>
-								<input type="number" id="limits-daily" min="0" step="1" placeholder="10000">
+								<label>每日请求次数</label>
+								<input type="number" id="limits-daily-req" min="0" step="1" placeholder="0=不限">
 							</div>
 							<div class="form-group" style="margin-bottom: 0;">
-								<label>每月限额 (Neurons)</label>
-								<input type="number" id="limits-monthly" min="0" step="1" placeholder="100000">
+								<label>每月请求次数</label>
+								<input type="number" id="limits-monthly-req" min="0" step="1" placeholder="0=不限">
+							</div>
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>每日 Token 用量</label>
+								<input type="number" id="limits-daily-token" min="0" step="1" placeholder="0=不限">
+							</div>
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>每月 Token 用量</label>
+								<input type="number" id="limits-monthly-token" min="0" step="1" placeholder="0=不限">
+							</div>
+						</div>
+
+						<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;">
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>全局并发上限</label>
+								<input type="number" id="limits-global-concurrency" min="0" step="1" placeholder="4">
+								<span style="font-size: 11px; color: var(--text-muted);">单 Worker isolate 内同时进行中的请求数</span>
 							</div>
 							<div class="form-group" style="margin-bottom: 0;">
 								<label>拦截阈值 (0-1)</label>
@@ -6099,16 +6220,57 @@ async function handleAdminPage(request, env, ctx) {
 							</div>
 						</div>
 
-						<button class="btn btn-primary" onclick="saveLimits()" style="align-self: flex-start;">保存配置</button>
-						<span id="limits-save-msg" style="font-size: 13px; margin-left: 12px; display: none;"></span>
+						<h4 style="margin-top: 18px; margin-bottom: 10px; font-size: 14px;">按模型限额</h4>
+						<p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">为特定模型单独设置每日请求次数 / 每日 Token 用量 / 并发上限（覆盖全局并发）。键名为用户请求的模型名（如 glm-5.3-flash）。</p>
+						<div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr auto; gap: 10px; background-color: var(--section-item-bg); padding: 16px; border-radius: 10px; border: 1px solid var(--border-color); margin-bottom: 12px;">
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>模型名</label>
+								<input type="text" id="permodel-name" placeholder="如 glm-5.3-flash">
+							</div>
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>日请求次数</label>
+								<input type="number" id="permodel-req" min="0" step="1" placeholder="0=不限">
+							</div>
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>日 Token 用量</label>
+								<input type="number" id="permodel-token" min="0" step="1" placeholder="0=不限">
+							</div>
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>并发上限</label>
+								<input type="number" id="permodel-concurrency" min="0" step="1" placeholder="0=用全局">
+							</div>
+							<div class="form-group" style="margin-bottom: 0;">
+								<label>&nbsp;</label>
+								<button class="btn btn-primary" onclick="addPerModelLimit()" style="width: 100%;">添加/修改</button>
+							</div>
+						</div>
+						<table>
+							<thead>
+								<tr>
+									<th>模型</th>
+									<th>日请求</th>
+									<th>日 Token</th>
+									<th>并发</th>
+									<th>操作</th>
+								</tr>
+							</thead>
+							<tbody id="permodel-table-body">
+							</tbody>
+						</table>
+
+						<div style="margin-top: 20px; display: flex; align-items: center; gap: 12px;">
+							<button class="btn btn-primary" onclick="saveLimits()">保存配置</button>
+							<span id="limits-save-msg" style="font-size: 13px; display: none;"></span>
+						</div>
 					</div>
 
 					<div class="section-card" style="margin-top: 20px;">
 						<div class="section-title">环境变量说明</div>
 						<p style="font-size: 13px; color: var(--text-muted); line-height: 1.8; margin-top: 8px;">
 							以下配置优先级：<strong>环境变量 > 面板配置 > 默认值</strong><br><br>
-							<code>DAILY_LIMIT</code> — 每日 Neurons 限额（默认 10000）<br>
-							<code>MONTHLY_LIMIT</code> — 每月 Neurons 限额（默认 100000）<br>
+							<code>DAILY_REQUEST_LIMIT</code> / <code>MONTHLY_REQUEST_LIMIT</code> — 日/月请求次数限额（默认 0=不限）<br>
+							<code>DAILY_TOKEN_LIMIT</code> / <code>MONTHLY_TOKEN_LIMIT</code> — 日/月 Token 用量限额（默认 0=不限）<br>
+							<code>MAX_CONCURRENCY_PER_MODEL</code> — 全局并发上限（默认 4）<br>
 							<code>USAGE_THRESHOLD</code> — 拦截阈值（0-1，默认 0，即关闭拦截）<br><br>
 							在 Cloudflare Workers 仪表盘的 Settings → Variables 中添加上述环境变量即可覆盖面板配置。
 						</p>
@@ -7208,33 +7370,74 @@ async function handleAdminPage(request, env, ctx) {
 			document.getElementById('model-select-modal').classList.remove('active');
 		}
 
+		let perModelLimitsCache = {};
 		async function loadLimits() {
 			try {
 				const res = await apiFetch('/api/limits');
 				const data = await res.json();
-				document.getElementById('limits-daily').value = data.dailyLimit;
-				document.getElementById('limits-monthly').value = data.monthlyLimit;
-				document.getElementById('limits-threshold').value = data.threshold;
+				document.getElementById('limits-daily-req').value = data.dailyRequestLimit || 0;
+				document.getElementById('limits-monthly-req').value = data.monthlyRequestLimit || 0;
+				document.getElementById('limits-daily-token').value = data.dailyTokenLimit || 0;
+				document.getElementById('limits-monthly-token').value = data.monthlyTokenLimit || 0;
+				document.getElementById('limits-global-concurrency').value = data.globalConcurrency || 4;
+				document.getElementById('limits-threshold').value = data.threshold || 0;
+				perModelLimitsCache = data.perModel || {};
+				renderPerModelTable();
 			} catch (e) {
 				console.error(e);
 				showToast('加载限额配置失败', 'error');
 			}
 		}
 
-		async function saveLimits() {
-			const daily = parseInt(document.getElementById('limits-daily').value, 10);
-			const monthly = parseInt(document.getElementById('limits-monthly').value, 10);
-			const threshold = parseFloat(document.getElementById('limits-threshold').value);
+		function renderPerModelTable() {
+			const tbody = document.getElementById('permodel-table-body');
+			const entries = Object.entries(perModelLimitsCache || {});
+			if (entries.length === 0) {
+				tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color: var(--text-muted); padding: 20px;">暂无按模型限额配置</td></tr>';
+				return;
+			}
+			tbody.innerHTML = entries.map(([m, cfg]) => \`
+				<tr>
+					<td><strong>\${escapeHtml(m)}</strong></td>
+					<td>\${cfg.requestLimit > 0 ? cfg.requestLimit : '不限'}</td>
+					<td>\${cfg.tokenLimit > 0 ? cfg.tokenLimit : '不限'}</td>
+					<td>\${cfg.concurrency > 0 ? cfg.concurrency : '全局'}</td>
+					<td><button class="btn btn-secondary" style="padding:4px 10px; font-size:11px; color: var(--danger-color);" onclick="removePerModelLimit(\${attrEscape(m)})">删除</button></td>
+				</tr>
+			\`).join('');
+		}
 
-			if (isNaN(daily) || daily < 0) {
-				showToast('每日限额必须是非负整数', 'error');
-				return;
-			}
-			if (isNaN(monthly) || monthly < 0) {
-				showToast('每月限额必须是非负整数', 'error');
-				return;
-			}
-			if (isNaN(threshold) || threshold < 0 || threshold > 1) {
+		function addPerModelLimit() {
+			const name = document.getElementById('permodel-name').value.trim();
+			if (!name) { showToast('请输入模型名', 'warning'); return; }
+			perModelLimitsCache = perModelLimitsCache || {};
+			perModelLimitsCache[name] = {
+				requestLimit: parseInt(document.getElementById('permodel-req').value, 10) || 0,
+				tokenLimit: parseInt(document.getElementById('permodel-token').value, 10) || 0,
+				concurrency: parseInt(document.getElementById('permodel-concurrency').value, 10) || 0
+			};
+			document.getElementById('permodel-name').value = '';
+			document.getElementById('permodel-req').value = '';
+			document.getElementById('permodel-token').value = '';
+			document.getElementById('permodel-concurrency').value = '';
+			renderPerModelTable();
+			showToast('已加入待保存列表，点击"保存配置"生效');
+		}
+
+		function removePerModelLimit(name) {
+			delete perModelLimitsCache[name];
+			renderPerModelTable();
+		}
+
+		async function saveLimits() {
+			const dailyReq = parseInt(document.getElementById('limits-daily-req').value, 10) || 0;
+			const monthlyReq = parseInt(document.getElementById('limits-monthly-req').value, 10) || 0;
+			const dailyToken = parseInt(document.getElementById('limits-daily-token').value, 10) || 0;
+			const monthlyToken = parseInt(document.getElementById('limits-monthly-token').value, 10) || 0;
+			const globalConc = parseInt(document.getElementById('limits-global-concurrency').value, 10) || 4;
+			const threshold = parseFloat(document.getElementById('limits-threshold').value) || 0;
+
+			if (threshold < 0 || threshold > 1) {
 				showToast('阈值必须在 0-1 之间', 'error');
 				return;
 			}
@@ -7242,7 +7445,15 @@ async function handleAdminPage(request, env, ctx) {
 			const res = await apiFetch('/api/limits', {
 				method: 'PUT',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ dailyLimit: daily, monthlyLimit: monthly, threshold })
+				body: JSON.stringify({
+					dailyRequestLimit: dailyReq,
+					monthlyRequestLimit: monthlyReq,
+					dailyTokenLimit: dailyToken,
+					monthlyTokenLimit: monthlyToken,
+					globalConcurrency: globalConc,
+					threshold,
+					perModel: perModelLimitsCache
+				})
 			});
 
 			const msgEl = document.getElementById('limits-save-msg');
