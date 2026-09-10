@@ -1418,17 +1418,22 @@ async function handleV1Proxy(request, env, ctx) {
 		ctx.waitUntil(incrementKeyUsage(env, authResult.keyId));
 	}
 
-	const limitCheck = await checkUsageLimit(env, model);
-	if (!limitCheck.allowed) {
-		const msg = `Request blocked: ${limitCheck.reason}. Please check your usage dashboard.`;
+	// /v1/models 与 count_tokens 不消耗推理配额，跳过限额检查
+	const skipLimit = (url.pathname === '/v1/models' && request.method === 'GET')
+		|| url.pathname === '/v1/messages/count_tokens';
+	if (!skipLimit) {
+		const limitCheck = await checkUsageLimit(env);
+		if (!limitCheck.allowed) {
+			const msg = `Request blocked: ${limitCheck.reason}. Please check your usage dashboard.`;
 
-		if (url.pathname === '/v1/messages' || url.pathname === '/v1/messages/count_tokens') {
-			return new Response(JSON.stringify({
-				type: 'error',
-				error: { type: 'quota_exceeded', message: msg }
-			}), { status: 429, headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
+			if (url.pathname === '/v1/messages' || url.pathname === '/v1/messages/count_tokens') {
+				return new Response(JSON.stringify({
+					type: 'error',
+					error: { type: 'quota_exceeded', message: msg }
+				}), { status: 429, headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
+			}
+			return jsonError(msg, 429, 'quota_exceeded');
 		}
-		return jsonError(msg, 429, 'quota_exceeded');
 	}
 
 	if (url.pathname === '/v1/models' && request.method === 'GET') {
