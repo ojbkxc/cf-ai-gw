@@ -1462,8 +1462,18 @@ async function handleV1Proxy(request, env, ctx) {
 
 	if (url.pathname.startsWith('/v1/models/') && request.method === 'GET') {
 		const modelId = decodeURIComponent(url.pathname.slice('/v1/models/'.length));
+		// 空尾斜杠 /v1/models/ 视为列模型请求，与 /v1/models 等价
 		if (!modelId) {
-			return jsonError("Model ID is required", 400, "invalid_request_error");
+			const customTokens = await getModelTokens(env);
+			const combinedMap = await getCombinedModelMap(env);
+			const modelsData = Object.keys(combinedMap).map(id => {
+				const cfModel = combinedMap[id] || '';
+				if (!cfModel.startsWith('@cf/')) return null;
+				const ownedBy = getModelOwnedBy(cfModel, id);
+				const tokens = customTokens[cfModel] || DEFAULT_MODEL_TOKENS[cfModel] || 0;
+				return { id, object: 'model', created: MODEL_CREATED_TS, owned_by: ownedBy, _tokens: tokens };
+			}).filter(Boolean).sort((a, b) => (b._tokens || 0) - (a._tokens || 0)).map(({ _tokens, ...rest }) => rest);
+			return new Response(JSON.stringify({ object: 'list', data: modelsData }), { headers: { 'Content-Type': 'application/json' } });
 		}
 
 		const combinedMap = await getCombinedModelMap(env);
