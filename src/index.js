@@ -3888,7 +3888,8 @@ async function handleDashboardApi(request, env, ctx) {
 
 		if (graphqlAccounts.length > 0) {
 			// 真实 Neurons 口径：刷新 GraphQL 缓存（与模式B refreshAccountsUsage 同逻辑同KV键）
-			const cacheMap = await refreshAccountsUsage(env, graphqlAccounts, USAGE_REFRESH_LIMIT, force);
+			// 手动刷新(force)时全量刷新所有账号，而非仅最旧3个，确保点刷新能拿到全部账号最新用量
+			const cacheMap = await refreshAccountsUsage(env, graphqlAccounts, force ? graphqlAccounts.length : USAGE_REFRESH_LIMIT, force);
 
 			const todayStr = getTodayStr();
 			const results = graphqlAccounts.map(account => {
