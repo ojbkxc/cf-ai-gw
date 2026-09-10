@@ -5,19 +5,19 @@
  */
 
 // 用量限额配置（环境变量覆盖，未设置则用默认值）
-// 思想转变：不再以 Neurons 为核心，改为「请求次数 + Token 用量 + 并发」三维度
+// 思想转变：关注「请求次数 + 并发」两维度（Token 用量仅做看板统计，不参与限额拦截）
 const DEFAULT_DAILY_REQUEST_LIMIT = 0;       // 0 = 不限
 const DEFAULT_MONTHLY_REQUEST_LIMIT = 0;     // 0 = 不限
-const DEFAULT_DAILY_TOKEN_LIMIT = 0;         // 0 = 不限
-const DEFAULT_MONTHLY_TOKEN_LIMIT = 0;       // 0 = 不限
 const DEFAULT_USAGE_THRESHOLD = 0;           // 0 = 关闭拦截
 // 旧字段保留向后兼容（迁移期仍可读）
 const DEFAULT_DAILY_LIMIT = 10000;
 const DEFAULT_MONTHLY_LIMIT = 100000;
 
-// ===== 每模型并发限制（Workers 单 isolate 内有效）=====
+// ===== 并发限制（Workers 单 isolate 内有效）=====
 const DEFAULT_MAX_CONCURRENCY_PER_MODEL = 4;
-const modelInflight = new Map(); // cfModel -> 当前 in-flight 请求数
+const DEFAULT_GLOBAL_CONCURRENCY = 0;        // 0 = 不限
+const modelInflight = new Map();             // cfModel -> 当前 in-flight 请求数
+let globalInflight = 0;                      // 全局 in-flight 请求数
 
 function getMaxConcurrencyPerModel(env, cfModel) {
 	const v = env && env.MAX_CONCURRENCY_PER_MODEL;
@@ -26,19 +26,22 @@ function getMaxConcurrencyPerModel(env, cfModel) {
 	return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_MAX_CONCURRENCY_PER_MODEL;
 }
 
-// 尝试占用槽位。成功返回 true，超限返回 false
-function acquireModelSlot(cfModel, max) {
+// 尝试占用全局+模型双槽位。成功返回 true，超限返回 false（不占用）
+function acquireModelSlot(cfModel, max, globalMax) {
 	const cur = modelInflight.get(cfModel) || 0;
 	if (cur >= max) return false;
+	if (globalMax > 0 && globalInflight >= globalMax) return false;
 	modelInflight.set(cfModel, cur + 1);
+	globalInflight += 1;
 	return true;
 }
 
-// 释放槽位
+// 释放槽位（全局+模型）
 function releaseModelSlot(cfModel) {
 	const next = (modelInflight.get(cfModel) || 1) - 1;
 	if (next <= 0) modelInflight.delete(cfModel);
 	else modelInflight.set(cfModel, next);
+	if (globalInflight > 0) globalInflight -= 1;
 }
 
 // 包装 stream：在流完全读取或取消时自动释放槽位
@@ -632,7 +635,7 @@ function getEnvNum(env, key, defaultVal, parseFn) {
 }
 
 // 读取限额配置（优先级：环境变量 > KV > 默认值）
-// 三维度：请求次数(日/月)、Token 用量(日/月)、并发(全局/按模型)
+// 两维度：请求次数(日/月) + 并发(全局/按模型)；Token 用量仅统计不拦截
 async function getUsageLimits(env) {
 	const kvLimits = await getUsageLimitsConfig(env);
 
@@ -640,18 +643,15 @@ async function getUsageLimits(env) {
 		// 旧字段（向后兼容，看板仍引用）
 		dailyLimit: getEnvNum(env, 'DAILY_LIMIT', kvLimits.dailyLimit ?? DEFAULT_DAILY_LIMIT, parseInt),
 		monthlyLimit: getEnvNum(env, 'MONTHLY_LIMIT', kvLimits.monthlyLimit ?? DEFAULT_MONTHLY_LIMIT, parseInt),
-		// 新字段：请求次数限额
+		// 请求次数限额
 		dailyRequestLimit: getEnvNum(env, 'DAILY_REQUEST_LIMIT', kvLimits.dailyRequestLimit ?? DEFAULT_DAILY_REQUEST_LIMIT, parseInt),
 		monthlyRequestLimit: getEnvNum(env, 'MONTHLY_REQUEST_LIMIT', kvLimits.monthlyRequestLimit ?? DEFAULT_MONTHLY_REQUEST_LIMIT, parseInt),
-		// 新字段：Token 用量限额
-		dailyTokenLimit: getEnvNum(env, 'DAILY_TOKEN_LIMIT', kvLimits.dailyTokenLimit ?? DEFAULT_DAILY_TOKEN_LIMIT, parseInt),
-		monthlyTokenLimit: getEnvNum(env, 'MONTHLY_TOKEN_LIMIT', kvLimits.monthlyTokenLimit ?? DEFAULT_MONTHLY_TOKEN_LIMIT, parseInt),
 		// 拦截阈值
 		threshold: getEnvNum(env, 'USAGE_THRESHOLD', kvLimits.threshold ?? DEFAULT_USAGE_THRESHOLD, parseFloat),
-		// 按模型配置：{ [modelName]: { requestLimit, tokenLimit, concurrency } }
+		// 按模型配置：{ [modelName]: { requestLimit, concurrency } }
 		perModel: kvLimits.perModel || {},
-		// 全局并发上限（0 = 用 env.MAX_CONCURRENCY_PER_MODEL 或默认 4）
-		globalConcurrency: getEnvNum(env, 'MAX_CONCURRENCY_PER_MODEL', kvLimits.globalConcurrency ?? DEFAULT_MAX_CONCURRENCY_PER_MODEL, parseInt)
+		// 全局并发上限（0 = 不限；env MAX_CONCURRENCY_PER_MODEL 优先）
+		globalConcurrency: getEnvNum(env, 'MAX_CONCURRENCY_PER_MODEL', kvLimits.globalConcurrency ?? DEFAULT_GLOBAL_CONCURRENCY, parseInt)
 	};
 }
 
@@ -1032,7 +1032,8 @@ async function aggregateEventsByDate(env, dateStr) {
 	return agg;
 }
 
-// 用量限额检查：三维度（请求次数 / Token 用量 / 并发）× 日/月 + 按模型
+// 用量限额检查：两维度（请求次数 + 并发）× 日/月 + 按模型请求次数
+// Token 用量仅做看板统计，不参与限额拦截
 async function checkUsageLimit(env, model = null) {
 	const limits = await getUsageLimits(env);
 	const { threshold } = limits;
@@ -1047,14 +1048,12 @@ async function checkUsageLimit(env, model = null) {
 
 	// 本月累计（聚合本月所有天的 evt_ 键；为性能只查今日 + tokens_monthly_ 汇总键兜底）
 	const monthlyKey = getTokenMonthlyKey();
-	let monthRequests = todayAgg.requests, monthTokens = todayAgg.tokens;
+	let monthRequests = todayAgg.requests;
 	try {
 		const raw = await env.KV.get(monthlyKey);
 		if (raw) {
 			const m = JSON.parse(raw);
-			// tokens_monthly_ 是 best-effort 汇总，可能比 evt_ 聚合更全（含 8 天前数据）
 			if ((m.requests || 0) > monthRequests) monthRequests = m.requests || 0;
-			if (((m.input || 0) + (m.output || 0)) > monthTokens) monthTokens = (m.input || 0) + (m.output || 0);
 		}
 	} catch (_) {}
 
@@ -1066,28 +1065,17 @@ async function checkUsageLimit(env, model = null) {
 	if (limits.monthlyRequestLimit > 0 && monthRequests >= limits.monthlyRequestLimit * threshold) {
 		return { allowed: false, reason: `Monthly request limit reached (${monthRequests}/${limits.monthlyRequestLimit})`, limits };
 	}
-	// 全局日 Token
-	if (limits.dailyTokenLimit > 0 && todayAgg.tokens >= limits.dailyTokenLimit * threshold) {
-		return { allowed: false, reason: `Daily token limit reached (${todayAgg.tokens}/${limits.dailyTokenLimit})`, limits };
-	}
-	// 全局月 Token
-	if (limits.monthlyTokenLimit > 0 && monthTokens >= limits.monthlyTokenLimit * threshold) {
-		return { allowed: false, reason: `Monthly token limit reached (${monthTokens}/${limits.monthlyTokenLimit})`, limits };
-	}
 
-	// 按模型限额
+	// 按模型日请求数限额
 	if (model && limits.perModel && limits.perModel[model]) {
 		const pm = limits.perModel[model];
-		const modelAgg = todayAgg.models[model] || { requests: 0, tokens: 0 };
+		const modelAgg = todayAgg.models[model] || { requests: 0 };
 		if (pm.requestLimit > 0 && modelAgg.requests >= pm.requestLimit * threshold) {
 			return { allowed: false, reason: `Model "${model}" daily request limit reached (${modelAgg.requests}/${pm.requestLimit})`, limits };
 		}
-		if (pm.tokenLimit > 0 && modelAgg.tokens >= pm.tokenLimit * threshold) {
-			return { allowed: false, reason: `Model "${model}" daily token limit reached (${modelAgg.tokens}/${pm.tokenLimit})`, limits };
-		}
 	}
 
-	return { allowed: true, limits, todayAgg, monthRequests, monthTokens };
+	return { allowed: true, limits, todayAgg, monthRequests };
 }
 
 // ===== P0: Workers AI 错误码映射 + friendlyError =====
@@ -1331,14 +1319,13 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 		return { success: false, status: 503, error: cbErr };
 	}
 
-	// 并发限制：KV perModel 优先，否则 env 全局值
+	// 并发限制：全局并发上限 + 按模型并发上限（perModel 优先于默认）
 	const limits = await getUsageLimits(env);
-	let max = limits.globalConcurrency || DEFAULT_MAX_CONCURRENCY_PER_MODEL;
-	const userModelName = cfPayload._userModelName;
-	if (userModelName && limits.perModel && limits.perModel[userModelName] && limits.perModel[userModelName].concurrency > 0) {
-		max = limits.perModel[userModelName].concurrency;
-	}
-	if (!acquireModelSlot(cfModel, max)) {
+	const globalMax = limits.globalConcurrency || 0;  // 0 = 不限
+	let max = limits.perModel && cfPayload._userModelName && limits.perModel[cfPayload._userModelName] && limits.perModel[cfPayload._userModelName].concurrency > 0
+		? limits.perModel[cfPayload._userModelName].concurrency
+		: (getMaxConcurrencyPerModel(env));
+	if (!acquireModelSlot(cfModel, max, globalMax)) {
 		return { success: false, status: 429, error: concurrencyLimitError(cfModel, max) };
 	}
 
@@ -3077,10 +3064,14 @@ async function handleEmbeddings(request, env, ctx) {
 	const fallbackWarning = isFallback ? sanitizeHeaderValue(`Model "${model}" not found in mapping, fell back to ${cfModel}`) : null;
 	const textArray = Array.isArray(input) ? input : [input];
 
-	// 模型级并发限制
-	const max = getMaxConcurrencyPerModel(env);
-	if (!acquireModelSlot(cfModel, max)) {
-		const fe = { status: 429, type: 'rate_limit_error', message: `模型并发已达上限 (${max})，请稍后重试` };
+	// 并发限制：全局 + 模型级
+	const limits = await getUsageLimits(env);
+	const globalMax = limits.globalConcurrency || 0;
+	const max = (limits.perModel && limits.perModel[model] && limits.perModel[model].concurrency > 0)
+		? limits.perModel[model].concurrency
+		: getMaxConcurrencyPerModel(env);
+	if (!acquireModelSlot(cfModel, max, globalMax)) {
+		const fe = { status: 429, type: 'rate_limit_error', message: `并发已达上限 (模型${max}${globalMax > 0 ? '/-全局' + globalMax : ''})，请稍后重试` };
 		return jsonError(fe.message, fe.status, fe.type);
 	}
 
@@ -3147,10 +3138,14 @@ async function handleImageGenerations(request, env, ctx) {
 		}
 	}
 
-	// 模型级并发限制
-	const max = getMaxConcurrencyPerModel(env);
-	if (!acquireModelSlot(cfModel, max)) {
-		return jsonError(`模型并发已达上限 (${max})，请稍后重试`, 429, 'rate_limit_error');
+	// 并发限制：全局 + 模型级
+	const limits = await getUsageLimits(env);
+	const globalMax = limits.globalConcurrency || 0;
+	const max = (limits.perModel && limits.perModel[model] && limits.perModel[model].concurrency > 0)
+		? limits.perModel[model].concurrency
+		: getMaxConcurrencyPerModel(env);
+	if (!acquireModelSlot(cfModel, max, globalMax)) {
+		return jsonError(`并发已达上限 (模型${max}${globalMax > 0 ? '/全局' + globalMax : ''})，请稍后重试`, 429, 'rate_limit_error');
 	}
 
 	try {
@@ -3260,10 +3255,14 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 			return jsonError("File size exceeds 8MB limit", 413, "invalid_request_error");
 		}
 
-		// 模型级并发限制
-		const max = getMaxConcurrencyPerModel(env);
-		if (!acquireModelSlot(actualCfModel, max)) {
-			return jsonError(`模型并发已达上限 (${max})，请稍后重试`, 429, 'rate_limit_error');
+		// 并发限制：全局 + 模型级
+		const limits = await getUsageLimits(env);
+		const globalMax = limits.globalConcurrency || 0;
+		const max = (limits.perModel && limits.perModel[model] && limits.perModel[model].concurrency > 0)
+			? limits.perModel[model].concurrency
+			: getMaxConcurrencyPerModel(env);
+		if (!acquireModelSlot(actualCfModel, max, globalMax)) {
+			return jsonError(`并发已达上限 (模型${max}${globalMax > 0 ? '/全局' + globalMax : ''})，请稍后重试`, 429, 'rate_limit_error');
 		}
 
 		try {
@@ -4051,8 +4050,8 @@ async function handleDashboardApi(request, env, ctx) {
 				if (val === null) return new Response(JSON.stringify({ error: 'monthlyLimit must be a non-negative integer' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 				updates.monthlyLimit = val;
 			}
-			// 新字段：请求次数 / Token 用量限额
-			for (const k of ['dailyRequestLimit', 'monthlyRequestLimit', 'dailyTokenLimit', 'monthlyTokenLimit', 'globalConcurrency']) {
+			// 新字段：请求次数限额 / 全局并发
+			for (const k of ['dailyRequestLimit', 'monthlyRequestLimit', 'globalConcurrency']) {
 				if (body[k] !== undefined) {
 					const val = nnInt(body[k]);
 					if (val === null) return new Response(JSON.stringify({ error: `${k} must be a non-negative integer` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
@@ -4066,7 +4065,7 @@ async function handleDashboardApi(request, env, ctx) {
 				}
 				updates.threshold = val;
 			}
-			// 按模型配置：{ [modelName]: { requestLimit, tokenLimit, concurrency } }
+			// 按模型配置：{ [modelName]: { requestLimit, concurrency } }
 			if (body.perModel !== undefined) {
 				if (typeof body.perModel !== 'object' || body.perModel === null) {
 					return new Response(JSON.stringify({ error: 'perModel must be an object' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
@@ -4076,7 +4075,6 @@ async function handleDashboardApi(request, env, ctx) {
 					if (!m || typeof cfg !== 'object') continue;
 					cleaned[m] = {
 						requestLimit: nnInt(cfg.requestLimit) || 0,
-						tokenLimit: nnInt(cfg.tokenLimit) || 0,
 						concurrency: nnInt(cfg.concurrency) || 0
 					};
 				}
@@ -6184,11 +6182,11 @@ async function handleAdminPage(request, env, ctx) {
 					<div class="section-card">
 						<div class="section-title">用量限额配置</div>
 						<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">
-							三维度限额：<strong>请求次数</strong> / <strong>Token 用量</strong> / <strong>并发数</strong>，可按全局与按模型分别配置。值设为 0 表示不限制。阈值设为 0 表示关闭限额拦截（仅统计不拦截）。
+							两维度限额：<strong>请求次数</strong> / <strong>并发数</strong>，可按全局与按模型分别配置。Token 用量仅做看板统计不参与拦截。值设为 0 表示不限制。阈值设为 0 表示关闭限额拦截（仅统计不拦截）。
 						</p>
 
 						<h4 style="margin-top: 18px; margin-bottom: 10px; font-size: 14px;">全局限额</h4>
-						<div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 16px; margin-bottom: 20px;">
+						<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;">
 							<div class="form-group" style="margin-bottom: 0;">
 								<label>每日请求次数</label>
 								<input type="number" id="limits-daily-req" min="0" step="1" placeholder="0=不限">
@@ -6197,21 +6195,13 @@ async function handleAdminPage(request, env, ctx) {
 								<label>每月请求次数</label>
 								<input type="number" id="limits-monthly-req" min="0" step="1" placeholder="0=不限">
 							</div>
-							<div class="form-group" style="margin-bottom: 0;">
-								<label>每日 Token 用量</label>
-								<input type="number" id="limits-daily-token" min="0" step="1" placeholder="0=不限">
-							</div>
-							<div class="form-group" style="margin-bottom: 0;">
-								<label>每月 Token 用量</label>
-								<input type="number" id="limits-monthly-token" min="0" step="1" placeholder="0=不限">
-							</div>
 						</div>
 
 						<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;">
 							<div class="form-group" style="margin-bottom: 0;">
 								<label>全局并发上限</label>
-								<input type="number" id="limits-global-concurrency" min="0" step="1" placeholder="4">
-								<span style="font-size: 11px; color: var(--text-muted);">单 Worker isolate 内同时进行中的请求数</span>
+								<input type="number" id="limits-global-concurrency" min="0" step="1" placeholder="0=不限">
+								<span style="font-size: 11px; color: var(--text-muted);">单 Worker isolate 内同时进行中的请求数（0=不限）</span>
 							</div>
 							<div class="form-group" style="margin-bottom: 0;">
 								<label>拦截阈值 (0-1)</label>
@@ -6221,8 +6211,8 @@ async function handleAdminPage(request, env, ctx) {
 						</div>
 
 						<h4 style="margin-top: 18px; margin-bottom: 10px; font-size: 14px;">按模型限额</h4>
-						<p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">为特定模型单独设置每日请求次数 / 每日 Token 用量 / 并发上限（覆盖全局并发）。键名为用户请求的模型名（如 glm-5.3-flash）。</p>
-						<div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr auto; gap: 10px; background-color: var(--section-item-bg); padding: 16px; border-radius: 10px; border: 1px solid var(--border-color); margin-bottom: 12px;">
+						<p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">为特定模型单独设置每日请求次数 / 并发上限（覆盖全局并发）。键名为用户请求的模型名（如 glm-5.3-flash）。</p>
+						<div style="display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 10px; background-color: var(--section-item-bg); padding: 16px; border-radius: 10px; border: 1px solid var(--border-color); margin-bottom: 12px;">
 							<div class="form-group" style="margin-bottom: 0;">
 								<label>模型名</label>
 								<input type="text" id="permodel-name" placeholder="如 glm-5.3-flash">
@@ -6230,10 +6220,6 @@ async function handleAdminPage(request, env, ctx) {
 							<div class="form-group" style="margin-bottom: 0;">
 								<label>日请求次数</label>
 								<input type="number" id="permodel-req" min="0" step="1" placeholder="0=不限">
-							</div>
-							<div class="form-group" style="margin-bottom: 0;">
-								<label>日 Token 用量</label>
-								<input type="number" id="permodel-token" min="0" step="1" placeholder="0=不限">
 							</div>
 							<div class="form-group" style="margin-bottom: 0;">
 								<label>并发上限</label>
@@ -6249,7 +6235,6 @@ async function handleAdminPage(request, env, ctx) {
 								<tr>
 									<th>模型</th>
 									<th>日请求</th>
-									<th>日 Token</th>
 									<th>并发</th>
 									<th>操作</th>
 								</tr>
@@ -7377,9 +7362,7 @@ async function handleAdminPage(request, env, ctx) {
 				const data = await res.json();
 				document.getElementById('limits-daily-req').value = data.dailyRequestLimit || 0;
 				document.getElementById('limits-monthly-req').value = data.monthlyRequestLimit || 0;
-				document.getElementById('limits-daily-token').value = data.dailyTokenLimit || 0;
-				document.getElementById('limits-monthly-token').value = data.monthlyTokenLimit || 0;
-				document.getElementById('limits-global-concurrency').value = data.globalConcurrency || 4;
+				document.getElementById('limits-global-concurrency').value = data.globalConcurrency || 0;
 				document.getElementById('limits-threshold').value = data.threshold || 0;
 				perModelLimitsCache = data.perModel || {};
 				renderPerModelTable();
@@ -7393,14 +7376,13 @@ async function handleAdminPage(request, env, ctx) {
 			const tbody = document.getElementById('permodel-table-body');
 			const entries = Object.entries(perModelLimitsCache || {});
 			if (entries.length === 0) {
-				tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color: var(--text-muted); padding: 20px;">暂无按模型限额配置</td></tr>';
+				tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-muted); padding: 20px;">暂无按模型限额配置</td></tr>';
 				return;
 			}
 			tbody.innerHTML = entries.map(([m, cfg]) => \`
 				<tr>
 					<td><strong>\${escapeHtml(m)}</strong></td>
 					<td>\${cfg.requestLimit > 0 ? cfg.requestLimit : '不限'}</td>
-					<td>\${cfg.tokenLimit > 0 ? cfg.tokenLimit : '不限'}</td>
 					<td>\${cfg.concurrency > 0 ? cfg.concurrency : '全局'}</td>
 					<td><button class="btn btn-secondary" style="padding:4px 10px; font-size:11px; color: var(--danger-color);" onclick="removePerModelLimit(\${attrEscape(m)})">删除</button></td>
 				</tr>
@@ -7413,12 +7395,10 @@ async function handleAdminPage(request, env, ctx) {
 			perModelLimitsCache = perModelLimitsCache || {};
 			perModelLimitsCache[name] = {
 				requestLimit: parseInt(document.getElementById('permodel-req').value, 10) || 0,
-				tokenLimit: parseInt(document.getElementById('permodel-token').value, 10) || 0,
 				concurrency: parseInt(document.getElementById('permodel-concurrency').value, 10) || 0
 			};
 			document.getElementById('permodel-name').value = '';
 			document.getElementById('permodel-req').value = '';
-			document.getElementById('permodel-token').value = '';
 			document.getElementById('permodel-concurrency').value = '';
 			renderPerModelTable();
 			showToast('已加入待保存列表，点击"保存配置"生效');
@@ -7432,9 +7412,7 @@ async function handleAdminPage(request, env, ctx) {
 		async function saveLimits() {
 			const dailyReq = parseInt(document.getElementById('limits-daily-req').value, 10) || 0;
 			const monthlyReq = parseInt(document.getElementById('limits-monthly-req').value, 10) || 0;
-			const dailyToken = parseInt(document.getElementById('limits-daily-token').value, 10) || 0;
-			const monthlyToken = parseInt(document.getElementById('limits-monthly-token').value, 10) || 0;
-			const globalConc = parseInt(document.getElementById('limits-global-concurrency').value, 10) || 4;
+			const globalConc = parseInt(document.getElementById('limits-global-concurrency').value, 10) || 0;
 			const threshold = parseFloat(document.getElementById('limits-threshold').value) || 0;
 
 			if (threshold < 0 || threshold > 1) {
@@ -7448,8 +7426,6 @@ async function handleAdminPage(request, env, ctx) {
 				body: JSON.stringify({
 					dailyRequestLimit: dailyReq,
 					monthlyRequestLimit: monthlyReq,
-					dailyTokenLimit: dailyToken,
-					monthlyTokenLimit: monthlyToken,
 					globalConcurrency: globalConc,
 					threshold,
 					perModel: perModelLimitsCache
