@@ -94,11 +94,21 @@ function getTokenMonthlyKey() {
 	return `tokens_monthly_${d.getFullYear()}_${String(d.getMonth() + 1).padStart(2, '0')}`;
 }
 
-// 累加 token 直接写入 KV（无内存缓冲，避免冷启动丢失）
+// 累加 token：每请求写独立事件键 evt_<date>_<uuid>，彻底无 read-modify-write 竞态。
+// buildLocalUsageFallback 用 KV.list 聚合。同时维护 tokens_daily_/tokens_monthly_ 汇总键
+// 作为 chart 快速路径（容忍少量并发覆盖丢失，事件键为准）。
 async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0, cacheRead = 0, cacheWrite = 0, durationSec = 0, model = null }) {
+	if (!ctx) return;
 	ctx.waitUntil((async () => {
 		try {
-			// 今日统计
+			const todayStr = getTodayStr();
+			// 1) 独立事件键（无竞态，作为请求数与 token 数的真实数据源）
+			const evtKey = `evt_${todayStr}_${crypto.randomUUID()}`;
+			const evt = { i: input, o: output, r: reasoning, m: model || null, ts: Date.now() };
+			await env.KV.put(evtKey, JSON.stringify(evt), { expirationTtl: TOKEN_KV_TTL_SEC });
+
+			// 2) 日汇总键（best-effort，并发可能覆盖丢失，仅用于前端避免 list N 次的快速展示；
+			//    真实数据以 list 事件键聚合为准，见 buildLocalUsageFallback）
 			const dailyKey = getTokenDailyKey();
 			const raw = await env.KV.get(dailyKey);
 			const cur = raw ? JSON.parse(raw) : { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, requests: 0, tokPerSecSum: 0, tokPerSecCount: 0, models: {} };
@@ -112,7 +122,6 @@ async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0
 				cur.tokPerSecSum = (cur.tokPerSecSum || 0) + Math.round(output / durationSec);
 				cur.tokPerSecCount = (cur.tokPerSecCount || 0) + 1;
 			}
-			// 按模型维度统计（看板"今日模型消耗占比"）
 			if (model) {
 				cur.models = cur.models || {};
 				const m = cur.models[model] || (cur.models[model] = { input: 0, output: 0 });
@@ -121,7 +130,7 @@ async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0
 			}
 			await env.KV.put(dailyKey, JSON.stringify(cur), { expirationTtl: TOKEN_KV_TTL_SEC });
 
-			// 月度统计（累加模式）
+			// 3) 月度汇总键（best-effort）
 			const monthlyKey = getTokenMonthlyKey();
 			const monthlyRaw = await env.KV.get(monthlyKey);
 			const monthly = monthlyRaw ? JSON.parse(monthlyRaw) : { input: 0, output: 0, reasoning: 0, requests: 0 };
@@ -871,26 +880,47 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) 
 async function buildLocalUsageFallback(env) {
 	const todayStr = getTodayStr();
 
-	// 今日 + 7 天历史（并行读取）
+	// 今日 + 7 天历史：用 evt_<date>_* 事件键聚合（无竞态、真实）
 	const historyDates = [];
 	for (let i = 0; i <= 6; i++) {
 		const d = new Date(Date.now() - i * 86400000);
 		historyDates.push(d.toISOString().split('T')[0]);
 	}
-	const dailyEntries = await Promise.all(
+
+	const dailyAgg = await Promise.all(
 		historyDates.map(async (date) => {
+			const agg = { date, input: 0, output: 0, requests: 0, models: {} };
 			try {
-				const raw = await env.KV.get(`tokens_daily_${date}`);
-				return raw ? { date, ...JSON.parse(raw) } : { date, input: 0, output: 0, requests: 0, models: {} };
-			} catch (e) { return { date, input: 0, output: 0, requests: 0, models: {} }; }
+				let cursor;
+				do {
+					const list = await env.KV.list({ prefix: `evt_${date}_`, cursor });
+					for (const k of list.keys) {
+						try {
+							const raw = await env.KV.get(k.name);
+							if (!raw) continue;
+							const evt = JSON.parse(raw);
+							agg.input += evt.i || 0;
+							agg.output += evt.o || 0;
+							agg.requests += 1;
+							if (evt.m) {
+								agg.models[evt.m] = agg.models[evt.m] || { input: 0, output: 0 };
+								agg.models[evt.m].input += evt.i || 0;
+								agg.models[evt.m].output += evt.o || 0;
+							}
+						} catch (_) {}
+					}
+					cursor = list.list_complete ? null : list.cursor;
+				} while (cursor);
+			} catch (e) { /* 容错 */ }
+			return agg;
 		})
 	);
 
-	const todayEntry = dailyEntries.find(e => e.date === todayStr) || { input: 0, output: 0, requests: 0, models: {} };
-	// 今日用量口径：优先用 requests 反映调用次数；用量数值用 input+output（token 数）
+	const todayEntry = dailyAgg.find(e => e.date === todayStr) || { input: 0, output: 0, requests: 0, models: {} };
 	const usageToday = (todayEntry.input || 0) + (todayEntry.output || 0);
 	const usageTodayRequests = todayEntry.requests || 0;
-	// 今日模型列表：若今日有调用但 models 字段为空（旧数据/usage 缺失），构造一个 "_unknown" 兜底项，避免看板"模型数 0"
+
+	// 今日模型占比
 	const modelsToday = [];
 	if (todayEntry.models) {
 		for (const [model, m] of Object.entries(todayEntry.models)) {
@@ -903,22 +933,36 @@ async function buildLocalUsageFallback(env) {
 	modelsToday.sort((a, b) => b.neurons - a.neurons);
 
 	// 7 日走势
-	const history = dailyEntries
+	const history = dailyAgg
 		.slice()
 		.sort((a, b) => a.date < b.date ? -1 : 1)
 		.map(e => ({ date: e.date, neurons: (e.input || 0) + (e.output || 0), requests: e.requests || 0 }));
 
-	// 本月累计（读 tokens_monthly_*_YYYY-MM；旧数据可能无 reasoning 字段，容错）
+	// 本月累计：list evt_<YYYY-MM-DD>_* 跨日聚合（本月所有天）
 	const now = new Date();
-	const monthKey = `tokens_monthly_${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, '0')}`;
+	const monthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
 	let monthInput = 0, monthOutput = 0, monthRequests = 0;
+	for (const e of dailyAgg) {
+		if (e.date.startsWith(monthPrefix)) {
+			monthInput += e.input || 0;
+			monthOutput += e.output || 0;
+			monthRequests += e.requests || 0;
+		}
+	}
+	// 本月可能有天数 >7 天的部分未在 dailyAgg 内，补查 tokens_monthly_ 汇总键（best-effort，可能偏低）
 	try {
+		const monthKey = `tokens_monthly_${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, '0')}`;
 		const raw = await env.KV.get(monthKey);
 		if (raw) {
 			const m = JSON.parse(raw);
-			monthInput = m.input || 0;
-			monthOutput = m.output || 0;
-			monthRequests = m.requests || 0;
+			// 若汇总键值更大（含 8 天前的数据），用汇总键；否则用聚合值
+			const sumFromMonthly = (m.input || 0) + (m.output || 0);
+			const sumFromAgg = monthInput + monthOutput;
+			if (sumFromMonthly > sumFromAgg) {
+				monthInput = m.input || 0;
+				monthOutput = m.output || 0;
+				monthRequests = m.requests || 0;
+			}
 		}
 	} catch (e) { /* 容错 */ }
 	const usageThisMonth = monthInput + monthOutput;
@@ -1497,9 +1541,11 @@ async function handleCompletions(request, env, ctx, pathname) {
 	}
 
 	if (stream) {
+		// 流式：先记一次 request（流式 done 分支只补 token，避免 ctx 失效导致 request 漏记）
+		accumulateFromUsage(env, ctx, null, requestStartTime, model);
 		// For Binding streaming, we get a ReadableStream directly. Wrap it in passthroughStream for SSE processing.
 		return streamResponse(
-			passthroughStream(result.stream, model, pathname === '/v1/completions', env, ctx, requestStartTime),
+			passthroughStream(result.stream, model, pathname === '/v1/completions', env, ctx, requestStartTime, true),
 			fallbackWarning
 		);
 	}
@@ -1839,8 +1885,9 @@ async function handleMessages(request, env, ctx) {
 	}
 
 	if (stream) {
+		accumulateFromUsage(env, ctx, null, requestStartTime, model);
 		return streamResponse(
-			anthropicStreamTransform(result.stream, model, anthropicBody.messages, env, ctx, requestStartTime),
+			anthropicStreamTransform(result.stream, model, anthropicBody.messages, env, ctx, requestStartTime, true),
 			fallbackWarning
 		);
 	}
@@ -1850,7 +1897,7 @@ async function handleMessages(request, env, ctx) {
 }
 
 // ===== Anthropic SSE 流式转换：OpenAI SSE → Anthropic SSE =====
-function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env, ctx, requestStartTime) {
+function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env, ctx, requestStartTime, tokenAlreadyCounted) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
@@ -2177,7 +2224,9 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 		})}\n\n`)); } catch (_) { /* 忽略 */ }
 		finalEventSent = true;
 
-		if (env && ctx) {
+		// 流式 request 已在 handler 入口计过；这里仅在拿到 token 数时补一次 token 累加
+		// （input/output 不为 0 时才写，避免重复计 request → 加 countRequest:false）
+		if (env && ctx && !tokenAlreadyCounted && (inputTokens > 0 || outputTokens > 0)) {
 			accumulateTokens(env, ctx, {
 				input: inputTokens,
 				output: outputTokens,
@@ -2443,8 +2492,9 @@ async function handleResponses(request, env, ctx) {
 	}
 
 	if (stream) {
+		accumulateFromUsage(env, ctx, null, requestStartTime, model);
 		return streamResponse(
-			responsesStreamTransform(result.stream, model, env, ctx, requestStartTime),
+			responsesStreamTransform(result.stream, model, env, ctx, requestStartTime, true),
 			fallbackWarning
 		);
 	}
@@ -2463,7 +2513,7 @@ async function handleResponses(request, env, ctx) {
 // ===== Responses SSE 流式转换：OpenAI Chat SSE → Responses SSE =====
 // 事件序列：response.created → output_item/content_part/output_text/reasoning_summary/function_call_arguments
 // 系列增量 → flush 所有未闭合 item → response.completed（含完整 output 数组 + usage）
-function responsesStreamTransform(upstreamBody, originalModel, env, ctx, requestStartTime) {
+function responsesStreamTransform(upstreamBody, originalModel, env, ctx, requestStartTime, tokenAlreadyCounted) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
@@ -2902,8 +2952,8 @@ function responsesStreamTransform(upstreamBody, originalModel, env, ctx, request
 		}))); } catch (_) { /* 忽略 enqueue 异常 */ }
 		finalEventSent = true;
 
-		// 流结束时累加 token 统计
-		if (env && ctx) {
+		// 流式 request 已在 handler 入口计过；这里仅在拿到 token 数时补一次 token 累加
+		if (env && ctx && !tokenAlreadyCounted && (inputTokens > 0 || outputTokens > 0)) {
 			accumulateTokens(env, ctx, {
 				input: inputTokens,
 				output: outputTokens,
@@ -3271,7 +3321,7 @@ async function handleCountTokens(request, env) {
 }
 
 // ===== passthroughStream - 透传 SSE 流 =====
-function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requestStartTime) {
+function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requestStartTime, tokenAlreadyCounted) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
@@ -3331,7 +3381,10 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 						controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 						controller.close();
 					if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-					accumulateFromUsage(env, ctx, streamUsage, requestStartTime, model);
+					// 流式 request 已在 handler 入口计过，这里只在有 usage 时补 token
+					if (!tokenAlreadyCounted && streamUsage) {
+						accumulateFromUsage(env, ctx, streamUsage, requestStartTime, model);
+					}
 						break;
 					}
 
