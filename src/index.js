@@ -137,15 +137,18 @@ async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0
 }
 
 // 从 usage 对象提取字段并累加 token 统计
+// 即使 usage 缺失（CF Binding 流式常不返回 usage chunk）也至少计一次 request，
+// 否则看板"今日请求"恒为 0 无法反映真实调用。
 function accumulateFromUsage(env, ctx, usage, requestStartTime, model = null) {
-	if (!ctx || !usage) return;
-	const pd = usage.prompt_tokens_details || {};
+	if (!ctx) return;
+	const u = usage || {};
+	const pd = u.prompt_tokens_details || {};
 	accumulateTokens(env, ctx, {
-		input: usage.prompt_tokens || 0,
-		output: usage.completion_tokens || 0,
-		reasoning: usage.reasoning_tokens || 0,
-		cacheRead: pd.cached_tokens ?? usage.cache_read_tokens ?? 0,
-		cacheWrite: usage.cache_write_tokens || 0,
+		input: u.prompt_tokens || 0,
+		output: u.completion_tokens || 0,
+		reasoning: u.reasoning_tokens || 0,
+		cacheRead: pd.cached_tokens ?? u.cache_read_tokens ?? 0,
+		cacheWrite: u.cache_write_tokens || 0,
 		durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
 		model,
 	});
@@ -884,17 +887,20 @@ async function buildLocalUsageFallback(env) {
 	);
 
 	const todayEntry = dailyEntries.find(e => e.date === todayStr) || { input: 0, output: 0, requests: 0, models: {} };
+	// 今日用量口径：优先用 requests 反映调用次数；用量数值用 input+output（token 数）
 	const usageToday = (todayEntry.input || 0) + (todayEntry.output || 0);
 	const usageTodayRequests = todayEntry.requests || 0;
-
-	// 今日模型占比（从 models 字段提取，输出 token 近似为消耗）
+	// 今日模型列表：若今日有调用但 models 字段为空（旧数据/usage 缺失），构造一个 "_unknown" 兜底项，避免看板"模型数 0"
 	const modelsToday = [];
 	if (todayEntry.models) {
 		for (const [model, m] of Object.entries(todayEntry.models)) {
 			modelsToday.push({ model, neurons: (m.input || 0) + (m.output || 0), requests: 0 });
 		}
-		modelsToday.sort((a, b) => b.neurons - a.neurons);
 	}
+	if (modelsToday.length === 0 && usageTodayRequests > 0) {
+		modelsToday.push({ model: '_unknown', neurons: usageToday, requests: usageTodayRequests });
+	}
+	modelsToday.sort((a, b) => b.neurons - a.neurons);
 
 	// 7 日走势
 	const history = dailyEntries
@@ -2171,7 +2177,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 		})}\n\n`)); } catch (_) { /* 忽略 */ }
 		finalEventSent = true;
 
-		if (env && ctx && (inputTokens > 0 || outputTokens > 0)) {
+		if (env && ctx) {
 			accumulateTokens(env, ctx, {
 				input: inputTokens,
 				output: outputTokens,
@@ -2897,7 +2903,7 @@ function responsesStreamTransform(upstreamBody, originalModel, env, ctx, request
 		finalEventSent = true;
 
 		// 流结束时累加 token 统计
-		if (env && ctx && (inputTokens > 0 || outputTokens > 0)) {
+		if (env && ctx) {
 			accumulateTokens(env, ctx, {
 				input: inputTokens,
 				output: outputTokens,
@@ -3698,6 +3704,7 @@ async function handleDashboardApi(request, env, ctx) {
 					usageTodayRequests,
 					modelsToday: cached && cached.todayDate === todayStr ? (cached.modelsToday || []) : [],
 					history: cached ? cached.history : [],
+					usageThisMonth: cached ? (cached.usageThisMonth || 0) : 0,
 					lastUpdated: cached ? cached.timestamp : 0
 				};
 			});
@@ -3722,9 +3729,10 @@ async function handleDashboardApi(request, env, ctx) {
 		const dailyUsage = fallback.accounts[0].usageToday;
 		const dailyRequests = fallback.accounts[0].usageTodayRequests;
 		const monthlyRequests = fallback.accounts[0].usageThisMonthRequests || 0;
+		const fallbackMonthlyUsage = fallback.accounts[0].usageThisMonth || monthlyUsage;
 		return new Response(JSON.stringify({
 			accounts: fallback.accounts,
-			limits: { dailyUsage, dailyRequests, dailyLimit: limits.dailyLimit, monthlyUsage, monthlyRequests, monthlyLimit: limits.monthlyLimit, threshold: limits.threshold },
+			limits: { dailyUsage, dailyRequests, dailyLimit: limits.dailyLimit, monthlyUsage: fallbackMonthlyUsage, monthlyRequests, monthlyLimit: limits.monthlyLimit, threshold: limits.threshold },
 			unit: fallback.unit
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
@@ -6199,10 +6207,12 @@ async function handleAdminPage(request, env, ctx) {
 
 				// 7天历史总量
 				const history7d = (account.history || []).reduce((sum, h) => sum + (h.neurons || 0), 0);
-				// 本月用量（从 history 中提取当月）
+				// 本月用量：优先用后端返回的 usageThisMonth（本地兜底已填），没有则从 history 提取当月
 				const now = new Date();
 				const monthPrefix = now.toISOString().slice(0, 7); // "YYYY-MM"
-				const monthUsage = (account.history || []).filter(h => h.date && h.date.startsWith(monthPrefix)).reduce((sum, h) => sum + (h.neurons || 0), 0);
+				const monthUsage = (typeof account.usageThisMonth === 'number' && account.usageThisMonth > 0)
+					? account.usageThisMonth
+					: (account.history || []).filter(h => h.date && h.date.startsWith(monthPrefix)).reduce((sum, h) => sum + (h.neurons || 0), 0);
 				// 模型数量
 				const modelCount = (account.modelsToday || []).length;
 				// 7天请求次数
