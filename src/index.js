@@ -6352,9 +6352,11 @@ async function handleAdminPage(request, env, ctx) {
 		}
 
 		// 请求次数用「万」为单位展示（如 12345 -> 1.23w）
+		// 规则：保留两位小数；两位小数全为 0 时去掉小数点显示整数（4.00w -> 4w），否则完整显示两位（4.01w / 4.12w）
 		function fmtWan(n) {
 			if (n < 10000) return String(n);
-			return (n / 10000).toFixed(2).replace(/\.?0+$/, '') + 'w';
+			const v = (n / 10000).toFixed(2);
+			return v.endsWith('.00') ? v.slice(0, -3) + 'w' : v + 'w';
 		}
 
 		let currentTab = 'overview';
