@@ -5008,12 +5008,24 @@ async function handleLandingPage(request, env, ctx) {
 		}
 
 		// 公开密钥查询（主页，无需登录）
+		let _publicKeyCountdownTimer = null;
+		function fmtRemainingMs(ms) {
+			if (ms <= 0) return '已到期';
+			const totalMin = Math.floor(ms / 60000);
+			const days = Math.floor(totalMin / 1440);
+			const hours = Math.floor((totalMin % 1440) / 60);
+			const mins = totalMin % 60;
+			if (days > 0) return days + ' 天 ' + hours + ' 小时 ' + mins + ' 分钟';
+			if (hours > 0) return hours + ' 小时 ' + mins + ' 分钟';
+			return mins + ' 分钟';
+		}
 		async function queryPublicKeyInfo() {
 			const input = document.getElementById('public-key-query-input');
 			const resultEl = document.getElementById('public-key-query-result');
 			const btn = document.getElementById('public-key-query-btn');
 			const key = (input.value || '').trim();
 			if (!key) { showToast('请输入 API Key', 'warning'); return; }
+			if (_publicKeyCountdownTimer) { clearInterval(_publicKeyCountdownTimer); _publicKeyCountdownTimer = null; }
 			btn.disabled = true;
 			const original = btn.innerText;
 			btn.innerText = '查询中...';
@@ -5026,18 +5038,30 @@ async function handleLandingPage(request, env, ctx) {
 					resultEl.innerHTML = '<div style="padding: 14px 16px; border-radius: 10px; background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2); color: var(--danger-color); font-size: 13px;">✗ ' + reason + '</div>';
 					return;
 				}
-				const expiryLine = data.expiresAt
-					? (data.remainingDays !== null && data.remainingDays !== undefined
-						? '剩余有效期: <strong>' + data.remainingDays + ' 天</strong>（至 ' + new Date(data.expiresAt).toLocaleDateString() + '）'
-						: '有效期至 ' + new Date(data.expiresAt).toLocaleString())
-					: '有效期: <strong>不限</strong>';
 				const callsLine = data.maxCalls && data.maxCalls > 0
 					? '剩余次数: <strong>' + (data.remainingCalls ?? 0) + ' / ' + data.maxCalls + '</strong>（已用 ' + (data.usedCalls || 0) + '）'
 					: '调用次数: <strong>不限</strong>';
+				let expiryHtml;
+				if (data.expiresAt) {
+					const expMs = Date.parse(data.expiresAt);
+					const remain = expMs - Date.now();
+					expiryHtml = '剩余有效期: <strong id="public-key-remaining">' + fmtRemainingMs(remain) + '</strong>（至 ' + new Date(data.expiresAt).toLocaleString() + '）';
+					if (!isNaN(expMs)) {
+						_publicKeyCountdownTimer = setInterval(() => {
+							const el = document.getElementById('public-key-remaining');
+							if (!el) { clearInterval(_publicKeyCountdownTimer); _publicKeyCountdownTimer = null; return; }
+							const left = expMs - Date.now();
+							el.innerText = fmtRemainingMs(left);
+							if (left <= 0) { clearInterval(_publicKeyCountdownTimer); _publicKeyCountdownTimer = null; }
+						}, 60000);
+					}
+				} else {
+					expiryHtml = '有效期: <strong>不限</strong>';
+				}
 				resultEl.innerHTML = '<div style="padding: 14px 16px; border-radius: 10px; background: rgba(34,197,94,0.08); border: 1px solid rgba(34,197,94,0.2); font-size: 13px; line-height: 1.8;">' +
 					'<div style="color: var(--success-color); font-weight: 600; margin-bottom: 6px;">✓ 密钥有效</div>' +
 					'<div style="color: var(--text-muted);">描述: ' + escapeHtml(data.name || '') + '</div>' +
-					'<div style="color: var(--text-muted);">' + expiryLine + '</div>' +
+					'<div style="color: var(--text-muted);">' + expiryHtml + '</div>' +
 					'<div style="color: var(--text-muted);">' + callsLine + '</div>' +
 					'</div>';
 			} catch (e) {
