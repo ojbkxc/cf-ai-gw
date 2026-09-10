@@ -5073,9 +5073,6 @@ async function handleLandingPage(request, env, ctx) {
 			}
 		}
 	</script>
-	<footer style="text-align: center; padding: 24px 0 20px; font-size: 12px; color: var(--text-muted); opacity: 0.6; z-index: 10;">
-		由 <a href="https://github.com/ojbkxc/cf-ai-gw" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">cf-ai-gw</a> 强力驱动
-	</footer>
 </body>
 </html>`;
 
@@ -5754,9 +5751,6 @@ async function handleAdminPage(request, env, ctx) {
 					<span>切换主题</span>
 				</button>
 				<button class="btn btn-secondary" onclick="logout()">退出登录</button>
-				<div style="text-align: center; font-size: 11px; color: var(--text-muted); opacity: 0.55; padding-top: 4px;">
-					由 <a href="https://github.com/ojbkxc/cf-ai-gw" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">cf-ai-gw</a> 强力驱动
-				</div>
 			</div>
 		</aside>
 
