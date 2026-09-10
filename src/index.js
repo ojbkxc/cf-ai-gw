@@ -1320,13 +1320,21 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 	if (!acquireModelSlot(cfModel, modelMax, globalMax)) {
 		return { success: false, status: 429, error: concurrencyLimitError(cfModel, modelMax) };
 	}
+	// 幂等释放：带标志位，避免 finally 与 catch 各自释放造成双释放，导致并发计数减超
+	let slotReleased = false;
+	const releaseSlot = () => {
+		if (!slotReleased) {
+			slotReleased = true;
+			releaseModelSlot(cfModel);
+		}
+	};
 
 	try {
 		if (stream) {
 			const inputs = { ...cfPayload, stream: true };
 			const resp = await env.AI.run(cfModel, inputs, aiRunOptions(env, { returnRawResponse: true, signal: AbortSignal.timeout(600000) }));
 			if (!resp.ok) {
-				releaseModelSlot(cfModel);
+				releaseSlot();
 				const errText = await resp.text();
 				let parsedErr;
 				try { parsedErr = JSON.parse(errText); } catch (_) { parsedErr = { message: errText }; }
@@ -1338,12 +1346,12 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 				return { success: false, status: resp.status, error: aiErr };
 			}
 			if (!resp.body) {
-				releaseModelSlot(cfModel);
+				releaseSlot();
 				return { success: false, status: 502, error: new Error('AI Binding returned empty response body') };
 			}
+			// 流式成功：槽位改由 wrapper 在流读完/取消/出错时释放，此处不标记已释放
 			cbOnSuccess(env);
 			noteModelOk(cfModel);
-			// 关键：流式响应要用 wrapper 包起来，等流完全读完才释放槽位
 			return { success: true, status: resp.status, stream: wrapStreamWithRelease(resp.body, cfModel) };
 		}
 		// 非流式：try/finally 确保释放
@@ -1353,9 +1361,11 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 			noteModelOk(cfModel);
 			return { success: true, status: 200, data: normalizeBindingResult(result, cfModel) };
 		} finally {
-			releaseModelSlot(cfModel);
+			releaseSlot();
 		}
 	} catch (e) {
+		// 流式在 run 阶段抛错在此兜底释放；非流式失败时 finally 已释放（幂等保证不双释放）
+		releaseSlot();
 		cbOnCapacityFail(env);
 		noteModelFail(cfModel, e);
 		return { success: false, status: 502, error: e };
@@ -6779,12 +6789,12 @@ async function handleAdminPage(request, env, ctx) {
 					datasets.push({
 						label: '请求次数',
 						data: requestsData,
-						borderColor: '#ef4444',
-						backgroundColor: 'rgba(239, 68, 68, 0.08)',
+						borderColor: '#eab308',
+						backgroundColor: 'rgba(234, 179, 8, 0.08)',
 						borderWidth: 2,
 						tension: 0.3,
 						fill: false,
-						pointBackgroundColor: '#ef4444',
+						pointBackgroundColor: '#eab308',
 						pointRadius: 3,
 						pointHoverRadius: 5,
 						yAxisID: 'y1'
@@ -6816,7 +6826,7 @@ async function handleAdminPage(request, env, ctx) {
 						type: 'linear',
 						position: 'right',
 						grid: { drawOnChartArea: false },
-						ticks: { color: '#ef4444' }
+						ticks: { color: '#eab308' }
 					};
 				}
 			historyChart = new Chart(ctx, {
