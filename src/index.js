@@ -4743,8 +4743,8 @@ async function handleLandingPage(request, env, ctx) {
 			<span class="logo-text">cf-ai-gw</span>
 		</div>
 
-		<div class="dashboard-grid">
-			
+		<div class="dashboard-grid" id="public-dashboard-grid" style="${isLoggedIn ? '' : 'display: none;'}">
+
 			<div class="stat-card" style="justify-content: space-between;">
 				<div>
 					<div class="stat-title" style="margin-bottom: 10px;">今日用量汇总</div>
@@ -4753,7 +4753,7 @@ async function handleLandingPage(request, env, ctx) {
 						<span id="public-unit-label" style="font-size: 14px; color: var(--text-muted); font-weight: 500; font-family: 'Outfit', sans-serif;">Neurons</span>
 					</div>
 				</div>
-				
+
 				<div style="margin-top: 16px;">
 					<div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted); margin-top: 8px;">
 						<span id="public-limit-desc">总限额: 0 Neurons</span>
@@ -4761,21 +4761,21 @@ async function handleLandingPage(request, env, ctx) {
 					</div>
 				</div>
 			</div>
-			
+
 			<div class="stat-card" id="public-models-card" style="padding: 24px; display: flex; flex-direction: column; justify-content: center;">
-				
+
 				<div class="public-chart-wrapper" id="public-chart-wrapper" style="display: none; height: 190px; width: 100%; flex-direction: row; align-items: center; justify-content: space-between; gap: 40px;">
-					
+
 					<div style="position: relative; height: 190px; width: 190px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;">
 						<canvas id="publicModelsChart"></canvas>
 					</div>
-					
+
 					<div style="flex: 1; display: flex; flex-direction: column; justify-content: center; min-width: 0; align-self: stretch; height: 190px;">
 						<div id="public-chart-legend" class="chart-legend" style="flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; max-height: 180px; overflow-y: auto; padding-right: 4px;"></div>
 					</div>
 				</div>
-				
-				
+
+
 				<div id="public-chart-placeholder" style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 190px; width: 100%; color: var(--text-muted); font-size: 13px; gap: 12px;">
 					<span class="spinner" style="width: 24px; height: 24px; border-width: 2.5px;"></span>
 					<span>正在载入数据...</span>
@@ -4870,7 +4870,8 @@ async function handleLandingPage(request, env, ctx) {
 		initTheme();
 
 		window.onload = function() {
-			loadPublicSummary();
+			// 仅登录后才拉取今日用量汇总
+			if (${isLoggedIn ? 'true' : 'false'}) loadPublicSummary();
 		};
 
 		async function loadPublicSummary() {
@@ -4878,10 +4879,8 @@ async function handleLandingPage(request, env, ctx) {
 				const res = await fetch('/api/usage/summary');
 				if (res.status === 401) {
 					// 未登录：隐藏用量卡片和模型图表，不显示 spinner
-					const publicCard = document.querySelector('.dashboard-grid .stat-card');
-					if (publicCard) publicCard.style.display = 'none';
-					const modelsCard = document.getElementById('public-models-card');
-					if (modelsCard) modelsCard.style.display = 'none';
+					const grid = document.getElementById('public-dashboard-grid');
+					if (grid) grid.style.display = 'none';
 					return;
 				}
 				const data = await res.json();
