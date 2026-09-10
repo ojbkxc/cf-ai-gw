@@ -6666,10 +6666,8 @@ async function handleAdminPage(request, env, ctx) {
 			// 更新文字显示
 			updateLastUpdatedText(lastFetched);
 
-			// 防抖：距上次刷新不到 60s 则跳过（手动刷新除外）
-			if (!isManual && lastFetched && (now - lastFetched) < 60000) {
-				return;
-			}
+			// 移除前端 60s 防抖：让 F5 每次都请求后端，由后端新鲜期缓存(60s)兜底避免重复昂贵 GraphQL 查询
+			// 这样浏览器刷新能看到不断更新的数据，又不回引发"刷新卡顿"
 
 			const btn = document.getElementById('btn-refresh-usage');
 			let originalBtnText = '';
