@@ -6321,6 +6321,12 @@ async function handleAdminPage(request, env, ctx) {
 			return (n / 1000000000).toFixed(2).replace(/\.?0+$/, '') + 'B';
 		}
 
+		// 请求次数用「万」为单位展示（如 12345 -> 1.23w）
+		function fmtWan(n) {
+			if (n < 10000) return String(n);
+			return (n / 10000).toFixed(2).replace(/\.?0+$/, '') + 'w';
+		}
+
 		let currentTab = 'overview';
 		let historyChart = null;
 		let modelsChart = null;
@@ -6373,14 +6379,14 @@ async function handleAdminPage(request, env, ctx) {
 				const roundedUsage = Math.ceil(account.usageToday);
 				newAccountIds.add(account.id);
 
-				// 7天历史总量
-				const history7d = (account.history || []).reduce((sum, h) => sum + (h.neurons || 0), 0);
 				// 本月用量：优先用后端返回的 usageThisMonth（本地兜底已填），没有则从 history 提取当月
 				const now = new Date();
 				const monthPrefix = now.toISOString().slice(0, 7); // "YYYY-MM"
 				const monthUsage = (typeof account.usageThisMonth === 'number' && account.usageThisMonth > 0)
 					? account.usageThisMonth
 					: (account.history || []).filter(h => h.date && h.date.startsWith(monthPrefix)).reduce((sum, h) => sum + (h.neurons || 0), 0);
+				// 本月请求次数：当月历史 requests 汇总
+				const monthRequests = (account.history || []).filter(h => h.date && h.date.startsWith(monthPrefix)).reduce((sum, h) => sum + (h.requests || 0), 0);
 				// 模型数量
 				const modelCount = (account.modelsToday || []).length;
 				// 7天请求次数
@@ -6421,9 +6427,9 @@ async function handleAdminPage(request, env, ctx) {
 					</div>
 					<div style="display:grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px 12px; font-size:11px; color: var(--text-muted); margin-top: 10px;">
 						<div><span style="opacity:0.6;">今日</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtTok(roundedUsage)}</strong> <span style="opacity:0.5;">\${unit}</span></div>
-						<div><span style="opacity:0.6;">今日请求</span><br><strong style="color: var(--text-color); font-size: 13px;">\${(account.usageTodayRequests || 0).toLocaleString()}</strong></div>
-						<div><span style="opacity:0.6;">7日总量</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtTok(history7d)}</strong> <span style="opacity:0.5;">\${unit}</span></div>
-						<div><span style="opacity:0.6;">7日请求</span><br><strong style="color: var(--text-color); font-size: 13px;">\${requests7d.toLocaleString()}</strong></div>
+						<div><span style="opacity:0.6;">今日请求</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtWan(account.usageTodayRequests || 0)}</strong></div>
+						<div><span style="opacity:0.6;">本月请求</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtWan(monthRequests)}</strong></div>
+						<div><span style="opacity:0.6;">7日请求</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtWan(requests7d)}</strong></div>
 						<div><span style="opacity:0.6;">本月用量</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtTok(monthUsage)}</strong> <span style="opacity:0.5;">\${unit}</span></div>
 						<div><span style="opacity:0.6;">日限额</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtTok(limits.dailyLimit)}</strong> <span style="opacity:0.5;">\${unit}</span></div>
 						<div><span style="opacity:0.6;">模型数</span><br><strong style="color: var(--text-color); font-size: 13px;">\${modelCount}</strong></div>
