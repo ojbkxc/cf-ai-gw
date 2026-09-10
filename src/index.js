@@ -452,6 +452,18 @@ const getUsageLimitsConfig = createKVGetter('cfg_limits', {});
 // 模式B账号配置（共用KV，模式A读取用于 GraphQL 真实 Neurons 查询，不写入）
 const getAccounts = createKVGetter('cfg_accounts', []);
 
+// 公开密钥查询限流（进程内滑动窗口，按 IP），防止被当 oracle 枚举有效 key
+const KEY_INFO_RATE_WINDOW_MS = 60000;
+const KEY_INFO_RATE_MAX = 30;
+const _keyInfoHits = new Map(); // ip -> [访问时间戳]
+function keyInfoRateLimited(ip) {
+	const now = Date.now();
+	const arr = (_keyInfoHits.get(ip) || []).filter(t => now - t < KEY_INFO_RATE_WINDOW_MS);
+	arr.push(now);
+	_keyInfoHits.set(ip, arr);
+	return arr.length > KEY_INFO_RATE_MAX;
+}
+
 async function saveUsageLimitsConfig(env, limits) {
 	const existing = await getUsageLimitsConfig(env);
 	const merged = { ...existing, ...limits };
@@ -814,6 +826,9 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT, 
 	const startMonth = monthStart.toISOString().split('.')[0] + 'Z';
 
 	for (const account of accountsToUpdate) {
+		// 故障冷却：账号刚刷新失败过一次（默认15s内）则跳过本轮，避免断供期高频重查放大风控
+		const lastErrTs = cacheMap[account.id]?.lastErrorTs || 0;
+		if (Date.now() - lastErrTs < 15000) continue;
 		try {
 			// 7 天窗口单次查询，提取今日+历史数据
 			const historyGroups = await queryGraphQL(account.accountId, account.apiToken, startSevenDays);
@@ -870,17 +885,20 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT, 
 		} catch (e) {
 			// 仅记录账号名与错误消息，避免异常对象可能携带请求头/token 被 tail workers 捕获
 			console.error(`Error querying GraphQL for ${account.name}: ${e?.message || e}`);
+			const prev = cacheMap[account.id] || {};
 			cacheMap[account.id] = {
 				status: 'error',
 				error: e.message,
-				todayDate: cacheMap[account.id]?.todayDate || '',
-				usageToday: cacheMap[account.id]?.usageToday || 0,
-				usageTodayRequests: cacheMap[account.id]?.usageTodayRequests || 0,
-				modelsToday: cacheMap[account.id]?.modelsToday || [],
-				history: cacheMap[account.id]?.history || [],
-				usageThisMonth: cacheMap[account.id]?.usageThisMonth || 0,
-				usageThisMonthRequests: cacheMap[account.id]?.usageThisMonthRequests || 0,
-				timestamp: Date.now() // 即使出错也更新时间戳，以便其他账号轮转刷新
+				todayDate: prev.todayDate || '',
+				usageToday: prev.usageToday || 0,
+				usageTodayRequests: prev.usageTodayRequests || 0,
+				modelsToday: prev.modelsToday || [],
+				history: prev.history || [],
+				usageThisMonth: prev.usageThisMonth || 0,
+				usageThisMonthRequests: prev.usageThisMonthRequests || 0,
+				// 保留旧 timestamp：不刷新，防止新鲜期短路掩盖故障；用 lastErrorTs 单独记录失败时间
+				timestamp: prev.timestamp || 0,
+				lastErrorTs: Date.now()
 			};
 		}
 		// 串行查询，每个账号之间加间隔，避免触发风控
@@ -2058,7 +2076,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 
 			try {
 				while (true) {
-					const result = await readWithTimeout(reader, 120000);
+					const result = await readWithTimeout(reader, 120000, { cancelOnTimeout: true });
 					if (result.done) {
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
@@ -2689,7 +2707,7 @@ function responsesStreamTransform(upstreamBody, originalModel, env, ctx, request
 
 			try {
 				while (true) {
-					const result = await readWithTimeout(reader, 120000);
+					const result = await readWithTimeout(reader, 120000, { cancelOnTimeout: true });
 					if (result.done) {
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
@@ -3500,7 +3518,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 
 			try {
 				while (true) {
-					const result = await readWithTimeout(reader, 120000);
+					const result = await readWithTimeout(reader, 120000, { cancelOnTimeout: true });
 					if (result.done) {
 						if (buffer.trim()) {
 							buffer = processLines(buffer, controller);
@@ -3671,6 +3689,11 @@ async function handleDashboardApi(request, env, ctx) {
 
 	// 公开密钥查询（无需登录）：凭 key 反查剩余有效期/剩余次数
 	if (url.pathname === '/api/key/info' && method === 'GET') {
+		// 限流：防止被当 oracle 枚举有效 key
+		const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() || 'unknown';
+		if (keyInfoRateLimited(ip)) {
+			return new Response(JSON.stringify({ valid: false, error: 'rate limited' }), { status: 429, headers: { 'Content-Type': 'application/json' } });
+		}
 		const presented = url.searchParams.get('key') || '';
 		if (!presented) {
 			return new Response(JSON.stringify({ valid: false, error: 'missing key parameter' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
@@ -3686,7 +3709,9 @@ async function handleDashboardApi(request, env, ctx) {
 		if (matched.expiresAt) {
 			const exp = Date.parse(matched.expiresAt);
 			if (!isNaN(exp)) {
-				remainingDays = Math.max(0, Math.floor((exp - nowMs) / 86400000));
+				const diffMs = exp - nowMs;
+				// 与 admin 看板一致：向上取整
+				remainingDays = diffMs <= 0 ? 0 : Math.ceil(diffMs / 86400000);
 				if (nowMs >= exp) expired = true;
 			}
 		}
@@ -3696,15 +3721,12 @@ async function handleDashboardApi(request, env, ctx) {
 			remainingCalls = Math.max(0, matched.maxCalls - (matched.usedCalls || 0));
 			if ((matched.usedCalls || 0) >= matched.maxCalls) exhausted = true;
 		}
+		// 只返回对外必要的字段，收敛 name/createdAt/maxCalls/usedCalls 等内部信息
 		return new Response(JSON.stringify({
 			valid: !expired && !exhausted,
-			name: matched.name,
-			createdAt: matched.createdAt,
-			expiresAt: matched.expiresAt,
+			expiresAt: matched.expiresAt || null,
 			remainingDays,
 			expired,
-			maxCalls: matched.maxCalls || null,
-			usedCalls: matched.usedCalls || 0,
 			remainingCalls,
 			exhausted
 		}), { headers: { 'Content-Type': 'application/json' } });
@@ -3818,14 +3840,18 @@ async function handleDashboardApi(request, env, ctx) {
 		return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// CSRF 防护
+	// CSRF 防护（Bearer 认证的 REST 客户端主动携带令牌，不依赖浏览器 Cookie，无需 CSRF）
 	if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
-		const cookies = request.headers.get('Cookie') || '';
-		const csrfCookieMatch = cookies.match(/csrf_token=([^;]+)/);
-		const csrfCookie = csrfCookieMatch ? csrfCookieMatch[1] : null;
-		const csrfHeader = request.headers.get('X-CSRF-Token');
-		if (!csrfCookie || !csrfHeader || csrfCookie !== csrfHeader) {
-			return new Response(JSON.stringify({ error: 'CSRF token validation failed. Please refresh the page.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+		const authHeader = request.headers.get('Authorization') || '';
+		const isBearer = authHeader.startsWith('Bearer ');
+		if (!isBearer) {
+			const cookies = request.headers.get('Cookie') || '';
+			const csrfCookieMatch = cookies.match(/csrf_token=([^;]+)/);
+			const csrfCookie = csrfCookieMatch ? csrfCookieMatch[1] : null;
+			const csrfHeader = request.headers.get('X-CSRF-Token');
+			if (!csrfCookie || !csrfHeader || csrfCookie !== csrfHeader) {
+				return new Response(JSON.stringify({ error: 'CSRF token validation failed. Please refresh the page.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+			}
 		}
 	}
 
@@ -7161,7 +7187,7 @@ async function handleAdminPage(request, env, ctx) {
 					<td class="col-target"><code style="cursor: pointer; word-break: break-all;" title="点击复制" onclick="copyModelId(\${attrEscape(target)})">\${escapeHtml(target)}</code></td>
 					<td>
 						<div class="row-tokens">
-							<input type="number" min="1" step="1" value="\${showVal ? showVal : ''}" placeholder="\${tokensPlaceholder}" data-target="\${attrEscape(target)}" onchange="saveRowTokens(this)">
+							<input type="number" min="1" step="1" value="\${showVal ? showVal : ''}" placeholder="\${tokensPlaceholder}" data-target="\${escapeHtml(target)}" onchange="saveRowTokens(this)">
 							<button class="btn btn-secondary" onclick="saveRowTokens(this.previousElementSibling)">保存</button>
 						</div>
 					</td>
