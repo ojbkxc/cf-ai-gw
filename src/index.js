@@ -83,6 +83,7 @@ function getTodayStr() {
 
 const TOKEN_KV_TTL_SEC = 86400 * 8;    // KV 键保留 8 天（看板 7 日走势需要历史数据）
 const USAGE_REFRESH_LIMIT = 3;         // 单次刷新的账号数上限（防 CF 风控，与模式 B 一致）
+const USAGE_REFRESH_FRESH_SEC = 60;    // 用量缓冲新鲜期（秒）：缓存未过期则跳过 GraphQL 重查，避免频繁刷新卡顿
 
 // 获取 token 统计 KV 键名
 function getTokenDailyKey() {
@@ -780,6 +781,17 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) 
 		}
 	}
 
+	// 新鲜期短路：所有账号上都已刷新且未过期（默认60s内），直接返回缓存，避免每次刷新都重查 GraphQL 造成卡顿
+	const freshSec = env && Number(env.USAGE_REFRESH_FRESH_SEC) > 0 ? Number(env.USAGE_REFRESH_FRESH_SEC) : USAGE_REFRESH_FRESH_SEC;
+	const nowMs = Date.now();
+	const allFresh = accounts.every(a => {
+		const c = cacheMap[a.id];
+		return c && c.todayDate === getTodayStr() && nowMs - (c.timestamp || 0) < freshSec * 1000;
+	});
+	if (allFresh) {
+		return cacheMap;
+	}
+
 	// 按最后更新时间升序，优先更新最旧数据
 	const sortedAccounts = [...accounts].sort((a, b) => {
 		const tA = cacheMap[a.id]?.timestamp || 0;
@@ -891,6 +903,19 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) 
 async function buildLocalUsageFallback(env) {
 	const todayStr = getTodayStr();
 
+	// 缓存短路：新鲜期内直接返回上次聚合结果，避免每次刷新都遍历 7 天 evt_* 键造成卡顿
+	const freshSec = env && Number(env.USAGE_REFRESH_FRESH_SEC) > 0 ? Number(env.USAGE_REFRESH_FRESH_SEC) : USAGE_REFRESH_FRESH_SEC;
+	try {
+		const cacheRaw = await env.KV.get('cache_local_usage_fallback');
+		if (cacheRaw) {
+			const cached = JSON.parse(cacheRaw);
+			if (cached && cached.__date === todayStr && Date.now() - (cached.__ts || 0) < freshSec * 1000) {
+				cached.accounts[0].lastUpdated = Date.now();
+				return { accounts: cached.accounts, unit: cached.unit || 'Tokens' };
+			}
+		}
+	} catch (_) { /* 缓存异常则重新聚合 */ }
+
 	// 今日 + 7 天历史：用 evt_<date>_* 事件键聚合（无竞态、真实）
 	const historyDates = [];
 	for (let i = 0; i <= 6; i++) {
@@ -978,7 +1003,7 @@ async function buildLocalUsageFallback(env) {
 	} catch (e) { /* 容错 */ }
 	const usageThisMonth = monthInput + monthOutput;
 
-	return {
+	const result = {
 		accounts: [{
 			id: 'binding-single',
 			name: 'AI Binding (Single Account)',
@@ -994,6 +1019,11 @@ async function buildLocalUsageFallback(env) {
 		}],
 		unit: 'Tokens'
 	};
+	// 写缓存（带日期+时间戳），供新鲜期内短路复用
+	try {
+		await env.KV.put('cache_local_usage_fallback', JSON.stringify({ __date: todayStr, __ts: Date.now(), accounts: result.accounts, unit: result.unit }), { expirationTtl: freshSec });
+	} catch (_) { /* 缓存失败不影响返回 */ }
+	return result;
 }
 
 // 用量限额检查（简化版：从 token 统计 KV 获取用量）
