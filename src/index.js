@@ -6200,34 +6200,6 @@ async function handleAdminPage(request, env, ctx) {
 							</div>
 						</div>
 
-						<h4 style="margin-top: 18px; margin-bottom: 10px; font-size: 14px;">按模型并发覆盖</h4>
-						<p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">为特定模型单独设置并发上限（覆盖每模型默认值）。键名为用户请求的模型名（如 glm-5.3-flash）。</p>
-						<div style="display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; background-color: var(--section-item-bg); padding: 16px; border-radius: 10px; border: 1px solid var(--border-color); margin-bottom: 12px;">
-							<div class="form-group" style="margin-bottom: 0;">
-								<label>模型名</label>
-								<input type="text" id="permodel-name" placeholder="如 glm-5.3-flash">
-							</div>
-							<div class="form-group" style="margin-bottom: 0;">
-								<label>并发上限</label>
-								<input type="number" id="permodel-concurrency" min="0" step="1" placeholder="0=用默认">
-							</div>
-							<div class="form-group" style="margin-bottom: 0;">
-								<label>&nbsp;</label>
-								<button class="btn btn-primary" onclick="addPerModelLimit()" style="width: 100%;">添加/修改</button>
-							</div>
-						</div>
-						<table>
-							<thead>
-								<tr>
-									<th>模型</th>
-									<th>并发</th>
-									<th>操作</th>
-								</tr>
-							</thead>
-							<tbody id="permodel-table-body">
-							</tbody>
-						</table>
-
 						<div style="margin-top: 20px; display: flex; align-items: center; gap: 12px;">
 							<button class="btn btn-primary" onclick="saveLimits()">保存配置</button>
 							<span id="limits-save-msg" style="font-size: 13px; display: none;"></span>
@@ -6801,20 +6773,20 @@ async function handleAdminPage(request, env, ctx) {
 				yAxisID: 'y'
 			}];
 			if (requestsData && requestsData.some(v => v > 0)) {
-				datasets.push({
-					label: '请求次数',
-					data: requestsData,
-					borderColor: '#22c55e',
-					backgroundColor: 'rgba(34, 197, 94, 0.08)',
-					borderWidth: 2,
-					tension: 0.3,
-					fill: false,
-					pointBackgroundColor: '#22c55e',
-					pointRadius: 3,
-					pointHoverRadius: 5,
-					yAxisID: 'y1'
-				});
-			}
+					datasets.push({
+						label: '请求次数',
+						data: requestsData,
+						borderColor: '#ef4444',
+						backgroundColor: 'rgba(239, 68, 68, 0.08)',
+						borderWidth: 2,
+						tension: 0.3,
+						fill: false,
+						pointBackgroundColor: '#ef4444',
+						pointRadius: 3,
+						pointHoverRadius: 5,
+						yAxisID: 'y1'
+					});
+				}
 			const scales = {
 				y: {
 					type: 'linear',
@@ -6837,13 +6809,13 @@ async function handleAdminPage(request, env, ctx) {
 				}
 			};
 			if (requestsData && requestsData.some(v => v > 0)) {
-				scales.y1 = {
-					type: 'linear',
-					position: 'right',
-					grid: { drawOnChartArea: false },
-					ticks: { color: '#22c55e' }
-				};
-			}
+					scales.y1 = {
+						type: 'linear',
+						position: 'right',
+						grid: { drawOnChartArea: false },
+						ticks: { color: '#ef4444' }
+					};
+				}
 			historyChart = new Chart(ctx, {
 				type: 'line',
 				data: { labels: labels, datasets: datasets },
@@ -7338,54 +7310,16 @@ async function handleAdminPage(request, env, ctx) {
 			document.getElementById('model-select-modal').classList.remove('active');
 		}
 
-		let perModelLimitsCache = {};
 		async function loadLimits() {
 			try {
 					const res = await apiFetch('/api/limits');
 					const data = await res.json();
 					document.getElementById('limits-permodel-default-concurrency').value = data.perModelDefaultConcurrency;
 					document.getElementById('limits-global-concurrency').value = data.globalConcurrency;
-					perModelLimitsCache = data.perModel || {};
-					renderPerModelTable();
-				} catch (e) {
+					} catch (e) {
 				console.error(e);
-				showToast('加载限额配置失败', 'error');
+				showToast('加载并发配置失败', 'error');
 			}
-		}
-
-		function renderPerModelTable() {
-			const tbody = document.getElementById('permodel-table-body');
-			const entries = Object.entries(perModelLimitsCache || {});
-			if (entries.length === 0) {
-				tbody.innerHTML = '<tr><td colspan="3" style="text-align:center; color: var(--text-muted); padding: 20px;">暂无按模型并发覆盖</td></tr>';
-				return;
-			}
-			tbody.innerHTML = entries.map(([m, cfg]) => \`
-				<tr>
-					<td><strong>\${escapeHtml(m)}</strong></td>
-					<td>\${cfg.concurrency > 0 ? cfg.concurrency : '默认'}</td>
-					<td><button class="btn btn-secondary" style="padding:4px 10px; font-size:11px; color: var(--danger-color);" onclick="removePerModelLimit(\${attrEscape(m)})">删除</button></td>
-				</tr>
-			\`).join('');
-		}
-
-		function addPerModelLimit() {
-			const name = document.getElementById('permodel-name').value.trim();
-			if (!name) { showToast('请输入模型名', 'warning'); return; }
-			perModelLimitsCache = perModelLimitsCache || {};
-			perModelLimitsCache[name] = {
-				requestLimit: 0,
-				concurrency: parseInt(document.getElementById('permodel-concurrency').value, 10) || 0
-			};
-			document.getElementById('permodel-name').value = '';
-			document.getElementById('permodel-concurrency').value = '';
-			renderPerModelTable();
-			showToast('已加入待保存列表，点击"保存配置"生效');
-		}
-
-		function removePerModelLimit(name) {
-			delete perModelLimitsCache[name];
-			renderPerModelTable();
 		}
 
 		async function saveLimits() {
@@ -7399,8 +7333,7 @@ async function handleAdminPage(request, env, ctx) {
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					perModelDefaultConcurrency: perModelDefault,
-					globalConcurrency: globalConc,
-					perModel: perModelLimitsCache
+					globalConcurrency: globalConc
 				})
 			});
 
