@@ -4961,9 +4961,8 @@ async function handleLandingPage(request, env, ctx) {
 				</div>
 
 				<div style="margin-top: 16px;">
-					<div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted); margin-top: 8px;">
-						<span id="public-limit-desc">总限额: 0 Neurons</span>
-						<span id="public-percent-desc" style="font-weight: 600; color: var(--accent-color);">0.00%</span>
+					<div style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">
+						<span id="public-limit-desc">今日累计用量 0</span>
 					</div>
 				</div>
 			</div>
@@ -5131,7 +5130,6 @@ async function handleLandingPage(request, env, ctx) {
 
 		function renderPublicSummary(data) {
 			lastPublicSummaryData = data;
-			const percent = Number(data.usagePercentage).toFixed(2);
 			const roundedNeurons = Math.ceil(data.totalNeuronsToday);
 			const unit = data.unit || 'Neurons';
 
@@ -5140,8 +5138,8 @@ async function handleLandingPage(request, env, ctx) {
 
 			const unitLabel = document.getElementById('public-unit-label');
 			if (unitLabel) unitLabel.innerText = unit;
-			document.getElementById('public-limit-desc').innerText = '总限额: ' + Number(data.totalLimit).toLocaleString() + ' ' + unit;
-			document.getElementById('public-percent-desc').innerText = percent + '%';
+			document.getElementById('public-limit-desc').innerText = '今日累计用量: ' + fmtTok(roundedNeurons) + ' ' + unit;
+			document.getElementById('public-percent-desc') && (document.getElementById('public-percent-desc').style.display = 'none');
 
 			const wrapper = document.getElementById('public-chart-wrapper');
 			const placeholder = document.getElementById('public-chart-placeholder');
@@ -6040,9 +6038,8 @@ async function handleAdminPage(request, env, ctx) {
 								<div class="stat-value" id="stat-monthly-usage" style="font-size: 42px;">0</div>
 								<span id="stat-monthly-unit" style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Tokens</span>
 							</div>
-							<div class="stat-desc" id="stat-monthly-desc" style="margin-top: auto; display: flex; justify-content: space-between;">
-								<span>0 / 100K Neurons</span>
-								<span id="stat-monthly-pct" style="font-weight: 600; color: var(--text-muted);">0%</span>
+							<div class="stat-desc" id="stat-monthly-desc" style="margin-top: auto; font-size: 12px; color: var(--text-muted);">
+								<span>本月累计用量</span>
 							</div>
 						</div>
 					</div>
@@ -6465,7 +6462,6 @@ async function handleAdminPage(request, env, ctx) {
 						<div><span style="opacity:0.6;">本月请求</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtWan(monthRequests)}</strong></div>
 						<div><span style="opacity:0.6;">7日请求</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtWan(requests7d)}</strong></div>
 						<div><span style="opacity:0.6;">本月用量</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtTok(monthUsage)}</strong> <span style="opacity:0.5;">\${unit}</span></div>
-						<div><span style="opacity:0.6;">日限额</span><br><strong style="color: var(--text-color); font-size: 13px;">\${fmtTok(limits.dailyLimit)}</strong> <span style="opacity:0.5;">\${unit}</span></div>
 						<div><span style="opacity:0.6;">模型数</span><br><strong style="color: var(--text-color); font-size: 13px;">\${modelCount}</strong></div>
 						<div><span style="opacity:0.6;">状态</span><br><strong style="color: \${level === 'danger' ? '#ef4444' : (level === 'warn' ? '#f59e0b' : '#22c55e')}; font-size: 13px;">\${statusText}</strong></div>
 					</div>
@@ -6535,32 +6531,15 @@ async function handleAdminPage(request, env, ctx) {
 		}
 
 		function updateLimitCards(limits) {
-			const { monthlyUsage = 0, monthlyRequests = 0, monthlyLimit = 100000, threshold = 0.9 } = limits || {};
-			const limitDisabled = threshold <= 0;
+			const { monthlyRequests = 0 } = limits || {};
 			const unit = window.__usageUnit || 'Neurons';
 
-			// 本月限额
-		const monthlyPct = monthlyLimit > 0 ? Number(((monthlyUsage / monthlyLimit) * 100).toFixed(2)) : 0;
-		document.getElementById('stat-monthly-usage').innerText = fmtTok(Math.ceil(monthlyUsage));
-		const monthlyDesc = document.getElementById('stat-monthly-desc');
-		if (monthlyDesc) {
-			const leftSpan = monthlyDesc.querySelector('span:first-child');
-			const rightSpan = monthlyDesc.querySelector('#stat-monthly-pct');
-			if (leftSpan) {
-				leftSpan.innerText = limitDisabled
-					? fmtTok(Math.ceil(monthlyUsage)) + ' ' + unit + ' · 限额关闭'
-					: fmtTok(Math.ceil(monthlyUsage)) + ' / ' + fmtTok(monthlyLimit) + ' ' + unit;
+			// 本月用量（仅展示，无限额限制）
+			document.getElementById('stat-monthly-usage').innerText = fmtTok(Math.ceil(limits?.monthlyUsage || 0));
+			const monthlyDesc = document.getElementById('stat-monthly-desc');
+			if (monthlyDesc && monthlyDesc.querySelector('span')) {
+				monthlyDesc.querySelector('span').innerText = '本月累计用量 (' + unit + ')';
 			}
-			if (rightSpan) {
-				if (limitDisabled) {
-					rightSpan.style.display = 'none';
-				} else {
-					rightSpan.style.display = '';
-					rightSpan.innerText = monthlyPct.toFixed(1) + '%';
-					rightSpan.style.color = '';
-				}
-			}
-		}
 			document.getElementById('stat-monthly-requests').innerText = monthlyRequests.toLocaleString();
 
 		}
