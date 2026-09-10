@@ -14,8 +14,8 @@ const DEFAULT_DAILY_LIMIT = 10000;
 const DEFAULT_MONTHLY_LIMIT = 100000;
 
 // ===== 并发限制（Workers 单 isolate 内有效）=====
-const DEFAULT_MAX_CONCURRENCY_PER_MODEL = 4;
-const DEFAULT_GLOBAL_CONCURRENCY = 0;        // 0 = 不限
+const DEFAULT_MAX_CONCURRENCY_PER_MODEL = 4;   // 每模型并发上限默认 4
+const DEFAULT_GLOBAL_CONCURRENCY = 10;         // 全局总并发上限默认 10
 const modelInflight = new Map();             // cfModel -> 当前 in-flight 请求数
 let globalInflight = 0;                      // 全局 in-flight 请求数
 
@@ -651,7 +651,7 @@ async function getUsageLimits(env) {
 		// 按模型配置：{ [modelName]: { requestLimit, concurrency } }
 		perModel: kvLimits.perModel || {},
 		// 全局并发上限（0 = 不限；env MAX_CONCURRENCY_PER_MODEL 优先）
-		globalConcurrency: getEnvNum(env, 'MAX_CONCURRENCY_PER_MODEL', kvLimits.globalConcurrency ?? DEFAULT_GLOBAL_CONCURRENCY, parseInt)
+		globalConcurrency: getEnvNum(env, 'GLOBAL_CONCURRENCY', kvLimits.globalConcurrency ?? DEFAULT_GLOBAL_CONCURRENCY, parseInt)
 	};
 }
 
@@ -1319,14 +1319,14 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 		return { success: false, status: 503, error: cbErr };
 	}
 
-	// 并发限制：全局并发上限 + 按模型并发上限（perModel 优先于默认）
+	// 并发限制：全局总并发上限 + 每模型并发上限
 	const limits = await getUsageLimits(env);
-	const globalMax = limits.globalConcurrency || 0;  // 0 = 不限
-	let max = limits.perModel && cfPayload._userModelName && limits.perModel[cfPayload._userModelName] && limits.perModel[cfPayload._userModelName].concurrency > 0
+	const globalMax = limits.globalConcurrency;  // 默认 10
+	const modelMax = (limits.perModel && cfPayload._userModelName && limits.perModel[cfPayload._userModelName] && limits.perModel[cfPayload._userModelName].concurrency > 0)
 		? limits.perModel[cfPayload._userModelName].concurrency
-		: (getMaxConcurrencyPerModel(env));
-	if (!acquireModelSlot(cfModel, max, globalMax)) {
-		return { success: false, status: 429, error: concurrencyLimitError(cfModel, max) };
+		: getMaxConcurrencyPerModel(env);  // 默认 4
+	if (!acquireModelSlot(cfModel, modelMax, globalMax)) {
+		return { success: false, status: 429, error: concurrencyLimitError(cfModel, modelMax) };
 	}
 
 	try {
@@ -3066,12 +3066,12 @@ async function handleEmbeddings(request, env, ctx) {
 
 	// 并发限制：全局 + 模型级
 	const limits = await getUsageLimits(env);
-	const globalMax = limits.globalConcurrency || 0;
+	const globalMax = limits.globalConcurrency;  // 默认 10
 	const max = (limits.perModel && limits.perModel[model] && limits.perModel[model].concurrency > 0)
 		? limits.perModel[model].concurrency
-		: getMaxConcurrencyPerModel(env);
+		: getMaxConcurrencyPerModel(env);  // 默认 4
 	if (!acquireModelSlot(cfModel, max, globalMax)) {
-		const fe = { status: 429, type: 'rate_limit_error', message: `并发已达上限 (模型${max}${globalMax > 0 ? '/-全局' + globalMax : ''})，请稍后重试` };
+		const fe = { status: 429, type: 'rate_limit_error', message: `并发已达上限 (模型${max}/全局${globalMax})，请稍后重试` };
 		return jsonError(fe.message, fe.status, fe.type);
 	}
 
@@ -3145,7 +3145,7 @@ async function handleImageGenerations(request, env, ctx) {
 		? limits.perModel[model].concurrency
 		: getMaxConcurrencyPerModel(env);
 	if (!acquireModelSlot(cfModel, max, globalMax)) {
-		return jsonError(`并发已达上限 (模型${max}${globalMax > 0 ? '/全局' + globalMax : ''})，请稍后重试`, 429, 'rate_limit_error');
+		return jsonError(`并发已达上限 (模型${max}/全局${globalMax})，请稍后重试`, 429, 'rate_limit_error');
 	}
 
 	try {
@@ -3257,12 +3257,12 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 
 		// 并发限制：全局 + 模型级
 		const limits = await getUsageLimits(env);
-		const globalMax = limits.globalConcurrency || 0;
+		const globalMax = limits.globalConcurrency;  // 默认 10
 		const max = (limits.perModel && limits.perModel[model] && limits.perModel[model].concurrency > 0)
 			? limits.perModel[model].concurrency
-			: getMaxConcurrencyPerModel(env);
+			: getMaxConcurrencyPerModel(env);  // 默认 4
 		if (!acquireModelSlot(actualCfModel, max, globalMax)) {
-			return jsonError(`并发已达上限 (模型${max}${globalMax > 0 ? '/全局' + globalMax : ''})，请稍后重试`, 429, 'rate_limit_error');
+			return jsonError(`并发已达上限 (模型${max}/全局${globalMax})，请稍后重试`, 429, 'rate_limit_error');
 		}
 
 		try {
@@ -6199,9 +6199,9 @@ async function handleAdminPage(request, env, ctx) {
 
 						<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;">
 							<div class="form-group" style="margin-bottom: 0;">
-								<label>全局并发上限</label>
-								<input type="number" id="limits-global-concurrency" min="0" step="1" placeholder="0=不限">
-								<span style="font-size: 11px; color: var(--text-muted);">单 Worker isolate 内同时进行中的请求数（0=不限）</span>
+								<label>全局总并发上限</label>
+								<input type="number" id="limits-global-concurrency" min="0" step="1" placeholder="10">
+								<span style="font-size: 11px; color: var(--text-muted);">所有模型合计同时进行中的请求数（默认 10）</span>
 							</div>
 							<div class="form-group" style="margin-bottom: 0;">
 								<label>拦截阈值 (0-1)</label>
@@ -6254,8 +6254,8 @@ async function handleAdminPage(request, env, ctx) {
 						<p style="font-size: 13px; color: var(--text-muted); line-height: 1.8; margin-top: 8px;">
 							以下配置优先级：<strong>环境变量 > 面板配置 > 默认值</strong><br><br>
 							<code>DAILY_REQUEST_LIMIT</code> / <code>MONTHLY_REQUEST_LIMIT</code> — 日/月请求次数限额（默认 0=不限）<br>
-							<code>DAILY_TOKEN_LIMIT</code> / <code>MONTHLY_TOKEN_LIMIT</code> — 日/月 Token 用量限额（默认 0=不限）<br>
-							<code>MAX_CONCURRENCY_PER_MODEL</code> — 全局并发上限（默认 4）<br>
+							<code>MAX_CONCURRENCY_PER_MODEL</code> — 每模型并发上限（默认 4）<br>
+							<code>GLOBAL_CONCURRENCY</code> — 全局总并发上限（默认 10）<br>
 							<code>USAGE_THRESHOLD</code> — 拦截阈值（0-1，默认 0，即关闭拦截）<br><br>
 							在 Cloudflare Workers 仪表盘的 Settings → Variables 中添加上述环境变量即可覆盖面板配置。
 						</p>
@@ -7362,7 +7362,7 @@ async function handleAdminPage(request, env, ctx) {
 				const data = await res.json();
 				document.getElementById('limits-daily-req').value = data.dailyRequestLimit || 0;
 				document.getElementById('limits-monthly-req').value = data.monthlyRequestLimit || 0;
-				document.getElementById('limits-global-concurrency').value = data.globalConcurrency || 0;
+				document.getElementById('limits-global-concurrency').value = data.globalConcurrency;
 				document.getElementById('limits-threshold').value = data.threshold || 0;
 				perModelLimitsCache = data.perModel || {};
 				renderPerModelTable();
@@ -7412,7 +7412,8 @@ async function handleAdminPage(request, env, ctx) {
 		async function saveLimits() {
 			const dailyReq = parseInt(document.getElementById('limits-daily-req').value, 10) || 0;
 			const monthlyReq = parseInt(document.getElementById('limits-monthly-req').value, 10) || 0;
-			const globalConc = parseInt(document.getElementById('limits-global-concurrency').value, 10) || 0;
+			const globalConc = parseInt(document.getElementById('limits-global-concurrency').value, 10);
+			if (isNaN(globalConc) || globalConc < 0) { showToast('全局总并发上限必须是非负整数', 'error'); return; }
 			const threshold = parseFloat(document.getElementById('limits-threshold').value) || 0;
 
 			if (threshold < 0 || threshold > 1) {
