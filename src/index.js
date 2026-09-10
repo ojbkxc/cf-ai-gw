@@ -6401,9 +6401,11 @@ async function handleAdminPage(request, env, ctx) {
 
 			accounts.forEach(account => {
 				totalUsageToday += account.usageToday;
+				const TOTAL_REQUESTS_CAP = 10000; // 单账号进度条上限 10000 次请求
 				totalRequestsToday += account.usageTodayRequests || 0;
 
-			const percentage = limits.dailyLimit > 0 ? Number(((account.usageToday / limits.dailyLimit) * 100).toFixed(2)) : 0;
+				// 进度条按「今日请求次数 / 上限1万次」展示
+				const percentage = TOTAL_REQUESTS_CAP > 0 ? Number((((account.usageTodayRequests || 0) / TOTAL_REQUESTS_CAP) * 100).toFixed(2)) : 0;
 				// ≥100% 红色，≥90% 橙色，其余绿色
 				const level = percentage >= 100 ? 'danger' : (percentage >= 90 ? 'warn' : 'ok');
 				const warningClass = account.status === 'error' ? 'badge-danger' : (account.status === 'pending' ? 'badge-info' : (level === 'danger' ? 'badge-danger' : (level === 'warn' ? 'badge-warning' : 'badge-success')));
@@ -6501,14 +6503,15 @@ async function handleAdminPage(request, env, ctx) {
 			const historyChartTitle = document.getElementById('history-chart-title');
 			if (historyChartTitle) historyChartTitle.innerText = '过去 7 日消耗走势 (' + unit + ')';
 
-			const overallPercentage = totalLimit > 0 ? Number(((totalUsageToday / totalLimit) * 100).toFixed(2)) : 0;
-			const neuronsDesc = document.getElementById('stat-neurons-desc');
+			const TOTAL_REQUESTS_CAP = 10000; // 总请求进度条上限 10000 次
+				const overallPercentage = TOTAL_REQUESTS_CAP > 0 ? Number(((totalRequestsToday / TOTAL_REQUESTS_CAP) * 100).toFixed(2)) : 0;
+				const neuronsDesc = document.getElementById('stat-neurons-desc');
 			if (neuronsDesc) {
 				const leftSpan = neuronsDesc.querySelector('span:first-child');
 				const rightSpan = neuronsDesc.querySelector('#stat-neurons-pct');
 				if (leftSpan) {
-					leftSpan.innerHTML = fmtTok(roundedTotalUsageToday) + ' / ' + fmtTok(totalLimit) + ' ' + unit;
-				}
+						leftSpan.innerHTML = fmtWan(totalRequestsToday) + ' / ' + fmtWan(TOTAL_REQUESTS_CAP) + ' 次请求';
+					}
 				if (rightSpan) {
 					const pctText = overallPercentage > 100 ? '+' + (overallPercentage - 100).toFixed(2) + '%' : overallPercentage.toFixed(2) + '%';
 					rightSpan.innerText = pctText;
