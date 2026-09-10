@@ -6180,12 +6180,15 @@ async function handleAdminPage(request, env, ctx) {
 							</tbody>
 						</table>
 					</div>
-				</div>
-					<div class="section-card">
-						<div class="section-title">并发配置</div>
-						<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">
-							仅两维度并发控制：<strong>每模型并发</strong> / <strong>全局总并发</strong>。Token 用量仅做看板统计，不参与拦截、无使用限制。
-						</p>
+					</div>
+
+					<!-- TAB: Limits (并发配置，独立 Tab) -->
+					<div id="tab-limits" class="tab-content">
+						<div class="section-card" style="margin-top: 0;">
+							<div class="section-title">并发配置</div>
+							<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">
+								仅两维度并发控制：<strong>每模型并发</strong> / <strong>全局总并发</strong>。Token 用量仅做看板统计，不参与拦截、无使用限制。
+							</p>
 
 						<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;">
 							<div class="form-group" style="margin-bottom: 0;">
