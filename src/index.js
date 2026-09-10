@@ -433,7 +433,9 @@ function createKVGetter(kvKey, defaultValue) {
 		const now = Date.now();
 		if (_promise && (now - _promiseTime) < 60000) return _promise;
 		_promise = (async () => {
-			const raw = await env.KV.get(kvKey, { cacheTtl: 60 });
+			// 不传 cacheTtl（默认0）：关闭边缘读缓存，保证读取始终拿到最新 KV，
+			// 否则 key 次数累加后校验会命中旧缓存，导致"次数用完/过期"延迟拦截
+			const raw = await env.KV.get(kvKey);
 			return safeJSONParse(raw, defaultValue);
 		})();
 		_promiseTime = now;
