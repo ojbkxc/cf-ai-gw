@@ -3572,16 +3572,22 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 		let remainingCalls = null;
 		let exhausted = false;
+		let usedCalls = matched.usedCalls || 0;
 		if (matched.maxCalls && matched.maxCalls > 0) {
-			remainingCalls = Math.max(0, matched.maxCalls - (matched.usedCalls || 0));
-			if ((matched.usedCalls || 0) >= matched.maxCalls) exhausted = true;
+			// 已用次数从 DO 强一致计数读取（实时），与 admin 看板 / 限次校验同源
+			usedCalls = await doKeyUsage(env, matched.id, matched.usedCalls || 0);
+			remainingCalls = Math.max(0, matched.maxCalls - usedCalls);
+			if (usedCalls >= matched.maxCalls) exhausted = true;
 		}
-		// 只返回对外必要的字段，收敛 name/createdAt/maxCalls/usedCalls 等内部信息
+		// 返回对外必要的展示字段（name 描述、maxCalls 上限、usedCalls 已用均需前端展示）
 		return new Response(JSON.stringify({
 			valid: !expired && !exhausted,
+			name: matched.name || '',
 			expiresAt: matched.expiresAt || null,
 			remainingDays,
 			expired,
+			maxCalls: matched.maxCalls || null,
+			usedCalls,
 			remainingCalls,
 			exhausted
 		}), { headers: { 'Content-Type': 'application/json' } });
