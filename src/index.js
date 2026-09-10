@@ -919,22 +919,10 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT, 
 // ===== 本地 Token 兜底数据源（无 cfg_accounts 且无 ANALYTICS_API_TOKEN 时使用） =====
 // 读 tokens_daily_* (今日+过去7天) 与 tokens_monthly_* 拼出与 GraphQL 同结构的虚拟账号数据。
 // 单位是 Token 不是 Neurons（CF 按 Neurons 计费，token≠Neurons），看板需据此切换口径标注。
-async function buildLocalUsageFallback(env, force = false) {
+async function buildLocalUsageFallback(env) {
 	const todayStr = getTodayStr();
 
-	// 缓存短路：新鲜期内直接返回上次聚合结果，避免每次刷新都遍历 7 天 evt_* 键造成卡顿
-	// force=true（手动刷新）时跳过短路，强制重新聚合最新用量
-	const freshSec = env && Number(env.USAGE_REFRESH_FRESH_SEC) > 0 ? Number(env.USAGE_REFRESH_FRESH_SEC) : USAGE_REFRESH_FRESH_SEC;
-	try {
-		const cacheRaw = await env.KV.get('cache_local_usage_fallback');
-		if (cacheRaw && !force) {
-			const cached = JSON.parse(cacheRaw);
-			if (cached && cached.__date === todayStr && Date.now() - (cached.__ts || 0) < freshSec * 1000) {
-				cached.accounts[0].lastUpdated = Date.now();
-				return { accounts: cached.accounts, unit: cached.unit || 'Tokens' };
-			}
-		}
-	} catch (_) { /* 缓存异常则重新聚合 */ }
+	// 模式A：用量直接实时聚合本地 KV 的 evt_* 事件键，不做缓存，确保每次刷新都读到最新本地计数
 
 	// 今日 + 7 天历史：用 evt_<date>_* 事件键聚合（无竞态、真实）
 	const historyDates = [];
@@ -1039,10 +1027,6 @@ async function buildLocalUsageFallback(env, force = false) {
 		}],
 		unit: 'Tokens'
 	};
-	// 写缓存（带日期+时间戳），供新鲜期内短路复用
-	try {
-		await env.KV.put('cache_local_usage_fallback', JSON.stringify({ __date: todayStr, __ts: Date.now(), accounts: result.accounts, unit: result.unit }), { expirationTtl: freshSec });
-	} catch (_) { /* 缓存失败不影响返回 */ }
 	return result;
 }
 
@@ -3866,78 +3850,13 @@ async function handleDashboardApi(request, env, ctx) {
 		}]), { headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 账号用量（真实 Neurons 口径：GraphQL Analytics，与模式B一致）
+	// 账号用量（模式A：实时聚合本地 KV 的 evt_* 事件键）
 	if (url.pathname === '/api/accounts/usage' && method === 'GET') {
-		const force = new URL(request.url).searchParams.get('force') === '1';
 		const limits = await getUsageLimits(env);
 		const monthlyUsage = await getMonthlyUsage(env);
-		const accounts = await getAccounts(env);
 
-		// 数据源判定：cfg_accounts > ANALYTICS_API_TOKEN(自账号) > 本地 token 兜底
-		const hasAnalyticsToken = !!(env.ANALYTICS_API_TOKEN && env.ANALYTICS_ACCOUNT_ID);
-		let graphqlAccounts = accounts;
-		if (accounts.length === 0 && hasAnalyticsToken) {
-			// 仅部署模式 A 且配了只读 Analytics Token：构造虚拟自账号走 GraphQL
-			graphqlAccounts = [{
-				id: 'binding-single',
-				name: 'AI Binding (Single Account)',
-				accountId: env.ANALYTICS_ACCOUNT_ID,
-				apiToken: env.ANALYTICS_API_TOKEN
-			}];
-		}
-
-		if (graphqlAccounts.length > 0) {
-			// 真实 Neurons 口径：刷新 GraphQL 缓存（与模式B refreshAccountsUsage 同逻辑同KV键）
-			// 手动刷新(force)时全量刷新所有账号，而非仅最旧3个，确保点刷新能拿到全部账号最新用量
-			const cacheMap = await refreshAccountsUsage(env, graphqlAccounts, force ? graphqlAccounts.length : USAGE_REFRESH_LIMIT, force);
-
-			const todayStr = getTodayStr();
-			const results = graphqlAccounts.map(account => {
-				const cached = cacheMap[account.id];
-				let usageToday = 0;
-				let usageTodayRequests = 0;
-				if (cached) {
-					if (cached.todayDate === todayStr) {
-						usageToday = cached.usageToday || 0;
-						usageTodayRequests = cached.usageTodayRequests || 0;
-					} else if (cached.history) {
-						const todayEntry = cached.history.find(h => h.date === todayStr);
-						usageToday = todayEntry ? todayEntry.neurons : 0;
-						usageTodayRequests = todayEntry && todayEntry.requests ? todayEntry.requests : 0;
-					}
-				}
-				return {
-					id: account.id,
-					name: account.name,
-					accountId: account.accountId,
-					status: cached ? cached.status : 'pending',
-					error: cached ? cached.error : undefined,
-					usageToday,
-					usageTodayRequests,
-					modelsToday: cached && cached.todayDate === todayStr ? (cached.modelsToday || []) : [],
-					history: cached ? cached.history : [],
-					usageThisMonth: cached ? (cached.usageThisMonth || 0) : 0,
-					lastUpdated: cached ? cached.timestamp : 0
-				};
-			});
-
-			let dailyUsage = 0;
-			let dailyRequests = 0;
-			let monthlyRequests = 0;
-			results.forEach(a => { dailyUsage += a.usageToday || 0; dailyRequests += a.usageTodayRequests || 0; });
-			for (const [, data] of Object.entries(cacheMap)) {
-				if (data.usageThisMonthRequests) monthlyRequests += data.usageThisMonthRequests;
-			}
-
-			return new Response(JSON.stringify({
-				accounts: results,
-				limits: { dailyUsage, dailyRequests, dailyLimit: limits.dailyLimit, monthlyUsage, monthlyRequests, monthlyLimit: limits.monthlyLimit, threshold: limits.threshold },
-				unit: 'Neurons'
-			}), { headers: { 'Content-Type': 'application/json' } });
-		}
-
-		// 本地 token 兜底（无 cfg_accounts 且无 Analytics Token）
-		const fallback = await buildLocalUsageFallback(env, force);
+		// 模式A：用量直接来自本地 KV 聚合（evt_* 事件键），实时读取，无需缓存、也无需查询 CF Analytics GraphQL
+		const fallback = await buildLocalUsageFallback(env);
 		const dailyUsage = fallback.accounts[0].usageToday;
 		const dailyRequests = fallback.accounts[0].usageTodayRequests;
 		const monthlyRequests = fallback.accounts[0].usageThisMonthRequests || 0;
