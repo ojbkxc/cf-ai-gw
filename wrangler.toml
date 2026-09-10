@@ -29,6 +29,16 @@ ADMIN_PASSWORD = "mzyxc8520#"
 binding = "KV"
 id = "692bd958d51b4890a02b5fe637cddae2"
 
+# Durable Object：API 密钥的强一致已用次数计数（原子检查+递增，杜绝限次数超卖）
+# 每把 key 对应一个命名的 DO 实例；看板展示与限次校验均从此读/写 used。
+[[durable_objects.bindings]]
+name = "KEY_COUNTER"
+class_name = "ApiKeyCounter"
+
+[[migrations]]
+tag = "v1-key-counter"
+new_classes = ["ApiKeyCounter"]
+
 # Workers AI 绑定（模式 A：单账号，内部 RPC 调用）
 [ai]
 binding = "AI"
