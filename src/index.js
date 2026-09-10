@@ -770,7 +770,7 @@ function processAnalytics(groups) {
 
 // 刷新模式B账号列表的 GraphQL 用量缓存（cache_usage_details），与模式B refreshAccountsUsage 同逻辑。
 // 模式A共用同一KV，读同一缓存键保证两模式看板一致。
-async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) {
+async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT, force = false) {
 	const cachedDetailsRaw = await env.KV.get('cache_usage_details');
 	let cacheMap = {};
 	if (cachedDetailsRaw) {
@@ -782,13 +782,14 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) 
 	}
 
 	// 新鲜期短路：所有账号上都已刷新且未过期（默认60s内），直接返回缓存，避免每次刷新都重查 GraphQL 造成卡顿
+	// force=true（手动刷新）时跳过短路，强制重查最新用量
 	const freshSec = env && Number(env.USAGE_REFRESH_FRESH_SEC) > 0 ? Number(env.USAGE_REFRESH_FRESH_SEC) : USAGE_REFRESH_FRESH_SEC;
 	const nowMs = Date.now();
 	const allFresh = accounts.every(a => {
 		const c = cacheMap[a.id];
 		return c && c.todayDate === getTodayStr() && nowMs - (c.timestamp || 0) < freshSec * 1000;
 	});
-	if (allFresh) {
+	if (allFresh && !force) {
 		return cacheMap;
 	}
 
@@ -900,14 +901,15 @@ async function refreshAccountsUsage(env, accounts, limit = USAGE_REFRESH_LIMIT) 
 // ===== 本地 Token 兜底数据源（无 cfg_accounts 且无 ANALYTICS_API_TOKEN 时使用） =====
 // 读 tokens_daily_* (今日+过去7天) 与 tokens_monthly_* 拼出与 GraphQL 同结构的虚拟账号数据。
 // 单位是 Token 不是 Neurons（CF 按 Neurons 计费，token≠Neurons），看板需据此切换口径标注。
-async function buildLocalUsageFallback(env) {
+async function buildLocalUsageFallback(env, force = false) {
 	const todayStr = getTodayStr();
 
 	// 缓存短路：新鲜期内直接返回上次聚合结果，避免每次刷新都遍历 7 天 evt_* 键造成卡顿
+	// force=true（手动刷新）时跳过短路，强制重新聚合最新用量
 	const freshSec = env && Number(env.USAGE_REFRESH_FRESH_SEC) > 0 ? Number(env.USAGE_REFRESH_FRESH_SEC) : USAGE_REFRESH_FRESH_SEC;
 	try {
 		const cacheRaw = await env.KV.get('cache_local_usage_fallback');
-		if (cacheRaw) {
+		if (cacheRaw && !force) {
 			const cached = JSON.parse(cacheRaw);
 			if (cached && cached.__date === todayStr && Date.now() - (cached.__ts || 0) < freshSec * 1000) {
 				cached.accounts[0].lastUpdated = Date.now();
@@ -3840,6 +3842,7 @@ async function handleDashboardApi(request, env, ctx) {
 
 	// 账号用量（真实 Neurons 口径：GraphQL Analytics，与模式B一致）
 	if (url.pathname === '/api/accounts/usage' && method === 'GET') {
+		const force = new URL(request.url).searchParams.get('force') === '1';
 		const limits = await getUsageLimits(env);
 		const monthlyUsage = await getMonthlyUsage(env);
 		const accounts = await getAccounts(env);
@@ -3859,7 +3862,7 @@ async function handleDashboardApi(request, env, ctx) {
 
 		if (graphqlAccounts.length > 0) {
 			// 真实 Neurons 口径：刷新 GraphQL 缓存（与模式B refreshAccountsUsage 同逻辑同KV键）
-			const cacheMap = await refreshAccountsUsage(env, graphqlAccounts);
+			const cacheMap = await refreshAccountsUsage(env, graphqlAccounts, USAGE_REFRESH_LIMIT, force);
 
 			const todayStr = getTodayStr();
 			const results = graphqlAccounts.map(account => {
@@ -3907,7 +3910,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 
 		// 本地 token 兜底（无 cfg_accounts 且无 Analytics Token）
-		const fallback = await buildLocalUsageFallback(env);
+		const fallback = await buildLocalUsageFallback(env, force);
 		const dailyUsage = fallback.accounts[0].usageToday;
 		const dailyRequests = fallback.accounts[0].usageTodayRequests;
 		const monthlyRequests = fallback.accounts[0].usageThisMonthRequests || 0;
@@ -6652,9 +6655,10 @@ async function handleAdminPage(request, env, ctx) {
 			isRefreshingUsage = true;
 
 			try {
-				// 并行请求账号用量和 API 密钥数
+				// 并行请求账号用量和 API 密钥数（手动刷新时强制重查最新用量）
+				const usageUrl = isManual ? '/api/accounts/usage?force=1' : '/api/accounts/usage';
 				const [usageRes, keysRes] = await Promise.all([
-					apiFetch('/api/accounts/usage'),
+					apiFetch(usageUrl),
 					apiFetch('/api/keys')
 				]);
 				const data = await usageRes.json();
