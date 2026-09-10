@@ -3956,7 +3956,11 @@ async function handleDashboardApi(request, env, ctx) {
 				let remainingDays = null;
 				if (k.expiresAt) {
 					const exp = Date.parse(k.expiresAt);
-					if (!isNaN(exp)) remainingDays = Math.max(0, Math.floor((exp - nowMs) / 86400000));
+					if (!isNaN(exp)) {
+						const diffMs = exp - nowMs;
+						// 向上取整：创建 N 天后只要未过期即显示 N 天，避免因时分秒流逝而少算天数
+						remainingDays = diffMs <= 0 ? 0 : Math.ceil(diffMs / 86400000);
+					}
 				}
 				let remainingCalls = null;
 				if (k.maxCalls && k.maxCalls > 0) {
@@ -4001,6 +4005,38 @@ async function handleDashboardApi(request, env, ctx) {
 			await saveApiKeys(env, keys);
 			return new Response(JSON.stringify({ success: true, key: generatedKey }), { headers: { 'Content-Type': 'application/json' } });
 		}
+	}
+
+	if (url.pathname.startsWith('/api/keys/') && method === 'PUT') {
+		const id = decodeURIComponent(url.pathname.slice('/api/keys/'.length));
+		const { name, expiresDays, expiresMonths, remainingCalls } = await safeJsonBody(request) || {};
+		const keys = await getApiKeys(env);
+		const k = keys.find(x => x.id === id);
+		if (!k) {
+			return new Response(JSON.stringify({ error: 'Key not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+		}
+		// 描述名称
+		if (typeof name === 'string') k.name = name;
+		// 有效期：填数字>0 则从当前时间起计算；填 0 或负数则置为不限
+		if (expiresDays !== undefined || expiresMonths !== undefined) {
+			const days = parseInt(expiresDays, 10);
+			const months = parseInt(expiresMonths, 10);
+			if (days > 0 || months > 0) {
+				const d = new Date();
+				if (months > 0) d.setMonth(d.getMonth() + months);
+				if (days > 0) d.setDate(d.getDate() + days);
+				k.expiresAt = d.toISOString();
+			} else {
+				k.expiresAt = null;
+			}
+		}
+		// 剩余次数：用户填的是“剩余可用次数”，则 maxCalls = 已用 + 剩余；填 0 或空则置为不限
+		if (remainingCalls !== undefined) {
+			const rem = parseInt(remainingCalls, 10);
+			k.maxCalls = rem > 0 ? ((k.usedCalls || 0) + rem) : null;
+		}
+		await saveApiKeys(env, keys);
+		return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
 	}
 
 	if (url.pathname.startsWith('/api/keys/') && method === 'DELETE') {
@@ -6273,7 +6309,7 @@ async function handleAdminPage(request, env, ctx) {
 					<label for="key-name">密钥描述/使用客户端 (如: Cursor / NextChat)</label>
 					<input type="text" id="key-name" placeholder="请输入描述名" style="width: 100%;">
 				</div>
-				<div class="form-group" style="margin-bottom: 16px;">
+				<div class="form-group" style="margin-bottom: 16px;" id="key-val-group">
 					<label for="key-val">API 密钥值 (可选，为空则随机生成 sk-wa-...)</label>
 					<input type="text" id="key-val" placeholder="留空则随机生成密钥" style="width: 100%;">
 				</div>
@@ -6289,13 +6325,13 @@ async function handleAdminPage(request, env, ctx) {
 						</div>
 					</div>
 					<div class="form-group" style="margin-bottom: 0;">
-						<label for="key-max-calls">最大调用次数 (空=不限)</label>
+						<label for="key-max-calls" id="key-max-calls-label">最大调用次数 (空=不限)</label>
 						<input type="number" id="key-max-calls" min="1" placeholder="不限" style="width: 100%;">
 					</div>
 				</div>
 				<div class="modal-footer" style="margin-top: 10px; display: flex; gap: 12px; justify-content: flex-end; width: 100%;">
 					<button class="btn btn-secondary" onclick="closeKeyModal()">取消</button>
-					<button class="btn btn-primary" onclick="saveKey()">生成密钥</button>
+					<button class="btn btn-primary" id="key-save-btn" onclick="saveKey()">生成密钥</button>
 				</div>
 			</div>
 			<div id="key-modal-success" class="hidden" style="display: flex; flex-direction: column; gap: 16px;">
@@ -6956,6 +6992,7 @@ async function handleAdminPage(request, env, ctx) {
 					<td style="color: \${callsColor};">\${escapeHtml(callsText)}</td>
 					<td>\${dateStr}</td>
 					<td>
+						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; margin-right:6px;" onclick="openEditKeyModal(\${attrEscape(k.id)})">编辑</button>
 						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey(\${attrEscape(k.id)})">删除</button>
 					</td>
 				\`;
@@ -6969,16 +7006,47 @@ async function handleAdminPage(request, env, ctx) {
 			await copyText(val, 'API Key 复制成功！');
 		}
 
+		// 当前正在编辑的密钥 id（null=新增模式）
+		let KEY_EDITING_ID = null;
+
 		function openAddKeyModal() {
+			KEY_EDITING_ID = null;
 			document.getElementById('key-name').value = '';
 			document.getElementById('key-val').value = '';
 			document.getElementById('key-expires-num').value = '';
 			document.getElementById('key-expires-unit').value = 'days';
 			document.getElementById('key-max-calls').value = '';
 			document.getElementById('key-modal-title').innerText = '生成新 API 密钥';
+			document.getElementById('key-max-calls-label').innerText = '最大调用次数 (空=不限)';
+			document.getElementById('key-val-group').style.display = '';
+			document.getElementById('key-save-btn').innerText = '生成密钥';
 			document.getElementById('key-modal-form').classList.remove('hidden');
 			document.getElementById('key-modal-success').classList.add('hidden');
 			document.getElementById('key-modal').classList.add('active');
+		}
+
+		async function openEditKeyModal(id) {
+			try {
+				const res = await apiFetch('/api/keys');
+				if (!res.ok) { showToast('加载密钥失败！', 'error'); return; }
+				const keys = await res.json();
+				const k = keys.find(x => x.id === id);
+				if (!k) { showToast('未找到该密钥！', 'error'); return; }
+				KEY_EDITING_ID = id;
+				document.getElementById('key-name').value = k.name || '';
+				document.getElementById('key-expires-num').value = (k.remainingDays != null && k.remainingDays > 0) ? k.remainingDays : '';
+				document.getElementById('key-expires-unit').value = 'days';
+				document.getElementById('key-max-calls').value = (k.remainingCalls != null) ? k.remainingCalls : '';
+				document.getElementById('key-modal-title').innerText = '编辑 API 密钥';
+				document.getElementById('key-max-calls-label').innerText = '剩余次数 (空=不限)';
+				document.getElementById('key-val-group').style.display = 'none';
+				document.getElementById('key-save-btn').innerText = '保存修改';
+				document.getElementById('key-modal-form').classList.remove('hidden');
+				document.getElementById('key-modal-success').classList.add('hidden');
+				document.getElementById('key-modal').classList.add('active');
+			} catch (e) {
+				showToast('加载密钥失败！', 'error');
+			}
 		}
 
 		function closeKeyModal() {
@@ -6993,6 +7061,27 @@ async function handleAdminPage(request, env, ctx) {
 			const maxCalls = document.getElementById('key-max-calls').value;
 			if (!name) {
 				showToast('请输入描述名称！', 'warning');
+				return;
+			}
+			if (KEY_EDITING_ID) {
+				const body = { name };
+				if (expiresNum && parseInt(expiresNum, 10) > 0) {
+					if (expiresUnit === 'months') body.expiresMonths = parseInt(expiresNum, 10);
+					else body.expiresDays = parseInt(expiresNum, 10);
+				}
+				if (maxCalls && parseInt(maxCalls, 10) > 0) body.remainingCalls = parseInt(maxCalls, 10);
+				const res = await apiFetch('/api/keys/' + encodeURIComponent(KEY_EDITING_ID), {
+					method: 'PUT',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify(body)
+				});
+				if (res.ok) {
+					loadKeys();
+					closeKeyModal();
+					showToast('密钥已更新！', 'success');
+				} else {
+					showToast('保存密钥失败！', 'error');
+				}
 				return;
 			}
 			const body = { name, key };
