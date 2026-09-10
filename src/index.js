@@ -521,21 +521,44 @@ async function checkAdminAuth(request, env) {
 async function checkProxyAuth(request, env) {
 	const apiKeys = await getApiKeys(env);
 	if (apiKeys.length === 0) {
-		return true;
+		return { ok: true };
 	}
 
 	const xApiKey = request.headers.get('x-api-key');
-	if (xApiKey && apiKeys.some(k => timingSafeEqual(k.key, xApiKey))) {
-		return true;
-	}
-
 	const authHeader = request.headers.get('Authorization');
-	if (authHeader && authHeader.startsWith('Bearer ')) {
-		const token = authHeader.substring(7);
-		return apiKeys.some(k => timingSafeEqual(k.key, token));
+	const bearerToken = (authHeader && authHeader.startsWith('Bearer ')) ? authHeader.substring(7) : null;
+	const presented = xApiKey || bearerToken;
+	if (!presented) return { ok: false, reason: 'missing' };
+
+	const matched = apiKeys.find(k => timingSafeEqual(k.key, presented));
+	if (!matched) return { ok: false, reason: 'invalid' };
+
+	// 有效期校验
+	if (matched.expiresAt) {
+		const exp = Date.parse(matched.expiresAt);
+		if (!isNaN(exp) && Date.now() >= exp) return { ok: false, reason: 'expired', keyId: matched.id };
+	}
+	// 次数校验
+	if (matched.maxCalls && matched.maxCalls > 0) {
+		const used = matched.usedCalls || 0;
+		if (used >= matched.maxCalls) return { ok: false, reason: 'exhausted', keyId: matched.id };
 	}
 
-	return false;
+	return { ok: true, keyId: matched.id };
+}
+
+// 异步累加密钥调用次数（waitUntil 中执行，不阻塞主请求）
+async function incrementKeyUsage(env, keyId) {
+	try {
+		const keys = await getApiKeys(env);
+		const k = keys.find(x => x.id === keyId);
+		if (!k) return;
+		k.usedCalls = (k.usedCalls || 0) + 1;
+		await env.KV.put('cfg_api_keys', JSON.stringify(keys));
+		getApiKeys.invalidate();
+	} catch (e) {
+		console.error('Failed to increment key usage:', e?.message || e);
+	}
 }
 
 function jsonError(message, status = 500, type = 'server_error', code = null, param = null) {
@@ -1253,17 +1276,26 @@ async function resolveModelName(model, env) {
 async function handleV1Proxy(request, env, ctx) {
 	const url = new URL(request.url);
 
-	if (!await checkProxyAuth(request, env)) {
+	const authResult = await checkProxyAuth(request, env);
+	if (!authResult.ok) {
+		const reasonMsg = authResult.reason === 'expired' ? 'API key has expired.'
+			: authResult.reason === 'exhausted' ? 'API key call limit reached.'
+			: authResult.reason === 'missing' ? 'Missing x-api-key or Authorization header.'
+			: 'Invalid x-api-key or Authorization header.';
 		if (url.pathname === '/v1/messages' || url.pathname === '/v1/messages/count_tokens') {
 			return new Response(JSON.stringify({
 				type: 'error',
 				error: {
 					type: 'authentication_error',
-					message: 'Invalid x-api-key or Authorization header.'
+					message: reasonMsg
 				}
 			}), { status: 401, headers: { 'Content-Type': 'application/json', 'X-Request-Id': generateRequestId() } });
 		}
-		return jsonError("Incorrect or missing API key. Configure keys in the dashboard.", 401, "invalid_request_error", "invalid_api_key");
+		return jsonError(reasonMsg, 401, "invalid_request_error", "invalid_api_key");
+	}
+	// 鉴权通过且命中具名 key：异步累加调用次数
+	if (authResult.keyId && ctx) {
+		ctx.waitUntil(incrementKeyUsage(env, authResult.keyId));
 	}
 
 	const limitCheck = await checkUsageLimit(env);
@@ -3447,6 +3479,47 @@ async function handleDashboardApi(request, env, ctx) {
 		});
 	}
 
+	// 公开密钥查询（无需登录）：凭 key 反查剩余有效期/剩余次数
+	if (url.pathname === '/api/key/info' && method === 'GET') {
+		const presented = url.searchParams.get('key') || '';
+		if (!presented) {
+			return new Response(JSON.stringify({ valid: false, error: 'missing key parameter' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		}
+		const apiKeys = await getApiKeys(env);
+		const matched = apiKeys.find(k => timingSafeEqual(k.key, presented));
+		if (!matched) {
+			return new Response(JSON.stringify({ valid: false, reason: 'not_found' }), { headers: { 'Content-Type': 'application/json' } });
+		}
+		const nowMs = Date.now();
+		let remainingDays = null;
+		let expired = false;
+		if (matched.expiresAt) {
+			const exp = Date.parse(matched.expiresAt);
+			if (!isNaN(exp)) {
+				remainingDays = Math.max(0, Math.floor((exp - nowMs) / 86400000));
+				if (nowMs >= exp) expired = true;
+			}
+		}
+		let remainingCalls = null;
+		let exhausted = false;
+		if (matched.maxCalls && matched.maxCalls > 0) {
+			remainingCalls = Math.max(0, matched.maxCalls - (matched.usedCalls || 0));
+			if ((matched.usedCalls || 0) >= matched.maxCalls) exhausted = true;
+		}
+		return new Response(JSON.stringify({
+			valid: !expired && !exhausted,
+			name: matched.name,
+			createdAt: matched.createdAt,
+			expiresAt: matched.expiresAt,
+			remainingDays,
+			expired,
+			maxCalls: matched.maxCalls || null,
+			usedCalls: matched.usedCalls || 0,
+			remainingCalls,
+			exhausted
+		}), { headers: { 'Content-Type': 'application/json' } });
+	}
+
 	// 用量汇总（真实 Neurons 口径：GraphQL Analytics，与模式B一致）
 	if (url.pathname === '/api/usage/summary' && method === 'GET') {
 		const isAuthorized = await checkAdminAuth(request, env);
@@ -3687,14 +3760,42 @@ async function handleDashboardApi(request, env, ctx) {
 	if (url.pathname === '/api/keys') {
 		if (method === 'GET') {
 			const keys = await getApiKeys(env);
-			return new Response(JSON.stringify(keys), { headers: { 'Content-Type': 'application/json' } });
+			// 附带剩余天数/剩余次数（不返回 usedCalls 等内部字段也无妨，前端需要展示）
+			const nowMs = Date.now();
+			const enriched = keys.map(k => {
+				let remainingDays = null;
+				if (k.expiresAt) {
+					const exp = Date.parse(k.expiresAt);
+					if (!isNaN(exp)) remainingDays = Math.max(0, Math.floor((exp - nowMs) / 86400000));
+				}
+				let remainingCalls = null;
+				if (k.maxCalls && k.maxCalls > 0) {
+					remainingCalls = Math.max(0, k.maxCalls - (k.usedCalls || 0));
+				}
+				return { ...k, remainingDays, remainingCalls };
+			});
+			return new Response(JSON.stringify(enriched), { headers: { 'Content-Type': 'application/json' } });
 		}
 
 		if (method === 'POST') {
-			const { name, key } = await safeJsonBody(request) || {};
+			const { name, key, expiresDays, expiresMonths, maxCalls } = await safeJsonBody(request) || {};
 			if (!name) {
 				return new Response(JSON.stringify({ error: 'Name is required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 			}
+
+			// 计算过期时间（任一空=不限；同时填则叠加）
+			let expiresAt = null;
+			const days = parseInt(expiresDays, 10);
+			const months = parseInt(expiresMonths, 10);
+			if ((days > 0 || months > 0)) {
+				const d = new Date();
+				if (months > 0) d.setMonth(d.getMonth() + months);
+				if (days > 0) d.setDate(d.getDate() + days);
+				expiresAt = d.toISOString();
+			}
+			// 最大调用次数（空或<=0=不限）
+			const maxCallsNum = parseInt(maxCalls, 10);
+			const maxCallsVal = (maxCallsNum > 0) ? maxCallsNum : null;
 
 			const generatedKey = key || `sk-wa-${crypto.randomUUID().replace(/-/g, '')}`;
 			const keys = await getApiKeys(env);
@@ -3702,7 +3803,10 @@ async function handleDashboardApi(request, env, ctx) {
 				id: crypto.randomUUID(),
 				name,
 				key: generatedKey,
-				createdAt: new Date().toISOString()
+				createdAt: new Date().toISOString(),
+				expiresAt,
+				maxCalls: maxCallsVal,
+				usedCalls: 0
 			});
 			await saveApiKeys(env, keys);
 			return new Response(JSON.stringify({ success: true, key: generatedKey }), { headers: { 'Content-Type': 'application/json' } });
@@ -4678,7 +4782,18 @@ async function handleLandingPage(request, env, ctx) {
 				</div>
 			</div>
 		</div>
-	</div>
+
+			<!-- 公开密钥查询（无需登录） -->
+			<div class="section-card" style="margin-top: 24px; padding: 24px;">
+				<div class="section-title">API 密钥查询</div>
+				<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 16px; line-height: 1.6;">输入您的 API Key 查询剩余有效期与剩余调用次数。无需登录。</p>
+				<div style="display: flex; gap: 10px; flex-wrap: wrap;">
+					<input type="text" id="public-key-query-input" placeholder="sk-wa-..." style="flex: 1; min-width: 240px; font-family: monospace;">
+					<button class="btn btn-primary" onclick="queryPublicKeyInfo()" id="public-key-query-btn">查询</button>
+				</div>
+				<div id="public-key-query-result" style="margin-top: 16px; display: none;"></div>
+			</div>
+		</div>
 
 	<!-- 弹窗：管理员登录 / 后台快捷入口 -->
 	<div class="modal-overlay" id="login-modal">
@@ -4889,6 +5004,48 @@ async function handleLandingPage(request, env, ctx) {
 				setTimeout(() => {
 					window.location.reload();
 				}, 600);
+			}
+		}
+
+		// 公开密钥查询（主页，无需登录）
+		async function queryPublicKeyInfo() {
+			const input = document.getElementById('public-key-query-input');
+			const resultEl = document.getElementById('public-key-query-result');
+			const btn = document.getElementById('public-key-query-btn');
+			const key = (input.value || '').trim();
+			if (!key) { showToast('请输入 API Key', 'warning'); return; }
+			btn.disabled = true;
+			const original = btn.innerText;
+			btn.innerText = '查询中...';
+			try {
+				const res = await fetch('/api/key/info?key=' + encodeURIComponent(key));
+				const data = await res.json();
+				resultEl.style.display = 'block';
+				if (!data.valid) {
+					const reason = data.reason === 'not_found' ? '密钥不存在' : (data.expired ? '已过期' : (data.exhausted ? '已用尽' : '密钥无效'));
+					resultEl.innerHTML = '<div style="padding: 14px 16px; border-radius: 10px; background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2); color: var(--danger-color); font-size: 13px;">✗ ' + reason + '</div>';
+					return;
+				}
+				const expiryLine = data.expiresAt
+					? (data.remainingDays !== null && data.remainingDays !== undefined
+						? '剩余有效期: <strong>' + data.remainingDays + ' 天</strong>（至 ' + new Date(data.expiresAt).toLocaleDateString() + '）'
+						: '有效期至 ' + new Date(data.expiresAt).toLocaleString())
+					: '有效期: <strong>不限</strong>';
+				const callsLine = data.maxCalls && data.maxCalls > 0
+					? '剩余次数: <strong>' + (data.remainingCalls ?? 0) + ' / ' + data.maxCalls + '</strong>（已用 ' + (data.usedCalls || 0) + '）'
+					: '调用次数: <strong>不限</strong>';
+				resultEl.innerHTML = '<div style="padding: 14px 16px; border-radius: 10px; background: rgba(34,197,94,0.08); border: 1px solid rgba(34,197,94,0.2); font-size: 13px; line-height: 1.8;">' +
+					'<div style="color: var(--success-color); font-weight: 600; margin-bottom: 6px;">✓ 密钥有效</div>' +
+					'<div style="color: var(--text-muted);">描述: ' + escapeHtml(data.name || '') + '</div>' +
+					'<div style="color: var(--text-muted);">' + expiryLine + '</div>' +
+					'<div style="color: var(--text-muted);">' + callsLine + '</div>' +
+					'</div>';
+			} catch (e) {
+				resultEl.style.display = 'block';
+				resultEl.innerHTML = '<div style="padding: 14px 16px; border-radius: 10px; background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2); color: var(--danger-color); font-size: 13px;">查询失败: ' + escapeHtml(e.message || '网络错误') + '</div>';
+			} finally {
+				btn.disabled = false;
+				btn.innerText = original;
 			}
 		}
 	</script>
@@ -5743,6 +5900,8 @@ async function handleAdminPage(request, env, ctx) {
 								<tr>
 									<th>密钥描述</th>
 									<th>API Key</th>
+									<th>有效期</th>
+									<th>剩余次数</th>
 									<th>创建时间</th>
 									<th>操作</th>
 								</tr>
@@ -5898,6 +6057,22 @@ async function handleAdminPage(request, env, ctx) {
 					<label for="key-val">API 密钥值 (可选，为空则随机生成 sk-wa-...)</label>
 					<input type="text" id="key-val" placeholder="留空则随机生成密钥" style="width: 100%;">
 				</div>
+				<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+					<div class="form-group" style="margin-bottom: 0;">
+						<label for="key-expires-num">有效期 (空=不限)</label>
+						<div style="display: flex; gap: 8px;">
+							<input type="number" id="key-expires-num" min="1" placeholder="不限" style="flex: 1;">
+							<select id="key-expires-unit" style="width: 80px;">
+								<option value="days">天</option>
+								<option value="months">月</option>
+							</select>
+						</div>
+					</div>
+					<div class="form-group" style="margin-bottom: 0;">
+						<label for="key-max-calls">最大调用次数 (空=不限)</label>
+						<input type="number" id="key-max-calls" min="1" placeholder="不限" style="width: 100%;">
+					</div>
+				</div>
 				<div class="modal-footer" style="margin-top: 10px; display: flex; gap: 12px; justify-content: flex-end; width: 100%;">
 					<button class="btn btn-secondary" onclick="closeKeyModal()">取消</button>
 					<button class="btn btn-primary" onclick="saveKey()">生成密钥</button>
@@ -5975,6 +6150,7 @@ async function handleAdminPage(request, env, ctx) {
 			let totalRequestsToday = 0;
 			const totalLimit = limits.dailyLimit;
 			let historyData = {};
+			let historyRequestsData = {};
 			let modelsToday = {};
 
 			const usageList = document.getElementById('accounts-usage-list');
@@ -6064,6 +6240,7 @@ async function handleAdminPage(request, env, ctx) {
 				if (account.history) {
 					account.history.forEach(h => {
 						historyData[h.date] = (historyData[h.date] || 0) + h.neurons;
+						historyRequestsData[h.date] = (historyRequestsData[h.date] || 0) + (h.requests || 0);
 					});
 				}
 
@@ -6113,7 +6290,8 @@ async function handleAdminPage(request, env, ctx) {
 
 			const dates = Object.keys(historyData).sort();
 			const neuronsData = dates.map(d => historyData[d]);
-			renderHistoryChart(dates, neuronsData);
+			const requestsData = dates.map(d => historyRequestsData[d] || 0);
+			renderHistoryChart(dates, neuronsData, requestsData);
 
 			const models = Object.keys(modelsToday);
 			const modelsNeurons = models.map(m => modelsToday[m]);
@@ -6386,61 +6564,85 @@ async function handleAdminPage(request, env, ctx) {
 		}
 
 
-		function renderHistoryChart(labels, data) {
+		function renderHistoryChart(labels, data, requestsData) {
 			if (historyChart) historyChart.destroy();
 			const isLight = document.documentElement.getAttribute('data-theme') === 'light';
 			const gridColor = isLight ? 'rgba(0, 0, 0, 0.05)' : 'rgba(255, 255, 255, 0.05)';
 			const textColor = isLight ? '#64748b' : '#94a3b8';
+			const unit = window.__usageUnit || 'Neurons';
 			const ctx = document.getElementById('historyChart').getContext('2d');
 			const gradient = ctx.createLinearGradient(0, 0, 0, 300);
 			gradient.addColorStop(0, 'rgba(168, 85, 247, 0.35)');
 			gradient.addColorStop(1, 'rgba(168, 85, 247, 0.00)');
+			const datasets = [{
+				label: unit + ' 消耗',
+				data: data,
+				borderColor: '#a855f7',
+				backgroundColor: gradient,
+				borderWidth: 3,
+				tension: 0.3,
+				fill: true,
+				pointBackgroundColor: '#a855f7',
+				pointBorderColor: 'rgba(255, 255, 255, 0.8)',
+				pointBorderWidth: 1.5,
+				pointRadius: 4,
+				pointHoverRadius: 6,
+				pointHoverBorderWidth: 3,
+				yAxisID: 'y'
+			}];
+			if (requestsData && requestsData.some(v => v > 0)) {
+				datasets.push({
+					label: '请求次数',
+					data: requestsData,
+					borderColor: '#22c55e',
+					backgroundColor: 'rgba(34, 197, 94, 0.08)',
+					borderWidth: 2,
+					tension: 0.3,
+					fill: false,
+					pointBackgroundColor: '#22c55e',
+					pointRadius: 3,
+					pointHoverRadius: 5,
+					yAxisID: 'y1'
+				});
+			}
+			const scales = {
+				y: {
+					type: 'linear',
+					position: 'left',
+					grid: { color: gridColor },
+					ticks: { color: textColor, callback: function(value) { return fmtTok(value); } }
+				},
+				x: {
+					grid: { display: false },
+					ticks: {
+						color: textColor,
+						maxTicksLimit: 7,
+						callback: function(value, index) {
+							const d = new Date(labels[index]);
+							const month = String(d.getMonth() + 1).padStart(2, '0');
+							const day = String(d.getDate()).padStart(2, '0');
+							return month + '/' + day;
+						}
+					}
+				}
+			};
+			if (requestsData && requestsData.some(v => v > 0)) {
+				scales.y1 = {
+					type: 'linear',
+					position: 'right',
+					grid: { drawOnChartArea: false },
+					ticks: { color: '#22c55e' }
+				};
+			}
 			historyChart = new Chart(ctx, {
 				type: 'line',
-				data: {
-					labels: labels,
-					datasets: [{
-						label: 'Neuron 消耗数',
-						data: data,
-						borderColor: '#a855f7',
-						backgroundColor: gradient,
-						borderWidth: 3,
-						tension: 0.3,
-						fill: true,
-						pointBackgroundColor: '#a855f7',
-						pointBorderColor: 'rgba(255, 255, 255, 0.8)',
-						pointBorderWidth: 1.5,
-						pointRadius: 4,
-						pointHoverRadius: 6,
-						pointHoverBorderWidth: 3
-					}]
-				},
+				data: { labels: labels, datasets: datasets },
 				options: {
 					responsive: true,
 					maintainAspectRatio: false,
-					plugins: { legend: { display: false } },
-					scales: {
-						y: {
-							grid: { color: gridColor },
-							ticks: {
-								color: textColor,
-								callback: function(value) { return fmtTok(value); }
-							}
-						},
-						x: {
-							grid: { display: false },
-							ticks: {
-								color: textColor,
-								maxTicksLimit: 7,
-								callback: function(value, index) {
-									const d = new Date(labels[index]);
-									const month = String(d.getMonth() + 1).padStart(2, '0');
-									const day = String(d.getDate()).padStart(2, '0');
-									return month + '/' + day;
-								}
-							}
-						}
-					}
+					interaction: { mode: 'index', intersect: false },
+					plugins: { legend: { display: true, labels: { color: textColor, boxWidth: 12, font: { size: 11 } } } },
+					scales: scales
 				}
 			});
 		}
@@ -6517,6 +6719,16 @@ async function handleAdminPage(request, env, ctx) {
 		async function loadKeys() {
 			await loadTableData('/api/keys', 'keys-table-body', '暂无配置的 API 密钥', (k) => {
 				const dateStr = new Date(k.createdAt).toLocaleString();
+				const expiryText = k.expiresAt
+					? (k.remainingDays !== null && k.remainingDays !== undefined
+						? (k.remainingDays + ' 天' + (k.remainingDays === 0 ? ' (已到期)' : ''))
+						: new Date(k.expiresAt).toLocaleDateString())
+					: '不限';
+				const expiryColor = k.expiresAt && k.remainingDays !== null && k.remainingDays <= 0 ? 'var(--danger-color)' : 'var(--text-color)';
+				const callsText = k.maxCalls && k.maxCalls > 0
+					? \`\${(k.remainingCalls ?? k.maxCalls).toLocaleString()} / \${k.maxCalls.toLocaleString()}\`
+					: '不限';
+				const callsColor = k.maxCalls && (k.remainingCalls ?? 1) <= 0 ? 'var(--danger-color)' : 'var(--text-color)';
 				return \`
 					<td><strong style="font-weight:600;">\${escapeHtml(k.name)}</strong></td>
 					<td>
@@ -6525,6 +6737,8 @@ async function handleAdminPage(request, env, ctx) {
 							<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" onclick="copyKeyText(\${attrEscape(k.key)})">复制</button>
 						</div>
 					</td>
+					<td style="color: \${expiryColor};">\${escapeHtml(expiryText)}</td>
+					<td style="color: \${callsColor};">\${escapeHtml(callsText)}</td>
 					<td>\${dateStr}</td>
 					<td>
 						<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey(\${attrEscape(k.id)})">删除</button>
@@ -6543,6 +6757,9 @@ async function handleAdminPage(request, env, ctx) {
 		function openAddKeyModal() {
 			document.getElementById('key-name').value = '';
 			document.getElementById('key-val').value = '';
+			document.getElementById('key-expires-num').value = '';
+			document.getElementById('key-expires-unit').value = 'days';
+			document.getElementById('key-max-calls').value = '';
 			document.getElementById('key-modal-title').innerText = '生成新 API 密钥';
 			document.getElementById('key-modal-form').classList.remove('hidden');
 			document.getElementById('key-modal-success').classList.add('hidden');
@@ -6556,14 +6773,23 @@ async function handleAdminPage(request, env, ctx) {
 		async function saveKey() {
 			const name = document.getElementById('key-name').value;
 			const key = document.getElementById('key-val').value;
+			const expiresNum = document.getElementById('key-expires-num').value;
+			const expiresUnit = document.getElementById('key-expires-unit').value;
+			const maxCalls = document.getElementById('key-max-calls').value;
 			if (!name) {
 				showToast('请输入描述名称！', 'warning');
 				return;
 			}
+			const body = { name, key };
+			if (expiresNum && parseInt(expiresNum, 10) > 0) {
+				if (expiresUnit === 'months') body.expiresMonths = parseInt(expiresNum, 10);
+				else body.expiresDays = parseInt(expiresNum, 10);
+			}
+			if (maxCalls && parseInt(maxCalls, 10) > 0) body.maxCalls = parseInt(maxCalls, 10);
 			const res = await apiFetch('/api/keys', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ name, key })
+				body: JSON.stringify(body)
 			});
 			if (res.ok) {
 				const data = await res.json();
