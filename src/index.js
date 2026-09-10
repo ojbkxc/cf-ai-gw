@@ -290,10 +290,10 @@ function getModelOwnedBy(cfModel, id) {
 // ===== API 密钥已用次数：Durable Object 强一致计数器 =====
 // 每把 key 对应一个命名 DO（KEY_COUNTER.idFromName(keyId)）。单实例串行处理，
 // "检查是否超限 + 递增"在一个 handler 内原子完成，彻底杜绝并发超卖（KV 弱一致性做不到）。
-// 惰性播种：首次访问时若 DO 尚无记录，从 KV cfg_api_keys 里同步该 key 的存量 usedCalls 作为初始值。
-export class ApiKeyCounter extends DurableObject {
+// 注意：DO 不可 extends 全局 DurableObject（运行时无此基类），也不自动继承 Worker 的 KV 绑定，
+// 因此存量 usedCalls 由调用方通过请求体/查询参数以 seed 传入，DO 首次落盘时以该 seed 为基线。
+export class ApiKeyCounter {
 	constructor(state, env) {
-		super(state, env);
 		this.state = state;
 		this.env = env;
 		this._used = undefined;
@@ -301,38 +301,27 @@ export class ApiKeyCounter extends DurableObject {
 
 	async fetch(request) {
 		const url = new URL(request.url);
-		const keyId = decodeURIComponent(url.pathname.replace(/^\//, '')) || '';
-		await this._ensureSeed(keyId);
 		if (request.method === 'POST') {
-			const { max } = await request.json().catch(() => ({}));
-			return this._checkAndIncrement(max);
+			const { max, seed } = await request.json().catch(() => ({}));
+			return this._checkAndIncrement(max || 0, seed || 0);
 		}
-		return new Response(JSON.stringify({ used: this._used || 0 }));
+		// GET 读当前计数；DO 尚无持久记录时用外部传入的 seed（KV 存量 usedCalls）兜底展示
+		const seed = parseInt(url.searchParams.get('seed') || '0', 10) || 0;
+		return new Response(JSON.stringify({ used: await this._getUsed(seed) }));
 	}
 
-	// 惰性装载初始计数（首次从 KV cfg_api_keys 同步存量 usedCalls）
-	async _ensureSeed(keyId) {
+	// 读取当前计数；storage 无持久值时回落 seed（仅内存缓存，GET 不落盘）
+	async _getUsed(seedFallback) {
 		if (this._used === undefined) {
 			const stored = await this.state.storage.get('used');
-			if (stored === null) {
-				let seed = 0;
-				try {
-					const raw = await this.env.KV.get('cfg_api_keys');
-					const arr = raw ? (JSON.parse(raw) || []) : [];
-					const k = (arr || []).find(x => x.id === keyId);
-					if (k && k.usedCalls) seed = k.usedCalls;
-				} catch (_) { /* 忽略，种子为 0 */ }
-				this._used = seed;
-				await this.state.storage.put('used', seed);
-			} else {
-				this._used = stored;
-			}
+			this._used = (stored === null || stored === undefined) ? seedFallback : stored;
 		}
+		return this._used;
 	}
 
-	// 原子"检查并递增"：used >= maxCalls 则拒绝，否则 used++ 后放行
-	async _checkAndIncrement(max) {
-		const used = this._used || 0;
+	// 原子"检查并递增"：used >= maxCalls 则拒绝，否则 used++ 后落盘放行
+	async _checkAndIncrement(max, seed) {
+		const used = await this._getUsed(seed);
 		if (max && max > 0 && used >= max) {
 			return new Response(JSON.stringify({ allowed: false, used, max }));
 		}
@@ -347,19 +336,19 @@ export class ApiKeyCounter extends DurableObject {
 function getKeyCounter(env, keyId) {
 	return env.KEY_COUNTER.get(env.KEY_COUNTER.idFromName(keyId));
 }
-// 读某把 key 当前已用次数
-async function doKeyUsage(env, keyId) {
+// 读某把 key 当前已用次数（seed 为 KV 存量 usedCalls，DO 尚无记录时兜底）
+async function doKeyUsage(env, keyId, seed) {
 	try {
-		const r = await getKeyCounter(env, keyId).fetch('/' + encodeURIComponent(keyId));
+		const r = await getKeyCounter(env, keyId).fetch('/' + encodeURIComponent(keyId) + '?seed=' + (seed || 0));
 		return (await r.json()).used || 0;
-	} catch (_) { /* DO 异常时展示性回退 */ return 0; }
+	} catch (_) { /* DO 异常时展示性回退到 KV 存量 */ return seed || 0; }
 }
 // 原子"检查并递增"：返回 { allowed, used }；DO 故障时保守放行（degraded:true）
-async function doCheckAndIncrement(env, keyId, max) {
+async function doCheckAndIncrement(env, keyId, max, seed) {
 	try {
 		const r = await getKeyCounter(env, keyId).fetch('/' + encodeURIComponent(keyId), {
 			method: 'POST',
-			body: JSON.stringify({ max: max || 0 })
+			body: JSON.stringify({ max: max || 0, seed: seed || 0 })
 		});
 		return await r.json();
 	} catch (_) {
@@ -642,14 +631,14 @@ async function checkProxyAuth(request, env) {
 		const exp = Date.parse(matched.expiresAt);
 		if (!isNaN(exp) && Date.now() >= exp) return { ok: false, reason: 'expired', keyId: matched.id };
 	}
-	// 次数校验：DO 强一致原子"检查并递增"（杜绝并发超卖）。matched.usedCalls 仅做展示回显，非真源。
+	// 次数校验：DO 强一致原子"检查并递增"（杜绝并发超卖）。matched.usedCalls 为 KV 存量，作为 DO 首次基线 seed。
 	if (matched.maxCalls && matched.maxCalls > 0) {
-		const r = await doCheckAndIncrement(env, matched.id, matched.maxCalls);
+		const r = await doCheckAndIncrement(env, matched.id, matched.maxCalls, matched.usedCalls || 0);
 		if (r && r.allowed === false) return { ok: false, reason: 'exhausted', keyId: matched.id };
 		if (r && !r.degraded) matched.usedCalls = r.used;
 	} else {
 		// 不限次数的 key：仍需递增已用次数供展示（DO 计数，不校验上限）
-		const r = await doCheckAndIncrement(env, matched.id, 0);
+		const r = await doCheckAndIncrement(env, matched.id, 0, matched.usedCalls || 0);
 		if (r && !r.degraded) matched.usedCalls = r.used;
 	}
 
@@ -3664,8 +3653,8 @@ async function handleDashboardApi(request, env, ctx) {
 						remainingDays = diffMs <= 0 ? 0 : Math.ceil(diffMs / 86400000);
 					}
 				}
-				// 已用次数从 DO 强一致计数读取（限次真源）
-				const used = await doKeyUsage(env, k.id);
+				// 已用次数从 DO 强一致计数读取（限次真源）；KV 存量作 seed 兜底
+				const used = await doKeyUsage(env, k.id, k.usedCalls || 0);
 				let remainingCalls = null;
 				if (k.maxCalls && k.maxCalls > 0) {
 					remainingCalls = Math.max(0, k.maxCalls - used);
@@ -3737,7 +3726,7 @@ async function handleDashboardApi(request, env, ctx) {
 		// 剩余次数：用户填的是"剩余可用次数"，则 maxCalls = 已用(DO真源) + 剩余；填 0 或空则置为不限
 			if (remainingCalls !== undefined) {
 				const rem = parseInt(remainingCalls, 10);
-				const used = await doKeyUsage(env, k.id);
+				const used = await doKeyUsage(env, k.id, k.usedCalls || 0);
 				k.maxCalls = rem > 0 ? (used + rem) : null;
 			}
 		await saveApiKeys(env, keys);
