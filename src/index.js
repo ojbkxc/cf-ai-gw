@@ -107,6 +107,9 @@ async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0
 			const evt = { i: input, o: output, r: reasoning, m: model || null, ts: Date.now() };
 			await env.KV.put(evtKey, JSON.stringify(evt), { expirationTtl: TOKEN_KV_TTL_SEC });
 
+			// 1.5) 实时 DO 计数（看板"今日请求/今日用量"强一致读）；失败静默，不影响事件键/汇总键
+			await doBumpUsage(env, { requests: 1, input, output });
+
 			// 2) 日汇总键（best-effort，并发可能覆盖丢失，仅用于前端避免 list N 次的快速展示；
 			//    真实数据以 list 事件键聚合为准，见 buildLocalUsageFallback）
 			const dailyKey = getTokenDailyKey();
@@ -339,14 +342,14 @@ function getKeyCounter(env, keyId) {
 // 读某把 key 当前已用次数（seed 为 KV 存量 usedCalls，DO 尚无记录时兜底）
 async function doKeyUsage(env, keyId, seed) {
 	try {
-		const r = await getKeyCounter(env, keyId).fetch('/' + encodeURIComponent(keyId) + '?seed=' + (seed || 0));
+		const r = await getKeyCounter(env, keyId).fetch('https://do.local/counter/' + encodeURIComponent(keyId) + '?seed=' + (seed || 0));
 		return (await r.json()).used || 0;
 	} catch (_) { /* DO 异常时展示性回退到 KV 存量 */ return seed || 0; }
 }
 // 原子"检查并递增"：返回 { allowed, used }；DO 故障时保守放行（degraded:true）
 async function doCheckAndIncrement(env, keyId, max, seed) {
 	try {
-		const r = await getKeyCounter(env, keyId).fetch('/' + encodeURIComponent(keyId), {
+		const r = await getKeyCounter(env, keyId).fetch('https://do.local/counter/' + encodeURIComponent(keyId), {
 			method: 'POST',
 			body: JSON.stringify({ max: max || 0, seed: seed || 0 })
 		});
@@ -354,6 +357,59 @@ async function doCheckAndIncrement(env, keyId, max, seed) {
 	} catch (_) {
 		return { allowed: true, used: 0, degraded: true };
 	}
+}
+
+// ===== 今日用量实时计数：Durable Object 强一致计数器 =====
+// 按 UTC 日期命名（usage:<date>），与 evt_ 键口径一致。每次请求在 accumulateTokens 中
+// 原子累加 requests/input/output，看板"今日请求/今日用量"直接读此 DO，瞬时强一致，无 KV.list 延迟。
+export class UsageCounter {
+	constructor(state, env) {
+		this.state = state;
+		this.env = env;
+		this._data = undefined;
+	}
+
+	async fetch(request) {
+		await this._load();
+		if (request.method === 'POST') {
+			const { requests = 0, input = 0, output = 0 } = await request.json().catch(() => ({}));
+			this._data.requests = (this._data.requests || 0) + requests;
+			this._data.input = (this._data.input || 0) + input;
+			this._data.output = (this._data.output || 0) + output;
+			await this.state.storage.put('data', this._data);
+			return new Response(JSON.stringify(this._data));
+		}
+		return new Response(JSON.stringify(this._data));
+	}
+
+	async _load() {
+		if (this._data === undefined) {
+			const stored = await this.state.storage.get('data');
+			this._data = stored || { requests: 0, input: 0, output: 0 };
+		}
+	}
+}
+
+// 获取"今日用量"DO 实例（按 UTC 日期命名）
+function getUsageCounter(env, dateStr) {
+	return env.USAGE_COUNTER.get(env.USAGE_COUNTER.idFromName('usage:' + dateStr));
+}
+// 累加今日用量（请求次数 + token）；DO 强一致，异常时静默返回 null（不影响请求）
+async function doBumpUsage(env, { requests = 0, input = 0, output = 0 }) {
+	try {
+		const r = await getUsageCounter(env, getTodayStr()).fetch('https://do.local/usage/bump', {
+			method: 'POST',
+			body: JSON.stringify({ requests, input, output })
+		});
+		return await r.json();
+	} catch (_) { return null; }
+}
+// 读今日用量（DO），返回 { requests, input, output } 或 null
+async function doReadUsageToday(env) {
+	try {
+		const r = await getUsageCounter(env, getTodayStr()).fetch('https://do.local/usage/read');
+		return await r.json();
+	} catch (_) { return null; }
 }
 
 export default {
@@ -773,8 +829,14 @@ async function buildLocalUsageFallback(env) {
 	);
 
 	const todayEntry = dailyAgg.find(e => e.date === todayStr) || { input: 0, output: 0, requests: 0, models: {} };
-	const usageToday = (todayEntry.input || 0) + (todayEntry.output || 0);
-	const usageTodayRequests = todayEntry.requests || 0;
+	// 今日请求数/用量：优先取实时 DO（强一致），与 evt_ 聚合取较大者，既实时又避免 DO 冷启动时偏低
+	const doToday = await doReadUsageToday(env);
+	const usageToday = doToday
+		? Math.max((doToday.input || 0) + (doToday.output || 0), (todayEntry.input || 0) + (todayEntry.output || 0))
+		: ((todayEntry.input || 0) + (todayEntry.output || 0));
+	const usageTodayRequests = doToday
+		? Math.max(doToday.requests || 0, todayEntry.requests || 0)
+		: (todayEntry.requests || 0);
 
 	// 今日模型占比
 	const modelsToday = [];

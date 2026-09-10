@@ -35,9 +35,18 @@ id = "692bd958d51b4890a02b5fe637cddae2"
 name = "KEY_COUNTER"
 class_name = "ApiKeyCounter"
 
+# Durable Object：今日用量实时计数（请求次数 + token），强一致，看板实时展示用
+[[durable_objects.bindings]]
+name = "USAGE_COUNTER"
+class_name = "UsageCounter"
+
 [[migrations]]
 tag = "v1-key-counter"
 new_classes = ["ApiKeyCounter"]
+
+[[migrations]]
+tag = "v1-usage-counter"
+new_classes = ["UsageCounter"]
 
 # Workers AI 绑定（模式 A：单账号，内部 RPC 调用）
 [ai]
