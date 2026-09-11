@@ -131,9 +131,10 @@ async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0
 			}
 			if (model) {
 				cur.models = cur.models || {};
-				const m = cur.models[model] || (cur.models[model] = { input: 0, output: 0 });
+				const m = cur.models[model] || (cur.models[model] = { input: 0, output: 0, requests: 0 });
 				m.input += input;
 				m.output += output;
+				m.requests += countRequest ? 1 : 0;
 			}
 			await env.KV.put(dailyKey, JSON.stringify(cur), { expirationTtl: TOKEN_KV_TTL_SEC });
 
@@ -788,109 +789,77 @@ async function getMonthlyUsage(env) {
 	return raw ? parseInt(raw, 10) : 0;
 }
 
-// ===== 用量数据源（模式A）：实时聚合本地 KV 的 evt_* 事件键 =====
-// 今日+7天历史、本月汇总均直接来自 evt_<date>_* 事件键，无需查询 CF Analytics GraphQL。
-// 单位是 Token 而非 Neurons（CF 按 Neurons 计费，token≠Neurons），看板据此切换口径标注。
+// ===== 用量数据源（模式A）：DO 今日 + tokens_daily_/tokens_monthly_ 汇总键历史/本月 =====
+// 今日请求/次数/用量走 UsageCounter DO（强一致实时）；7日历史、本月、今日模型占比走汇总键（单键 get 秒回）。
+// 不再逐键聚合 evt_* 事件键，避免刷新卡死/死循环。单位是 Token（CF Neurons 计费口径不同）。
 async function buildLocalUsageFallback(env) {
 	const todayStr = getTodayStr();
 
-	// 模式A：用量直接实时聚合本地 KV 的 evt_* 事件键，不做缓存，确保每次刷新都读到最新本地计数
-
-	// 今日 + 7 天历史：用 evt_<date>_* 事件键聚合（无竞态、真实）
+	// 历史 7 天日期（含今日）
 	const historyDates = [];
 	for (let i = 0; i <= 6; i++) {
 		const d = new Date(Date.now() - i * 86400000);
 		historyDates.push(d.toISOString().split('T')[0]);
 	}
 
-	const dailyAgg = await Promise.all(
-		historyDates.map(async (date) => {
-			const agg = { date, input: 0, output: 0, requests: 0, models: {} };
-			try {
-				let cursor;
-				do {
-					const list = await env.KV.list({ prefix: `evt_${date}_`, cursor });
-					for (const k of list.keys) {
-						try {
-							const raw = await env.KV.get(k.name);
-							if (!raw) continue;
-							const evt = JSON.parse(raw);
-							agg.input += evt.i || 0;
-							agg.output += evt.o || 0;
-							agg.requests += 1;
-							if (evt.m) {
-								agg.models[evt.m] = agg.models[evt.m] || { input: 0, output: 0, requests: 0 };
-								agg.models[evt.m].input += evt.i || 0;
-								agg.models[evt.m].output += evt.o || 0;
-								agg.models[evt.m].requests += 1;
-							}
-						} catch (_) {}
-					}
-					cursor = list.list_complete ? null : list.cursor;
-				} while (cursor);
-			} catch (e) { /* 容错 */ }
-			return agg;
-		})
-	);
+	// 读历史上 6 天 + 今日的汇总键（单键 get，快；空键按 0 处理）
+	const historyByDate = {};
+	await Promise.all(historyDates.map(async (date) => {
+		try {
+			const raw = await env.KV.get(	okens_daily_\);
+			historyByDate[date] = raw ? JSON.parse(raw) : { input: 0, output: 0, requests: 0, models: {} };
+		} catch (_) { historyByDate[date] = { input: 0, output: 0, requests: 0, models: {} }; }
+	}));
 
-	const todayEntry = dailyAgg.find(e => e.date === todayStr) || { input: 0, output: 0, requests: 0, models: {} };
-	// 今日请求数/用量：优先取实时 DO（强一致），与 evt_ 聚合取较大者，既实时又避免 DO 冷启动时偏低
+	const todayEntry = historyByDate[todayStr] || { input: 0, output: 0, requests: 0, models: {} };
+
+	// 今日请求数/用量：以 DO 强一致实时值为准（DO 冷启动偏低时回退到汇总键，取较大者）
+	let usageToday = 0, usageTodayRequests = 0;
 	const doToday = await doReadUsageToday(env);
-	const usageToday = doToday
-		? Math.max((doToday.input || 0) + (doToday.output || 0), (todayEntry.input || 0) + (todayEntry.output || 0))
-		: ((todayEntry.input || 0) + (todayEntry.output || 0));
-	const usageTodayRequests = doToday
-		? Math.max(doToday.requests || 0, todayEntry.requests || 0)
-		: (todayEntry.requests || 0);
+	if (doToday) {
+		usageToday = Math.max((doToday.input || 0) + (doToday.output || 0), (todayEntry.input || 0) + (todayEntry.output || 0));
+		usageTodayRequests = Math.max(doToday.requests || 0, todayEntry.requests || 0);
+	} else {
+		usageToday = (todayEntry.input || 0) + (todayEntry.output || 0);
+		usageTodayRequests = todayEntry.requests || 0;
+	}
 
-	// 今日模型占比（按请求次数排序，同时统计 token 消耗）
+	// 今日模型占比（按请求次数排序，同时统计 token 消耗）：来自今日汇总键 models（含 per-model requests）
 	const modelsToday = [];
-	if (todayEntry.models) {
-		for (const [model, m] of Object.entries(todayEntry.models)) {
-			modelsToday.push({ model, requests: m.requests || 0, tokens: (m.input || 0) + (m.output || 0) });
-		}
+	const todayModels = todayEntry.models || {};
+	for (const [model, m] of Object.entries(todayModels)) {
+		modelsToday.push({ model, requests: m.requests || 0, tokens: (m.input || 0) + (m.output || 0) });
 	}
 	if (modelsToday.length === 0 && usageTodayRequests > 0) {
 		modelsToday.push({ model: '_unknown', requests: usageTodayRequests, tokens: usageToday });
 	}
 	modelsToday.sort((a, b) => b.requests - a.requests);
 
-	// 7 日走势
-	const history = dailyAgg
+	// 7 日走势（按日期升序）
+	const history = historyDates
 		.slice()
-		.sort((a, b) => a.date < b.date ? -1 : 1)
-		.map(e => ({ date: e.date, neurons: (e.input || 0) + (e.output || 0), requests: e.requests || 0 }));
+		.sort((a, b) => a < b ? -1 : 1)
+		.map(date => {
+			const e = historyByDate[date] || { input: 0, output: 0, requests: 0 };
+			return { date, neurons: (e.input || 0) + (e.output || 0), requests: e.requests || 0 };
+		});
 
-	// 本月累计：list evt_<YYYY-MM-DD>_* 跨日聚合（本月所有天）
+	// 本月累计：读 tokens_monthly_ 汇总键（best-effort，并发覆盖可能略偏低，但够快够近）
 	const now = new Date();
-	const monthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
 	let monthInput = 0, monthOutput = 0, monthRequests = 0;
-	for (const e of dailyAgg) {
-		if (e.date.startsWith(monthPrefix)) {
-			monthInput += e.input || 0;
-			monthOutput += e.output || 0;
-			monthRequests += e.requests || 0;
-		}
-	}
-	// 本月可能有天数 >7 天的部分未在 dailyAgg 内，补查 tokens_monthly_ 汇总键（best-effort，可能偏低）
 	try {
-		const monthKey = `tokens_monthly_${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, '0')}`;
+		const monthKey = 	okens_monthly__\;
 		const raw = await env.KV.get(monthKey);
 		if (raw) {
 			const m = JSON.parse(raw);
-			// 若汇总键值更大（含 8 天前的数据），用汇总键；否则用聚合值
-			const sumFromMonthly = (m.input || 0) + (m.output || 0);
-			const sumFromAgg = monthInput + monthOutput;
-			if (sumFromMonthly > sumFromAgg) {
-				monthInput = m.input || 0;
-				monthOutput = m.output || 0;
-				monthRequests = m.requests || 0;
-			}
+			monthInput = m.input || 0;
+			monthOutput = m.output || 0;
+			monthRequests = m.requests || 0;
 		}
 	} catch (e) { /* 容错 */ }
 	const usageThisMonth = monthInput + monthOutput;
 
-	const result = {
+	return {
 		accounts: [{
 			id: 'binding-single',
 			name: 'AI Binding (Single Account)',
@@ -906,7 +875,6 @@ async function buildLocalUsageFallback(env) {
 		}],
 		unit: 'Tokens'
 	};
-	return result;
 }
 
 // 用量限额检查（简化版：从 token 统计 KV 获取用量）
@@ -6244,8 +6212,10 @@ async function handleAdminPage(request, env, ctx) {
 				const monthUsage = (typeof account.usageThisMonth === 'number' && account.usageThisMonth > 0)
 					? account.usageThisMonth
 					: (account.history || []).filter(h => h.date && h.date.startsWith(monthPrefix)).reduce((sum, h) => sum + (h.neurons || 0), 0);
-				// 本月请求次数：当月历史 requests 汇总
-				const monthRequests = (account.history || []).filter(h => h.date && h.date.startsWith(monthPrefix)).reduce((sum, h) => sum + (h.requests || 0), 0);
+				// 本月请求次数：先用后端整月累计，没有则从当月 history 提取
+				const monthRequests = (typeof account.usageThisMonthRequests === 'number' && account.usageThisMonthRequests > 0)
+					? account.usageThisMonthRequests
+					: (account.history || []).filter(h => h.date && h.date.startsWith(monthPrefix)).reduce((sum, h) => sum + (h.requests || 0), 0);
 				// 模型数量
 				const modelCount = (account.modelsToday || []).length;
 				// 7天请求次数
