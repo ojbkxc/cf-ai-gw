@@ -51,3 +51,7 @@ new_classes = ["UsageCounter"]
 # Workers AI 绑定（模式 A：单账号，内部 RPC 调用）
 [ai]
 binding = "AI"
+
+# 定时任务：每天清旧日期 UsageCounter DO storage（保留 10 天，看 7 日走势够用）
+[triggers]
+crons = ["0 0 * * *"]

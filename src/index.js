@@ -313,6 +313,11 @@ export class ApiKeyCounter {
 			const { max, seed } = await request.json().catch(() => ({}));
 			return this._checkAndIncrement(max || 0, seed || 0);
 		}
+		if (request.method === 'DELETE') {
+			await this.state.storage.delete('used');
+			this._used = undefined;
+			return new Response('{"ok":true}', { headers: { 'Content-Type': 'application/json' } });
+		}
 		// GET 读当前计数；DO 尚无持久记录时用外部传入的 seed（KV 存量 usedCalls）兜底展示
 		const seed = parseInt(url.searchParams.get('seed') || '0', 10) || 0;
 		return new Response(JSON.stringify({ used: await this._getUsed(seed) }));
@@ -384,6 +389,11 @@ export class UsageCounter {
 			await this.state.storage.put('data', this._data);
 			return new Response(JSON.stringify(this._data));
 		}
+		if (request.method === 'DELETE') {
+			await this.state.storage.delete('data');
+			this._data = { requests: 0, input: 0, output: 0 };
+			return new Response('{"ok":true}', { headers: { 'Content-Type': 'application/json' } });
+		}
 		return new Response(JSON.stringify(this._data));
 	}
 
@@ -417,7 +427,28 @@ async function doReadUsageToday(env) {
 	} catch (_) { return null; }
 }
 
+// scheduled 清旧日期 UsageCounter DO：删除 cutoff 天前的 usage:<date> storage
+// 看 7 日走势需要最近 7 天数据，再留 3 天余量 → 默认保留 10 天
+const USAGE_DO_RETAIN_DAYS = 10;
+async function cleanupOldUsageDOs(env) {
+	const now = new Date();
+	let cleaned = 0;
+	for (let i = USAGE_DO_RETAIN_DAYS; i < USAGE_DO_RETAIN_DAYS + 30; i++) {
+		const d = new Date(now.getTime() - i * 86400000);
+		const dateStr = d.toISOString().split('T')[0];
+		try {
+			await getUsageCounter(env, dateStr).fetch('https://do.local/usage/cleanup', { method: 'DELETE' });
+			cleaned++;
+		} catch (_) {}
+	}
+	return cleaned;
+}
+
 export default {
+	async scheduled(event, env, ctx) {
+		ctx.waitUntil(cleanupOldUsageDOs(env).catch(() => {}));
+	},
+
 	async fetch(request, env, ctx) {
 		try {
 			// 1. 检查是否绑定了 KV 存储
@@ -877,33 +908,9 @@ async function buildLocalUsageFallback(env) {
 	};
 }
 
-// 用量限额检查（简化版：从 token 统计 KV 获取用量）
-// 聚合指定日期的 evt_ 事件键，返回 {requests, tokens, models:{m:{requests,tokens}}}
-async function aggregateEventsByDate(env, dateStr) {
-	const agg = { requests: 0, tokens: 0, models: {} };
-	try {
-		let cursor;
-		do {
-			const list = await env.KV.list({ prefix: `evt_${dateStr}_`, cursor });
-			for (const k of list.keys) {
-				try {
-					const raw = await env.KV.get(k.name);
-					if (!raw) continue;
-					const evt = JSON.parse(raw);
-					agg.requests += 1;
-					agg.tokens += (evt.i || 0) + (evt.o || 0);
-					if (evt.m) {
-						agg.models[evt.m] = agg.models[evt.m] || { requests: 0, tokens: 0 };
-						agg.models[evt.m].requests += 1;
-						agg.models[evt.m].tokens += (evt.i || 0) + (evt.o || 0);
-					}
-				} catch (_) {}
-			}
-			cursor = list.list_complete ? null : list.cursor;
-		} while (cursor);
-	} catch (e) { /* 容错 */ }
-	return agg;
-}
+// 注：原 aggregateEventsByDate（KV.list + 逐键 get evt_ 事件键）已移除，
+// 限额拦截改走 DO + tokens_daily_/tokens_monthly_ 汇总键快速路径（见 checkUsageLimit），
+// 避免 evt_ 键超过 ~900 条时触发 Workers 单请求子请求上限导致 5xx。
 
 // 用量限额检查：两维度（请求次数 + 并发）× 日/月 + 按模型请求次数
 // Token 用量仅做看板统计，不参与限额拦截
@@ -916,14 +923,27 @@ async function checkUsageLimit(env, model = null) {
 		return { allowed: true, limits };
 	}
 
-	const todayStr = getTodayStr();
-	const todayAgg = await aggregateEventsByDate(env, todayStr);
-
-	// 本月累计（聚合本月所有天的 evt_ 键；为性能只查今日 + tokens_monthly_ 汇总键兜底）
-	const monthlyKey = getTokenMonthlyKey();
-	let monthRequests = todayAgg.requests;
+	// 今日请求数：DO 强一致 + tokens_daily_ 汇总键兜底（取较大者，避免 DO 冷启动偏低）
+	// per-model 占比仅来自 tokens_daily_.models（best-effort，并发覆盖可能略偏低）
+	let todayRequests = 0;
+	let todayModels = {};
 	try {
-		const raw = await env.KV.get(monthlyKey);
+		const dailyRaw = await env.KV.get(getTokenDailyKey());
+		if (dailyRaw) {
+			const d = JSON.parse(dailyRaw);
+			todayRequests = d.requests || 0;
+			todayModels = d.models || {};
+		}
+	} catch (_) {}
+	const doToday = await doReadUsageToday(env);
+	if (doToday) {
+		todayRequests = Math.max(todayRequests, doToday.requests || 0);
+	}
+
+	// 本月累计（tokens_monthly_ 汇总键兜底，取较大者）
+	let monthRequests = todayRequests;
+	try {
+		const raw = await env.KV.get(getTokenMonthlyKey());
 		if (raw) {
 			const m = JSON.parse(raw);
 			if ((m.requests || 0) > monthRequests) monthRequests = m.requests || 0;
@@ -931,8 +951,8 @@ async function checkUsageLimit(env, model = null) {
 	} catch (_) {}
 
 	// 全局日请求数
-	if (limits.dailyRequestLimit > 0 && todayAgg.requests >= limits.dailyRequestLimit * threshold) {
-		return { allowed: false, reason: `Daily request limit reached (${todayAgg.requests}/${limits.dailyRequestLimit})`, limits };
+	if (limits.dailyRequestLimit > 0 && todayRequests >= limits.dailyRequestLimit * threshold) {
+		return { allowed: false, reason: `Daily request limit reached (${todayRequests}/${limits.dailyRequestLimit})`, limits };
 	}
 	// 全局月请求数
 	if (limits.monthlyRequestLimit > 0 && monthRequests >= limits.monthlyRequestLimit * threshold) {
@@ -942,13 +962,13 @@ async function checkUsageLimit(env, model = null) {
 	// 按模型日请求数限额
 	if (model && limits.perModel && limits.perModel[model]) {
 		const pm = limits.perModel[model];
-		const modelAgg = todayAgg.models[model] || { requests: 0 };
+		const modelAgg = todayModels[model] || { requests: 0 };
 		if (pm.requestLimit > 0 && modelAgg.requests >= pm.requestLimit * threshold) {
 			return { allowed: false, reason: `Model "${model}" daily request limit reached (${modelAgg.requests}/${pm.requestLimit})`, limits };
 		}
 	}
 
-	return { allowed: true, limits, todayAgg, monthRequests };
+	return { allowed: true, limits, todayRequests, monthRequests };
 }
 
 // ===== P0: Workers AI 错误码映射 + friendlyError =====
@@ -3801,6 +3821,8 @@ async function handleDashboardApi(request, env, ctx) {
 		const keys = await getApiKeys(env);
 		const filtered = keys.filter(k => k.id !== id);
 		await saveApiKeys(env, filtered);
+		// 同步清掉该 key 的 KEY_COUNTER DO 计数，避免旧计数永久残留
+		try { await getKeyCounter(env, id).fetch('https://do.local/counter/' + encodeURIComponent(id), { method: 'DELETE' }); } catch (_) {}
 		return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
 	}
 
@@ -5826,28 +5848,17 @@ async function handleAdminPage(request, env, ctx) {
 								<div class="stat-value" id="stat-total-neurons" style="font-size: 42px;">0</div>
 								<span id="stat-total-unit" style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Tokens</span>
 							</div>
+							<div style="display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 2px; font-size: 11px; color: var(--text-muted); white-space: nowrap;">
+								<span>↑上传 <span id="stat-tokens-input">0</span></span>
+								<span>↓下载 <span id="stat-tokens-output">0</span></span>
+								<span id="stat-tokens-speed">0 tok/s</span>
+							</div>
+							<div class="stat-desc" id="stat-tokens-reasoning" style="font-size: 10px; opacity: 0.65; margin-top: 2px;">推理 0 / 缓存读 0</div>
 							<div class="stat-desc" id="stat-neurons-desc" style="margin-top: auto; display: flex; justify-content: space-between; align-items: center;">
 								<span>0 / <span id="stat-neurons-limit">不限</span> Tokens</span>
 								<span id="stat-neurons-pct" style="font-weight: 600; color: var(--primary-color);">0%</span>
 							</div>
 							<div class="stat-desc" id="stat-cost-saving" style="font-size: 11px; color: #22c55e;">$0.00 节省成本</div>
-						</div>
-
-						<div class="stat-card">
-							<div class="stat-title-row" style="display: flex; align-items: center; justify-content: space-between;">
-								<div class="stat-title">Token 统计</div>
-								<div class="stat-icon-badge" style="background: linear-gradient(135deg, rgba(59, 130, 246, 0.15), rgba(16, 185, 129, 0.15)); color: var(--accent-color);">
-									<svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
-								</div>
-							</div>
-							<div style="display: flex; align-items: baseline; gap: 4px;">
-								<div class="stat-value" id="stat-tokens-total" style="font-size: 36px;">0</div>
-								<span style="font-size: 12px; color: var(--text-muted); font-weight: 500;">tokens</span>
-							</div>
-							<div class="stat-desc" style="margin-top: 4px; font-size: 11px; color: var(--text-muted);">↑上传 <span id="stat-tokens-input">0</span></div>
-							<div class="stat-desc" style="font-size: 11px; color: var(--text-muted);">↓下载 <span id="stat-tokens-output">0</span></div>
-							<div class="stat-desc" id="stat-tokens-speed" style="font-size: 11px; color: var(--text-muted);">0 tok/s</div>
-							<div class="stat-desc" id="stat-tokens-reasoning" style="margin-top: auto; font-size: 10px; opacity: 0.65;">推理 0 / 缓存读 0</div>
 						</div>
 
 						<div class="stat-card">
@@ -6361,8 +6372,6 @@ async function handleAdminPage(request, env, ctx) {
 				const res = await fetch("/api/tokens/today");
 				if (!res.ok) return;
 				const data = await res.json();
-				const totalEl = document.getElementById("stat-tokens-total");
-				if (totalEl) totalEl.innerText = data.totalFmt || "0";
 				const inputEl = document.getElementById("stat-tokens-input");
 				if (inputEl) inputEl.innerText = data.inputFmt || "0";
 				const outputEl = document.getElementById("stat-tokens-output");
