@@ -5111,7 +5111,7 @@ async function handleLandingPage(request, env, ctx) {
 					return;
 				}
 				const callsLine = data.maxCalls && data.maxCalls > 0
-					? '剩余次数: <strong>' + (data.remainingCalls ?? 0) + ' / ' + data.maxCalls + '</strong>（已用 ' + (data.usedCalls || 0) + '）'
+					? '剩余次数: <strong>' + (data.remainingCalls ?? 0) + ' / ' + data.maxCalls + '</strong>'
 					: '调用次数: <strong>不限</strong>';
 				let expiryHtml;
 				if (data.expiresAt) {
@@ -5144,7 +5144,7 @@ async function handleLandingPage(request, env, ctx) {
 				}
 				resultEl.innerHTML = '<div style="padding: 14px 16px; border-radius: 10px; background: rgba(34,197,94,0.08); border: 1px solid rgba(34,197,94,0.2); font-size: 13px; line-height: 1.8;">' +
 					'<div style="color: var(--success-color); font-weight: 600; margin-bottom: 6px;">✓ 密钥有效</div>' +
-					'<div style="color: var(--text-muted);">描述: ' + escapeHtml(data.name || '') + '</div>' +
+					'<div style="color: var(--text-muted);">名称: ' + escapeHtml(data.name || '') + '</div>' +
 					'<div style="color: var(--text-muted);">' + expiryHtml + '</div>' +
 					'<div style="color: var(--text-muted);">' + callsLine + '</div>' +
 					'</div>';
@@ -5988,7 +5988,7 @@ async function handleAdminPage(request, env, ctx) {
 						<table>
 							<thead>
 								<tr>
-									<th>密钥描述</th>
+									<th>名称</th>
 									<th>API Key</th>
 									<th>有效期</th>
 									<th>剩余次数</th>
@@ -6140,8 +6140,8 @@ async function handleAdminPage(request, env, ctx) {
 			</div>
 			<div id="key-modal-form">
 				<div class="form-group" style="margin-bottom: 16px;">
-					<label for="key-name">密钥描述/使用客户端 (如: Cursor / NextChat)</label>
-					<input type="text" id="key-name" placeholder="请输入描述名" style="width: 100%;">
+					<label for="key-name">名称 (如: Cursor / NextChat)</label>
+					<input type="text" id="key-name" placeholder="请输入名称" style="width: 100%;">
 				</div>
 				<div class="form-group" style="margin-bottom: 16px;" id="key-val-group">
 					<label for="key-val">API 密钥值 (可选，为空则随机生成 sk-wa-...)</label>
@@ -6939,7 +6939,7 @@ async function handleAdminPage(request, env, ctx) {
 			const expiresLocal = document.getElementById('key-expires-at').value;
 			const maxCalls = document.getElementById('key-max-calls').value;
 			if (!name) {
-				showToast('请输入描述名称！', 'warning');
+				showToast('请输入名称！', 'warning');
 				return;
 			}
 			// datetime-local → ISO；勾选永久或日期为空/无效则视为不限
