@@ -6414,6 +6414,11 @@ async function handleAdminPage(request, env, ctx) {
 				originalBtnText = btn.innerHTML;
 				btn.disabled = true;
 				btn.innerHTML = '<span class="spinner"></span> 刷新中...';
+				// 乐观恢复：1 秒后无论请求是否完成都恢复按钮，让用户可再次点击
+				setTimeout(() => {
+					btn.disabled = false;
+					btn.innerHTML = originalBtnText;
+				}, 1000);
 			}
 
 			isRefreshingUsage = true;
