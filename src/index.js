@@ -810,15 +810,8 @@ async function getUsageLimits(env) {
 	};
 }
 
-function getMonthlyUsageKey() {
-	const now = new Date();
-	return `usage_monthly_${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
-}
-
-async function getMonthlyUsage(env) {
-	const raw = await env.KV.get(getMonthlyUsageKey());
-	return raw ? parseInt(raw, 10) : 0;
-}
+// 注：原 getMonthlyUsage（读 usage_monthly_ 键）已移除——该键无人写入，是误导性死代码。
+// 月度用量统一走 buildLocalUsageFallback 的 tokens_monthly_ 汇总键。
 
 // ===== 用量数据源（模式A）：DO 今日 + tokens_daily_/tokens_monthly_ 汇总键历史/本月 =====
 // 今日请求/次数/用量走 UsageCounter DO（强一致实时）；7日历史、本月、今日模型占比走汇总键（单键 get 秒回）。
@@ -1537,7 +1530,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 		accumulateFromUsage(env, ctx, null, requestStartTime, shortModelName(cfModel));
 		// For Binding streaming, we get a ReadableStream directly. Wrap it in passthroughStream for SSE processing.
 		return streamResponse(
-			passthroughStream(result.stream, model, pathname === '/v1/completions', env, ctx, requestStartTime, false),
+			passthroughStream(result.stream, model, pathname === '/v1/completions', env, ctx, requestStartTime, false, cfModel),
 			fallbackWarning
 		);
 	}
@@ -1879,7 +1872,7 @@ async function handleMessages(request, env, ctx) {
 	if (stream) {
 		accumulateFromUsage(env, ctx, null, requestStartTime, shortModelName(cfModel));
 		return streamResponse(
-			anthropicStreamTransform(result.stream, model, anthropicBody.messages, env, ctx, requestStartTime, false),
+			anthropicStreamTransform(result.stream, model, anthropicBody.messages, env, ctx, requestStartTime, false, cfModel),
 			fallbackWarning
 		);
 	}
@@ -1889,7 +1882,7 @@ async function handleMessages(request, env, ctx) {
 }
 
 // ===== Anthropic SSE 流式转换：OpenAI SSE → Anthropic SSE =====
-function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env, ctx, requestStartTime, tokenAlreadyCounted) {
+function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env, ctx, requestStartTime, tokenAlreadyCounted, cfModel = null) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
@@ -1942,8 +1935,9 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 						if (!finalEventSent) {
 							sendFinalEvent(controller);
 						}
-						controller.close();
 						if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+						if (cfModel) releaseModelSlot(cfModel);
+						try { controller.close(); } catch (_) { }
 						break;
 					}
 
@@ -1967,11 +1961,13 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 					}
 				} catch (e2) { console.error('anthropicStreamTransform secondary error:', e2?.message || e2); }
 				if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+				if (cfModel) releaseModelSlot(cfModel);
 				try { controller.close(); } catch (_) { }
 			}
 		},
 		cancel() {
 			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+			if (cfModel) releaseModelSlot(cfModel);
 			return reader.cancel();
 		},
 	});
@@ -2488,7 +2484,7 @@ async function handleResponses(request, env, ctx) {
 	if (stream) {
 		accumulateFromUsage(env, ctx, null, requestStartTime, shortModelName(cfModel));
 		return streamResponse(
-			responsesStreamTransform(result.stream, model, env, ctx, requestStartTime, false),
+			responsesStreamTransform(result.stream, model, env, ctx, requestStartTime, false, cfModel),
 			fallbackWarning
 		);
 	}
@@ -2507,7 +2503,7 @@ async function handleResponses(request, env, ctx) {
 // ===== Responses SSE 流式转换：OpenAI Chat SSE → Responses SSE =====
 // 事件序列：response.created → output_item/content_part/output_text/reasoning_summary/function_call_arguments
 // 系列增量 → flush 所有未闭合 item → response.completed（含完整 output 数组 + usage）
-function responsesStreamTransform(upstreamBody, originalModel, env, ctx, requestStartTime, tokenAlreadyCounted) {
+function responsesStreamTransform(upstreamBody, originalModel, env, ctx, requestStartTime, tokenAlreadyCounted, cfModel = null) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
@@ -2576,8 +2572,9 @@ function responsesStreamTransform(upstreamBody, originalModel, env, ctx, request
 						if (!finalEventSent) {
 							sendFinalEvent(controller);
 						}
-						controller.close();
 						if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+						if (cfModel) releaseModelSlot(cfModel);
+						try { controller.close(); } catch (_) { }
 						break;
 					}
 
@@ -2601,11 +2598,13 @@ function responsesStreamTransform(upstreamBody, originalModel, env, ctx, request
 					}
 				} catch (e2) { console.error('responsesStreamTransform secondary error:', e2?.message || e2); }
 				if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+				if (cfModel) releaseModelSlot(cfModel);
 				try { controller.close(); } catch (_) { }
 			}
 		},
 		cancel() {
 			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+			if (cfModel) releaseModelSlot(cfModel);
 			return reader.cancel();
 		},
 	});
@@ -3330,7 +3329,7 @@ async function handleCountTokens(request, env) {
 }
 
 // ===== passthroughStream - 透传 SSE 流 =====
-function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requestStartTime, tokenAlreadyCounted) {
+function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requestStartTime, tokenAlreadyCounted, cfModel = null) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
@@ -3388,22 +3387,23 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 						}
 						ensureFinishReason(controller, 'stop');
 						controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-						controller.close();
-					if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-					// 流式 request 已在 handler 入口计过，这里只在有 usage 时补 token
-					if (!tokenAlreadyCounted && streamUsage) {
-						accumulateTokens(env, ctx, {
-							input: streamUsage.prompt_tokens || 0,
-							output: streamUsage.completion_tokens || 0,
-							reasoning: streamUsage.reasoning_tokens || 0,
-							cacheRead: (streamUsage.prompt_tokens_details?.cached_tokens ?? streamUsage.cache_read_tokens ?? 0),
-							cacheWrite: streamUsage.cache_write_tokens || 0,
-							durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
-							model,
-							countRequest: false,
-							writeEvent: false,
-						});
-					}
+						// 流式 request 已在 handler 入口计过，这里只在有 usage 时补 token
+						if (!tokenAlreadyCounted && streamUsage) {
+							accumulateTokens(env, ctx, {
+								input: streamUsage.prompt_tokens || 0,
+								output: streamUsage.completion_tokens || 0,
+								reasoning: streamUsage.reasoning_tokens || 0,
+								cacheRead: (streamUsage.prompt_tokens_details?.cached_tokens ?? streamUsage.cache_read_tokens ?? 0),
+								cacheWrite: streamUsage.cache_write_tokens || 0,
+								durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
+								model,
+								countRequest: false,
+								writeEvent: false,
+							});
+						}
+						if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+						if (cfModel) releaseModelSlot(cfModel);
+						try { controller.close(); } catch (_) { }
 						break;
 					}
 
@@ -3425,11 +3425,13 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 					controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 				} catch (e2) { console.error('passthroughStream secondary error:', e2?.message || e2); }
 				if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+				if (cfModel) releaseModelSlot(cfModel);
 				try { controller.close(); } catch (_) { }
 			}
 		},
 		cancel() {
 			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+			if (cfModel) releaseModelSlot(cfModel);
 			return reader.cancel();
 		},
 	});
@@ -3617,7 +3619,6 @@ async function handleDashboardApi(request, env, ctx) {
 
 		{
 			const limits = await getUsageLimits(env);
-			const monthlyUsage = await getMonthlyUsage(env);
 
 			// 模式A：用量直接来自本地 KV 聚合（evt_* 事件键），实时读取，无需缓存、也无需查询 CF Analytics GraphQL
 			const fallback = await buildLocalUsageFallback(env);
@@ -3633,7 +3634,7 @@ async function handleDashboardApi(request, env, ctx) {
 				modelsToday: formattedModelsToday,
 				dailyUsage: a.usageToday,
 				dailyLimit: limits.dailyLimit,
-				monthlyUsage: a.usageThisMonth || monthlyUsage,
+				monthlyUsage: a.usageThisMonth,
 				monthlyLimit: limits.monthlyLimit,
 				threshold: limits.threshold,
 				dailyRequests: a.usageTodayRequests,
@@ -3678,14 +3679,13 @@ async function handleDashboardApi(request, env, ctx) {
 	// 账号用量（模式A：实时聚合本地 KV 的 evt_* 事件键）
 	if (url.pathname === '/api/accounts/usage' && method === 'GET') {
 		const limits = await getUsageLimits(env);
-		const monthlyUsage = await getMonthlyUsage(env);
 
 		// 模式A：用量直接来自本地 KV 聚合（evt_* 事件键），实时读取，无需缓存、也无需查询 CF Analytics GraphQL
 		const fallback = await buildLocalUsageFallback(env);
 		const dailyUsage = fallback.accounts[0].usageToday;
 		const dailyRequests = fallback.accounts[0].usageTodayRequests;
 		const monthlyRequests = fallback.accounts[0].usageThisMonthRequests || 0;
-		const fallbackMonthlyUsage = fallback.accounts[0].usageThisMonth || monthlyUsage;
+		const fallbackMonthlyUsage = fallback.accounts[0].usageThisMonth;
 		return new Response(JSON.stringify({
 			accounts: fallback.accounts,
 			limits: { dailyUsage, dailyRequests, dailyLimit: limits.dailyLimit, monthlyUsage: fallbackMonthlyUsage, monthlyRequests, monthlyLimit: limits.monthlyLimit, threshold: limits.threshold },
