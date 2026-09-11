@@ -3604,7 +3604,7 @@ async function handleDashboardApi(request, env, ctx) {
 			const a = fallback.accounts[0];
 			const formattedModelsToday = (a.modelsToday || []).map(m => ({ model: m.model, requests: m.requests, tokens: m.tokens }));
 			const summary = {
-				totalNeuronsToday: a.usageToday,
+				totalTokensToday: a.usageToday,
 				totalRequestsToday: a.usageTodayRequests,
 				totalRequestsMonth: a.usageThisMonthRequests || 0,
 				totalAccounts: 1,
@@ -4763,16 +4763,13 @@ async function handleLandingPage(request, env, ctx) {
 				<div>
 					<div class="stat-title" style="margin-bottom: 10px;">今日用量汇总</div>
 					<div style="display: flex; align-items: baseline; gap: 4px;">
-						<div class="stat-value" id="public-neurons" style="font-size: 42px; background: var(--primary-gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 800; display: inline-block;">0</div>
-						<span id="public-unit-label" style="font-size: 14px; color: var(--text-muted); font-weight: 500; font-family: 'Outfit', sans-serif;">Neurons</span>
+						<div class="stat-value" id="public-tokens" style="font-size: 42px; background: var(--primary-gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 800; display: inline-block;">0</div>
+						<span id="public-unit-label" style="font-size: 14px; color: var(--text-muted); font-weight: 500; font-family: 'Outfit', sans-serif;">Tokens</span>
 					</div>
 				</div>
 
 				<div style="margin-top: 16px;">
-					<div style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">
-						<span id="public-limit-desc">今日累计用量 0</span>
-					</div>
-					<div style="font-size: 12px; color: var(--text-muted); margin-top: 6px;">
+					<div style="font-size: 12px; color: var(--text-muted);">
 						<span id="public-requests-desc">今日请求 0 次</span>
 					</div>
 				</div>
@@ -4941,16 +4938,14 @@ async function handleLandingPage(request, env, ctx) {
 
 		function renderPublicSummary(data) {
 			lastPublicSummaryData = data;
-			const roundedNeurons = Math.ceil(data.totalNeuronsToday);
-			const unit = data.unit || 'Neurons';
+			const roundedTokens = Math.ceil(data.totalTokensToday);
+			const unit = data.unit || 'Tokens';
 
 			// 触发数字滚动的动效
-			animateNumber('public-neurons', roundedNeurons, 1000);
+			animateNumber('public-tokens', roundedTokens, 1000);
 
 			const unitLabel = document.getElementById('public-unit-label');
 			if (unitLabel) unitLabel.innerText = unit;
-			document.getElementById('public-limit-desc').innerText = '今日累计用量: ' + fmtTok(roundedNeurons) + ' ' + unit;
-			document.getElementById('public-percent-desc') && (document.getElementById('public-percent-desc').style.display = 'none');
 			document.getElementById('public-requests-desc').innerText = '今日请求: ' + fmtWan(data.totalRequestsToday || 0) + ' 次';
 
 			const wrapper = document.getElementById('public-chart-wrapper');
@@ -5860,7 +5855,7 @@ async function handleAdminPage(request, env, ctx) {
 					<!-- Charts -->
 					<div class="charts-grid" style="margin-top: 24px;">
 						<div class="section-card">
-							<div class="section-title" id="history-chart-title">过去 7 日消耗走势 (Neurons)</div>
+							<div class="section-title" id="history-chart-title">过去 7 日消耗走势 (Tokens)</div>
 							<div class="chart-container">
 								<canvas id="historyChart"></canvas>
 							</div>
@@ -6169,7 +6164,7 @@ async function handleAdminPage(request, env, ctx) {
 				data = { accounts: data, limits: { dailyUsage: 0, dailyRequests: 0, dailyLimit: 10000, monthlyUsage: 0, monthlyRequests: 0, monthlyLimit: 100000, threshold: 0.9 } };
 			}
 			const { accounts, limits } = data;
-			const unit = data.unit || 'Neurons';
+			const unit = data.unit || 'Tokens';
 			window.__usageUnit = unit;
 
 			let totalUsageToday = 0;
@@ -6335,7 +6330,7 @@ async function handleAdminPage(request, env, ctx) {
 
 		function updateLimitCards(limits) {
 			const { monthlyRequests = 0 } = limits || {};
-			const unit = window.__usageUnit || 'Neurons';
+			const unit = window.__usageUnit || 'Tokens';
 
 			// 本月用量（仅展示，无限额限制）
 			document.getElementById('stat-monthly-usage').innerText = fmtTok(Math.ceil(limits?.monthlyUsage || 0));
@@ -6415,13 +6410,7 @@ async function handleAdminPage(request, env, ctx) {
 			let originalBtnText = '';
 			if (btn) {
 				originalBtnText = btn.innerHTML;
-				btn.disabled = true;
 				btn.innerHTML = '<span class="spinner"></span> 刷新中...';
-				// 乐观恢复：1 秒后无论请求是否完成都恢复按钮，让用户可再次点击
-				setTimeout(() => {
-					btn.disabled = false;
-					btn.innerHTML = originalBtnText;
-				}, 1000);
 			}
 
 			isRefreshingUsage = true;
@@ -6466,7 +6455,6 @@ async function handleAdminPage(request, env, ctx) {
 			} finally {
 				isRefreshingUsage = false;
 				if (btn) {
-					btn.disabled = false;
 					btn.innerHTML = originalBtnText;
 				}
 			}
@@ -6611,7 +6599,7 @@ async function handleAdminPage(request, env, ctx) {
 			const isLight = document.documentElement.getAttribute('data-theme') === 'light';
 			const gridColor = isLight ? 'rgba(0, 0, 0, 0.05)' : 'rgba(255, 255, 255, 0.05)';
 			const textColor = isLight ? '#64748b' : '#94a3b8';
-			const unit = window.__usageUnit || 'Neurons';
+			const unit = window.__usageUnit || 'Tokens';
 			const ctx = document.getElementById('historyChart').getContext('2d');
 			const gradient = ctx.createLinearGradient(0, 0, 0, 300);
 			gradient.addColorStop(0, 'rgba(168, 85, 247, 0.35)');
