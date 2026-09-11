@@ -126,6 +126,15 @@ grep "if (releaseSlot) releaseSlot();" → ≥ 9 处(3 transform × 3 路径)
 
 ## 6. 变更日志(最新在上)
 
+- **2026-09-11(首页新增接入信息卡片)**:用户要求三种接入格式在首页公开展示(接在
+  API 密钥查询下方)。公开页新增「接入信息」section-card,复用 admin 同款
+  access-endpoint 卡片三枚(OpenAI /v1/chat/completions、Responses /v1/responses、
+  Anthropic /v1/messages),点击复制。三个实现点:① 公开页 style 块原本没有
+  access-endpoint-* 样式(admin 专属),已复制适配(minmax 240px 适配窄屏);②
+  id 用 home-*-endpoint-url 避免与 admin 冲突,window.onload 回填 origin+path;
+  ③ 公开页没有 copyEndpointUrl(原本只在 admin script 块),已补独立定义
+  (内部走 SHARED_JS 的 copyText)。node --check OK。commit 4d0fc29,未部署验证。
+  改动文件:src/index.js。
 - **2026-09-11(「确定时间」按钮恢复)**:用户实测浏览器 datetime 弹框**只有清除按钮、
   没有确认按钮**(8d8add0 移除外置按钮的判断错误——弹框自带确认不成立,不同环境
   行为不一致)。恢复日期控件下方「确定时间」按钮:选完日期 onchange 只给即时提示
