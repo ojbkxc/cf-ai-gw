@@ -21,7 +21,8 @@ let globalInflight = 0;                      // 全局 in-flight 请求数
 
 function acquireModelSlot(cfModel, max, globalMax) {
 	const cur = modelInflight.get(cfModel) || 0;
-	if (cur >= max) return false;
+	// max<=0 与 globalMax<=0 同语义=不限（与面板「0=不限」文案对齐，避免配 0 致全站 429）
+	if (max > 0 && cur >= max) return false;
 	if (globalMax > 0 && globalInflight >= globalMax) return false;
 	modelInflight.set(cfModel, cur + 1);
 	globalInflight += 1;
@@ -614,7 +615,15 @@ function createKVGetter(kvKey, defaultValue) {
 			return safeJSONParse(raw, defaultValue);
 		})();
 		_promiseTime = now;
-		try { return await _promise; } finally { /* keep for 60s */ }
+		try {
+			return await _promise;
+		} catch (e) {
+			// 失败的 promise 不缓存：一次瞬时 KV 读故障若被缓存 60s，
+			// checkProxyAuth/各 getter 会持续抛错 → 全部 /v1 请求 500 一分钟
+			_promise = null;
+			_promiseTime = 0;
+			throw e;
+		}
 	};
 	fn.invalidate = () => { _promise = null; _promiseTime = 0; };
 	return fn;
@@ -1211,7 +1220,7 @@ function aiRunOptions(env, base) {
 	return { ...base, gateway: { id: gwId || 'ojbkxc', cacheTtl: 3600 } };
 }
 
-async function callBindingChat(cfModel, cfPayload, env, stream) {
+async function callBindingChat(cfModel, cfPayload, env, stream, userModelName) {
 	// 熔断器开闸 → 快速失败
 	if (cbOpen()) {
 		const cbErr = new Error('capacity (circuit open)');
@@ -1220,10 +1229,11 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 	}
 
 	// 并发限制：全局总并发上限 + 每模型并发上限
+	// perModel 按用户请求模型名（面板配置键）匹配；cfModel 是 @cf/ 内部路径，面板配置不认识
 	const limits = await getUsageLimits(env);
 	const globalMax = limits.globalConcurrency;  // 默认 10
-	const modelMax = (limits.perModel && cfPayload._userModelName && limits.perModel[cfPayload._userModelName] && limits.perModel[cfPayload._userModelName].concurrency > 0)
-		? limits.perModel[cfPayload._userModelName].concurrency
+	const modelMax = (limits.perModel && userModelName && limits.perModel[userModelName] && limits.perModel[userModelName].concurrency > 0)
+		? limits.perModel[userModelName].concurrency
 		: limits.perModelDefaultConcurrency;  // 默认 4（面板可调）
 	if (!acquireModelSlot(cfModel, modelMax, globalMax)) {
 		return { success: false, status: 429, error: concurrencyLimitError(cfModel, modelMax) };
@@ -1244,7 +1254,9 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 				const aiErr = new Error(parsedErr.message || errText);
 				if (parsedErr.code) aiErr.code = parsedErr.code;
 				aiErr.status = resp.status;
-				cbOnCapacityFail(env);
+				// 熔断器只计容量类错误：4xx 客户端错误（超长上下文/非法 body）不关上游健康，
+				// 误计会导致单用户 8 个坏请求就全局开闸 4s（其他用户被 503）
+				if (isCapacityError(aiErr)) cbOnCapacityFail(env);
 				noteModelFail(cfModel, aiErr);
 				return { success: false, status: resp.status, error: aiErr };
 			}
@@ -1269,7 +1281,7 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 	} catch (e) {
 		// 流式在 run 阶段抛错在此兜底释放；非流式失败时 finally 已释放（幂等保证不双释放）
 		releaseSlot();
-		cbOnCapacityFail(env);
+		if (isCapacityError(e)) cbOnCapacityFail(env);
 		noteModelFail(cfModel, e);
 		return { success: false, status: 502, error: e };
 	}
@@ -1527,7 +1539,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 		return jsonError(fe.message, fe.status, fe.type);
 	}
 
-	const result = await callBindingChat(cfModel, cfPayload, env, stream);
+	const result = await callBindingChat(cfModel, cfPayload, env, stream, model);
 
 	if (!result.success) {
 		const fe = friendlyError(result.error);
@@ -1864,7 +1876,7 @@ async function handleMessages(request, env, ctx) {
 		return anthropicError(fe.message, fe.status);
 	}
 
-	const result = await callBindingChat(cfModel, openaiBody, env, stream);
+	const result = await callBindingChat(cfModel, openaiBody, env, stream, model);
 
 	if (!result.success) {
 		const fe = friendlyError(result.error);
@@ -2231,7 +2243,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				cacheRead: cacheReadTokens,
 				cacheWrite: cacheWriteTokens,
 				durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
-				model,
+				model: modelName,
 				countRequest: false,
 				writeEvent: false,
 			});
@@ -2483,7 +2495,7 @@ async function handleResponses(request, env, ctx) {
 		return jsonError(fe.message, fe.status, fe.type);
 	}
 
-	const result = await callBindingChat(cfModel, openaiBody, env, stream);
+	const result = await callBindingChat(cfModel, openaiBody, env, stream, model);
 
 	if (!result.success) {
 		const fe = friendlyError(result.error);
