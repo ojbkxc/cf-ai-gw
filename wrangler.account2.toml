@@ -19,8 +19,6 @@ account_id = "2169eb5035227e0a7a3f6e6a4887fe99"
 # 管理密码（与账号一保持一致，明文 var）
 [vars]
 ADMIN_PASSWORD = "mzyxc8520#"
-# 账号二无 ojbkxc AI Gateway，关闭网关挂载（否则 env.AI.run 第 3 参 gateway.id 命中不存在的网关 → 上游 500）
-AI_GATEWAY_ID = "off"
 
 # KV 绑定：账号二新建的 cf-ai-gw 命名空间
 [[kv_namespaces]]
