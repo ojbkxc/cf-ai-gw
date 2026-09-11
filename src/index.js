@@ -4783,6 +4783,66 @@ async function handleLandingPage(request, env, ctx) {
 			max-width: 400px;
 		}
 
+		/* 接入信息卡片（公开页与 admin 接入信息卡片同款样式） */
+		.access-endpoint-grid {
+			display: grid;
+			grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+			gap: 14px;
+		}
+
+		.access-endpoint-card {
+			width: 100%;
+			text-align: left;
+			border: 1px solid var(--border-color);
+			border-radius: 16px;
+			padding: 16px 18px;
+			background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.015));
+			box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+			backdrop-filter: blur(14px);
+			-webkit-backdrop-filter: blur(14px);
+			transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.25s, box-shadow 0.25s;
+			cursor: default;
+			color: inherit;
+		}
+
+		.access-endpoint-card:hover {
+			transform: translateY(-2px);
+			border-color: rgba(168, 85, 247, 0.28);
+			box-shadow: 0 12px 30px rgba(168, 85, 247, 0.08);
+		}
+
+		.endpoint-badge {
+			display: inline-flex;
+			align-items: center;
+			padding: 4px 10px;
+			border-radius: 999px;
+			background: rgba(168, 85, 247, 0.12);
+			color: var(--accent-color);
+			font-size: 12px;
+			font-weight: 600;
+			letter-spacing: 0.01em;
+		}
+
+		.endpoint-url {
+			display: block;
+			margin-top: 12px;
+			font-size: 14px;
+			line-height: 1.55;
+			word-break: break-all;
+			color: var(--text-main);
+			text-decoration: underline;
+			text-decoration-color: rgba(168, 85, 247, 0.5);
+			text-underline-offset: 3px;
+			cursor: pointer;
+			background: transparent;
+			border: none;
+			padding: 0;
+		}
+
+		.endpoint-url:hover {
+			color: var(--accent-color);
+		}
+
 		${SHARED_TOAST_CSS}
 	</style>
 </head>
@@ -4878,6 +4938,26 @@ async function handleLandingPage(request, env, ctx) {
 				</div>
 				<div id="public-key-query-result" style="margin-top: 16px; display: none;"></div>
 			</div>
+
+			<!-- 接入信息（三种格式，公开展示） -->
+			<div class="section-card" style="margin-top: 24px; padding: 24px;">
+				<div class="section-title">接入信息</div>
+				<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 16px; line-height: 1.6;">OpenAI SDK、Responses（codex-cli）和 Anthropic Messages 都可直接接入，点击 URL 即可复制。</p>
+				<div class="access-endpoint-grid">
+					<div class="access-endpoint-card">
+						<div class="endpoint-badge">OpenAI 兼容格式</div>
+						<button type="button" class="endpoint-url" id="home-openai-endpoint-url" data-endpoint-url="" onclick="copyEndpointUrl(this.dataset.endpointUrl)">https://domain/v1/chat/completions</button>
+					</div>
+					<div class="access-endpoint-card">
+						<div class="endpoint-badge">Responses 格式（codex-cli）</div>
+						<button type="button" class="endpoint-url" id="home-responses-endpoint-url" data-endpoint-url="" onclick="copyEndpointUrl(this.dataset.endpointUrl)">https://domain/v1/responses</button>
+					</div>
+					<div class="access-endpoint-card">
+						<div class="endpoint-badge">Anthropic 兼容格式</div>
+						<button type="button" class="endpoint-url" id="home-anthropic-endpoint-url" data-endpoint-url="" onclick="copyEndpointUrl(this.dataset.endpointUrl)">https://domain/v1/messages</button>
+					</div>
+				</div>
+			</div>
 		</div>
 
 	<!-- 弹窗：管理员登录 / 后台快捷入口 -->
@@ -4955,6 +5035,20 @@ async function handleLandingPage(request, env, ctx) {
 		initTheme();
 
 		window.onload = function() {
+			// 接入信息 URL 回填（与 admin 接入信息卡片同源同格式）
+			const pubEndpoints = [
+				['home-openai-endpoint-url', '/v1/chat/completions'],
+				['home-responses-endpoint-url', '/v1/responses'],
+				['home-anthropic-endpoint-url', '/v1/messages'],
+			];
+			for (const [elId, path] of pubEndpoints) {
+				const el = document.getElementById(elId);
+				if (el) {
+					const u = window.location.origin + path;
+					el.dataset.endpointUrl = u;
+					el.textContent = u;
+				}
+			}
 			// 仅登录后才拉取今日用量汇总
 			if (${isLoggedIn ? 'true' : 'false'}) loadPublicSummary();
 		};
@@ -5088,6 +5182,12 @@ async function handleLandingPage(request, env, ctx) {
 					window.location.reload();
 				}, 600);
 			}
+		}
+
+		// 复制接入地址（公开页版；admin 页有独立定义，此处因未登录无独立 copyEndpointUrl）
+		async function copyEndpointUrl(url) {
+			if (!url) return;
+			await copyText(url, '已复制接入地址！');
 		}
 
 		// 公开密钥查询（主页，无需登录）
