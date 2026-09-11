@@ -5621,6 +5621,26 @@ async function handleAdminPage(request, env, ctx) {
 			box-shadow: none !important;
 		}
 
+		/* datetime-local：暗色主题下日历图标反色 + 禁用态视觉反馈 + 整框可点击弹选择器 */
+		input[type="datetime-local"] {
+			color-scheme: dark;
+		}
+		:root[data-theme="light"] input[type="datetime-local"] {
+			color-scheme: light;
+		}
+		input[type="datetime-local"]:disabled {
+			opacity: 0.5;
+			cursor: not-allowed;
+			filter: grayscale(1);
+		}
+		.picker-launcher {
+			position: relative;
+			cursor: pointer;
+		}
+		.picker-launcher input[type="datetime-local"] {
+			cursor: pointer;
+		}
+
 		.spinner {
 			display: inline-block;
 			width: 12px;
@@ -6170,7 +6190,9 @@ async function handleAdminPage(request, env, ctx) {
 							<input type="number" id="key-expires-days" min="0.01" step="0.01" placeholder="天数 (两位小数)" disabled oninput="onKeyDaysChange()" style="flex: 1;">
 							<span style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">天</span>
 						</div>
-						<input type="datetime-local" id="key-expires-at" disabled onchange="onKeyDateChange()" style="width: 100%;">
+						<div id="key-expires-launcher" class="picker-launcher" onclick="onKeyExpiresLauncherClick(event)" style="width: 100%;">
+							<input type="datetime-local" id="key-expires-at" disabled onchange="onKeyDateChange()" style="width: 100%;">
+						</div>
 						<div id="key-expires-hint" style="font-size: 11px; color: var(--text-muted); margin-top: 4px; display: none;"></div>
 					</div>
 					<div class="form-group" style="margin-bottom: 0;">
@@ -6913,6 +6935,20 @@ async function handleAdminPage(request, env, ctx) {
 			dateEl.value = toDatetimeLocalInput(target.toISOString());
 			const rounded = Math.round(days * 100) / 100;
 			setKeyExpiresHint('生效后至 ' + target.toLocaleString() + '（' + rounded + ' 天）');
+		}
+
+		// 点击整个日期显示框（含空白区域）→ 弹出浏览器自带的日期选择控件
+		// showPicker() 仅在用户手势中调用有效；旧浏览器降级为聚焦控件（点图标区也会弹）
+		function onKeyExpiresLauncherClick(evt) {
+			const dateEl = document.getElementById('key-expires-at');
+			if (dateEl.disabled) return;
+			if (evt.target === dateEl) return;  // 点控件本身交给浏览器默认行为
+			evt.preventDefault();
+			if (typeof dateEl.showPicker === 'function') {
+				try { dateEl.showPicker(); } catch (_) { dateEl.focus(); }
+			} else {
+				dateEl.focus();
+			}
 		}
 
 		// 日期控件 onchange：用户在日期选择弹框里点确认/选完触发，
