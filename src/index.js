@@ -6450,12 +6450,28 @@ async function handleAdminPage(request, env, ctx) {
 
 			try {
 				// 并行请求账号用量和 API 密钥数（均为实时 KV 聚合，无需 force 参数）
-				const [usageRes, keysRes] = await Promise.all([
-					apiFetch('/api/accounts/usage'),
-					apiFetch('/api/keys')
-				]);
-				const data = await usageRes.json();
-				const keys = await keysRes.json();
+				// 加超时中止：防止后端聚合挂起导致请求永不返回、按钮被永久锁死
+				const timeoutMs = 20000;
+				const ac = new AbortController();
+				const timer = setTimeout(() => ac.abort(), timeoutMs);
+				let data, keys;
+				try {
+					const [usageRes, keysRes] = await Promise.all([
+						apiFetch('/api/accounts/usage', { signal: ac.signal }),
+						apiFetch('/api/keys', { signal: ac.signal })
+					]);
+					data = await usageRes.json();
+					keys = await keysRes.json();
+				} catch (err) {
+					if (err && err.name === 'AbortError') {
+						console.error('刷新用量请求超时(', timeoutMs, 'ms)，可能后端聚合卡住');
+					} else {
+						console.error(err);
+					}
+					return;
+				} finally {
+					clearTimeout(timer);
+				}
 
 				// 渲染最新的实时数据
 				renderUsageDetails(data);
