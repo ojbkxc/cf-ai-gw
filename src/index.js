@@ -5056,8 +5056,9 @@ async function handleLandingPage(request, env, ctx) {
 		// 公开密钥查询（主页，无需登录）
 		let _publicKeyCountdownTimer = null;
 		function fmtRemainingMs(ms) {
-			if (ms <= 0) return '已到期';
+			if (ms <= 0) return '即将到期';
 			const totalMin = Math.floor(ms / 60000);
+			if (totalMin <= 0) return '<1 分钟';
 			const days = Math.floor(totalMin / 1440);
 			const hours = Math.floor((totalMin % 1440) / 60);
 			const mins = totalMin % 60;
@@ -5089,16 +5090,28 @@ async function handleLandingPage(request, env, ctx) {
 					: '调用次数: <strong>不限</strong>';
 				let expiryHtml;
 				if (data.expiresAt) {
+					// 服务端判定有效（data.valid=true），倒计时基于客户端时钟仅作细化展示；
+					// 客户端时钟偏差导致算出 ≤0 时显示「即将到期」，避免与服务端 valid 矛盾。
 					const expMs = Date.parse(data.expiresAt);
+					const serverRemainingDays = (data.remainingDays !== null && data.remainingDays !== undefined) ? data.remainingDays : null;
 					const remain = expMs - Date.now();
-					expiryHtml = '剩余有效期: <strong id="public-key-remaining">' + fmtRemainingMs(remain) + '</strong>（至 ' + new Date(data.expiresAt).toLocaleString() + '）';
-					if (!isNaN(expMs)) {
+					const remainText = remain <= 0
+						? (serverRemainingDays != null && serverRemainingDays > 0 ? '即将到期' : '已到期')
+						: fmtRemainingMs(remain);
+					expiryHtml = '剩余有效期: <strong id="public-key-remaining">' + remainText + '</strong>（至 ' + new Date(data.expiresAt).toLocaleString() + '）';
+					if (!isNaN(expMs) && remain > 0) {
 						_publicKeyCountdownTimer = setInterval(() => {
 							const el = document.getElementById('public-key-remaining');
 							if (!el) { clearInterval(_publicKeyCountdownTimer); _publicKeyCountdownTimer = null; return; }
 							const left = expMs - Date.now();
 							el.innerText = fmtRemainingMs(left);
-							if (left <= 0) { clearInterval(_publicKeyCountdownTimer); _publicKeyCountdownTimer = null; }
+							if (left <= 0) {
+								clearInterval(_publicKeyCountdownTimer); _publicKeyCountdownTimer = null;
+								// 整卡刷新为到期提示（服务端 next 校验时才真正拒绝）
+								const head = resultEl.querySelector('div');
+								if (head) head.innerHTML = '⏰ 有效期已到';
+								el.parentElement && (el.parentElement.style.color = 'var(--danger-color)');
+							}
 						}, 60000);
 					}
 				} else {
@@ -6110,7 +6123,7 @@ async function handleAdminPage(request, env, ctx) {
 					<input type="text" id="key-val" placeholder="留空则随机生成密钥" style="width: 100%;">
 				</div>
 				<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
-					<div class="form-group" style="margin-bottom: 0;">
+				<div class="form-group" style="margin-bottom: 0;">
 						<label for="key-expires-num">有效期 (空=不限)</label>
 						<div style="display: flex; gap: 8px;">
 							<input type="number" id="key-expires-num" min="1" placeholder="不限" style="flex: 1;">
@@ -6119,6 +6132,7 @@ async function handleAdminPage(request, env, ctx) {
 								<option value="months">月</option>
 							</select>
 						</div>
+						<div id="key-expires-hint" style="font-size: 11px; color: var(--text-muted); margin-top: 4px; display: none;"></div>
 					</div>
 					<div class="form-group" style="margin-bottom: 0;">
 						<label for="key-max-calls" id="key-max-calls-label">最大调用次数 (空=不限)</label>
@@ -6747,15 +6761,15 @@ async function handleAdminPage(request, env, ctx) {
 			await copyText(url, '已复制接入地址！');
 		}
 
-		// 通用表格数据加载函数
-		async function loadTableData(url, tbodyId, emptyMsg, renderFn, onEmpty) {
+		// 通用表格数据加载函数（emptyColspan：空表占位行跨列数，需与表头列数一致）
+		async function loadTableData(url, tbodyId, emptyMsg, renderFn, onEmpty, emptyColspan = 4) {
 			try {
 				const res = await apiFetch(url);
 				const items = await res.json();
 				const tbody = document.getElementById(tbodyId);
 				tbody.innerHTML = '';
 				if (items.length === 0) {
-					tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-muted); padding: 30px;">' + emptyMsg + '</td></tr>';
+					tbody.innerHTML = '<tr><td colspan="' + emptyColspan + '" style="text-align:center; color: var(--text-muted); padding: 30px;">' + emptyMsg + '</td></tr>';
 					if (onEmpty) onEmpty();
 					return;
 				}
@@ -6773,11 +6787,17 @@ async function handleAdminPage(request, env, ctx) {
 		async function loadKeys() {
 			await loadTableData('/api/keys', 'keys-table-body', '暂无配置的 API 密钥', (k) => {
 				const dateStr = new Date(k.createdAt).toLocaleString();
-				const expiryText = k.expiresAt
-					? (k.remainingDays !== null && k.remainingDays !== undefined
-						? (k.remainingDays + ' 天' + (k.remainingDays === 0 ? ' (已到期)' : ''))
-						: new Date(k.expiresAt).toLocaleDateString())
-					: '不限';
+				// 有效期列：剩余天数 + 具体到期日（月日），一眼看到何时到期
+				let expiryText = '不限';
+				if (k.expiresAt) {
+					const expDate = new Date(k.expiresAt);
+					const mmdd = (expDate.getMonth() + 1) + '-' + String(expDate.getDate()).padStart(2, '0');
+					if (k.remainingDays !== null && k.remainingDays !== undefined) {
+						expiryText = k.remainingDays <= 0 ? '已到期（至 ' + mmdd + '）' : (k.remainingDays + ' 天（至 ' + mmdd + '）');
+					} else {
+						expiryText = '至 ' + expDate.toLocaleDateString();
+					}
+				}
 				const expiryColor = k.expiresAt && k.remainingDays !== null && k.remainingDays <= 0 ? 'var(--danger-color)' : 'var(--text-color)';
 				const callsText = k.maxCalls && k.maxCalls > 0
 					? \`\${(k.remainingCalls ?? k.maxCalls).toLocaleString()} / \${k.maxCalls.toLocaleString()}\`
@@ -6802,7 +6822,7 @@ async function handleAdminPage(request, env, ctx) {
 			}, (hasData) => {
 				const el = document.getElementById('no-key-warning');
 				if (el) el.classList.toggle('hidden', !!hasData);
-			});
+			}, 6);
 		}
 
 		async function copyKeyText(val) {
@@ -6819,6 +6839,7 @@ async function handleAdminPage(request, env, ctx) {
 			document.getElementById('key-expires-num').value = '';
 			document.getElementById('key-expires-unit').value = 'days';
 			document.getElementById('key-max-calls').value = '';
+			document.getElementById('key-expires-hint').style.display = 'none';
 			document.getElementById('key-modal-title').innerText = '生成新 API 密钥';
 			document.getElementById('key-max-calls-label').innerText = '最大调用次数 (空=不限)';
 			document.getElementById('key-val-group').style.display = '';
@@ -6837,8 +6858,17 @@ async function handleAdminPage(request, env, ctx) {
 				if (!k) { showToast('未找到该密钥！', 'error'); return; }
 				KEY_EDITING_ID = id;
 				document.getElementById('key-name').value = k.name || '';
-				document.getElementById('key-expires-num').value = (k.remainingDays != null && k.remainingDays > 0) ? k.remainingDays : '';
+				// 有效期不预填：空=保留原到期日不变；填数字才从当前时刻重算（避免每次编辑静默改写/延长有效期）
+				document.getElementById('key-expires-num').value = '';
 				document.getElementById('key-expires-unit').value = 'days';
+				const hintEl = document.getElementById('key-expires-hint');
+				if (k.expiresAt) {
+					hintEl.innerText = '当前有效期至 ' + new Date(k.expiresAt).toLocaleString() + (k.remainingDays != null && k.remainingDays > 0 ? '（剩 ' + k.remainingDays + ' 天）' : '') + '；修改将从此刻重算';
+					hintEl.style.display = 'block';
+				} else {
+					hintEl.innerText = '当前不限期；填写数字将设置有效期';
+					hintEl.style.display = 'block';
+				}
 				document.getElementById('key-max-calls').value = (k.remainingCalls != null) ? k.remainingCalls : '';
 				document.getElementById('key-modal-title').innerText = '编辑 API 密钥';
 				document.getElementById('key-max-calls-label').innerText = '剩余次数 (空=不限)';
