@@ -126,6 +126,17 @@ grep "if (releaseSlot) releaseSlot();" → ≥ 9 处(3 transform × 3 路径)
 
 ## 6. 变更日志(最新在上)
 
+- **2026-09-11(密钥有效期控件最终简化:永久复选框+天数输入框单行)**:用户裁决
+  datetime 控件 bug 太多整体废弃,commit 74b75c6(-116/+29):① 删除 datetime-local
+  控件、picker-launcher、外置「确定时间」按钮及配套 JS(onKeyDateChange/
+  confirmKeyDate/onKeyExpiresLauncherClick/toDatetimeLocalInput/showPicker CSS);
+  ② 改为单行合并:「永久」label + 复选框 + 天数输入框 + 「天」单位,CSS 隐藏 number
+  上下箭头(-webkit-appearance:none + -moz-appearance:textfield);③ 逻辑:
+  勾选永久→天数框置灰清空且提交一律按永久;取消勾选→天数框可填(两位小数,0.5=半天),
+  oninput 即时 hint 换算到期时间;提交时 days>0 才算有效 ISO,否则创建拦截/编辑保持
+  原值;④ 编辑预填改为剩余天数((到期-现在)/天,两位小数),不动则 PUT 不带
+  expiresAt。后端 expiresAt 直收逻辑不变。node --check OK。未部署验证。
+  改动文件:src/index.js。下一步:部署后实测创建/编辑/永久置灰。
 - **2026-09-11(首页新增接入信息卡片)**:用户要求三种接入格式在首页公开展示(接在
   API 密钥查询下方)。公开页新增「接入信息」section-card,复用 admin 同款
   access-endpoint 卡片三枚(OpenAI /v1/chat/completions、Responses /v1/responses、
