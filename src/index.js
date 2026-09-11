@@ -97,18 +97,22 @@ function getTokenMonthlyKey() {
 // 累加 token：每请求写独立事件键 evt_<date>_<uuid>，彻底无 read-modify-write 竞态。
 // buildLocalUsageFallback 用 KV.list 聚合。同时维护 tokens_daily_/tokens_monthly_ 汇总键
 // 作为 chart 快速路径（容忍少量并发覆盖丢失，事件键为准）。
-async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0, cacheRead = 0, cacheWrite = 0, durationSec = 0, model = null }) {
+async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0, cacheRead = 0, cacheWrite = 0, durationSec = 0, model = null, countRequest = true, writeEvent = true }) {
 	if (!ctx) return;
 	ctx.waitUntil((async () => {
 		try {
 			const todayStr = getTodayStr();
-			// 1) 独立事件键（无竞态，作为请求数与 token 数的真实数据源）
-			const evtKey = `evt_${todayStr}_${crypto.randomUUID()}`;
-			const evt = { i: input, o: output, r: reasoning, m: model || null, ts: Date.now() };
-			await env.KV.put(evtKey, JSON.stringify(evt), { expirationTtl: TOKEN_KV_TTL_SEC });
+			// 1) 独立事件键（无竞态，作为请求数与 token 数的真实数据源）。
+			//    流式请求在 handler 入口已先写一条事件键记 request；流末补 token 时 writeEvent=false，
+			//    避免同一请求产生第二条事件键导致"今日请求"翻倍。
+			if (writeEvent) {
+				const evtKey = `evt_${todayStr}_${crypto.randomUUID()}`;
+				const evt = { i: input, o: output, r: reasoning, m: model || null, ts: Date.now() };
+				await env.KV.put(evtKey, JSON.stringify(evt), { expirationTtl: TOKEN_KV_TTL_SEC });
+			}
 
 			// 1.5) 实时 DO 计数（看板"今日请求/今日用量"强一致读）；失败静默，不影响事件键/汇总键
-			await doBumpUsage(env, { requests: 1, input, output });
+			await doBumpUsage(env, { requests: countRequest ? 1 : 0, input, output });
 
 			// 2) 日汇总键（best-effort，并发可能覆盖丢失，仅用于前端避免 list N 次的快速展示；
 			//    真实数据以 list 事件键聚合为准，见 buildLocalUsageFallback）
@@ -120,7 +124,7 @@ async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0
 			cur.reasoning = (cur.reasoning || 0) + reasoning;
 			cur.cacheRead = (cur.cacheRead || 0) + cacheRead;
 			cur.cacheWrite = (cur.cacheWrite || 0) + cacheWrite;
-			cur.requests += 1;
+			cur.requests += countRequest ? 1 : 0;
 			if (durationSec > 0 && output > 0) {
 				cur.tokPerSecSum = (cur.tokPerSecSum || 0) + Math.round(output / durationSec);
 				cur.tokPerSecCount = (cur.tokPerSecCount || 0) + 1;
@@ -140,7 +144,7 @@ async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0
 			monthly.input += input;
 			monthly.output += output;
 			monthly.reasoning = (monthly.reasoning || 0) + reasoning;
-			monthly.requests += 1;
+			monthly.requests += countRequest ? 1 : 0;
 			await env.KV.put(monthlyKey, JSON.stringify(monthly), { expirationTtl: 32 * 86400 });
 		} catch (e) {
 			console.error('Failed to accumulate tokens:', e?.message || e);
@@ -1537,7 +1541,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 		accumulateFromUsage(env, ctx, null, requestStartTime, model);
 		// For Binding streaming, we get a ReadableStream directly. Wrap it in passthroughStream for SSE processing.
 		return streamResponse(
-			passthroughStream(result.stream, model, pathname === '/v1/completions', env, ctx, requestStartTime, true),
+			passthroughStream(result.stream, model, pathname === '/v1/completions', env, ctx, requestStartTime, false),
 			fallbackWarning
 		);
 	}
@@ -1879,7 +1883,7 @@ async function handleMessages(request, env, ctx) {
 	if (stream) {
 		accumulateFromUsage(env, ctx, null, requestStartTime, model);
 		return streamResponse(
-			anthropicStreamTransform(result.stream, model, anthropicBody.messages, env, ctx, requestStartTime, true),
+			anthropicStreamTransform(result.stream, model, anthropicBody.messages, env, ctx, requestStartTime, false),
 			fallbackWarning
 		);
 	}
@@ -2217,7 +2221,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 		finalEventSent = true;
 
 		// 流式 request 已在 handler 入口计过；这里仅在拿到 token 数时补一次 token 累加
-		// （input/output 不为 0 时才写，避免重复计 request → 加 countRequest:false）
+		// （不重复计 request、不重复写事件键 → countRequest:false + writeEvent:false）
 		if (env && ctx && !tokenAlreadyCounted && (inputTokens > 0 || outputTokens > 0)) {
 			accumulateTokens(env, ctx, {
 				input: inputTokens,
@@ -2227,6 +2231,8 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				cacheWrite: cacheWriteTokens,
 				durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
 				model,
+				countRequest: false,
+				writeEvent: false,
 			});
 		}
 	}
@@ -2486,7 +2492,7 @@ async function handleResponses(request, env, ctx) {
 	if (stream) {
 		accumulateFromUsage(env, ctx, null, requestStartTime, model);
 		return streamResponse(
-			responsesStreamTransform(result.stream, model, env, ctx, requestStartTime, true),
+			responsesStreamTransform(result.stream, model, env, ctx, requestStartTime, false),
 			fallbackWarning
 		);
 	}
@@ -2945,6 +2951,7 @@ function responsesStreamTransform(upstreamBody, originalModel, env, ctx, request
 		finalEventSent = true;
 
 		// 流式 request 已在 handler 入口计过；这里仅在拿到 token 数时补一次 token 累加
+		// （不重复计 request、不重复写事件键 → countRequest:false + writeEvent:false）
 		if (env && ctx && !tokenAlreadyCounted && (inputTokens > 0 || outputTokens > 0)) {
 			accumulateTokens(env, ctx, {
 				input: inputTokens,
@@ -2954,6 +2961,8 @@ function responsesStreamTransform(upstreamBody, originalModel, env, ctx, request
 				cacheWrite: 0,
 				durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
 				model,
+				countRequest: false,
+				writeEvent: false,
 			});
 		}
 	}
@@ -3387,7 +3396,17 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 					if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 					// 流式 request 已在 handler 入口计过，这里只在有 usage 时补 token
 					if (!tokenAlreadyCounted && streamUsage) {
-						accumulateFromUsage(env, ctx, streamUsage, requestStartTime, model);
+						accumulateTokens(env, ctx, {
+							input: streamUsage.prompt_tokens || 0,
+							output: streamUsage.completion_tokens || 0,
+							reasoning: streamUsage.reasoning_tokens || 0,
+							cacheRead: (streamUsage.prompt_tokens_details?.cached_tokens ?? streamUsage.cache_read_tokens ?? 0),
+							cacheWrite: streamUsage.cache_write_tokens || 0,
+							durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
+							model,
+							countRequest: false,
+							writeEvent: false,
+						});
 					}
 						break;
 					}
@@ -4123,6 +4142,13 @@ const SHARED_JS = `
 					}
 				}
 			});
+		}
+
+		function fmtTok(n) {
+			if (n < 1000) return String(n);
+			if (n < 1000000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
+			if (n < 1000000000) return (n / 1000000).toFixed(2).replace(/\.?0+$/, '') + 'M';
+			return (n / 1000000000).toFixed(2).replace(/\.?0+$/, '') + 'B';
 		}`;
 
 const SHARED_BG_CSS = `
@@ -6138,13 +6164,6 @@ async function handleAdminPage(request, env, ctx) {
 
 	<script>
 		${SHARED_JS}
-
-		function fmtTok(n) {
-			if (n < 1000) return String(n);
-			if (n < 1000000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
-			if (n < 1000000000) return (n / 1000000).toFixed(2).replace(/\.?0+$/, '') + 'M';
-			return (n / 1000000000).toFixed(2).replace(/\.?0+$/, '') + 'B';
-		}
 
 		// 请求次数用「万」为单位展示（如 12345 -> 1.23w）
 		// 规则：保留两位小数；两位小数全为 0 时去掉小数点显示整数（4.00w -> 4w），否则完整显示两位（4.01w / 4.12w）

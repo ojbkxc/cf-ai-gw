@@ -186,6 +186,12 @@ cf-ai-gw/
 
 ## 5. 变更日志（最新在上）
 
+- **2026-09-11（流式 token 计数根因修复 + 登录页 fmtTok 崩溃 + 流式请求次数翻倍修复，仅 src/index.js）**：用户报告「项目很多 bug 请修复」。通读 src/index.js 后定位 3 个真实 bug 并修复：
+  - **BUG-1 流式 token 永久漏记（核心）**：`anthropicStreamTransform`/`responsesStreamTransform`/`passthroughStream` 三处 token 补偿块均以 `!tokenAlreadyCounted` 守卫，但三处调用点传入的 `tokenAlreadyCounted` 恒为 `true`，导致流式请求只记 +1 request 从不记 token，看板「今日用量」对所有流式流量永久低估。修复：三处调用点 `true` → `false`，让流末拿到 usage 时能补 token；`accumulateTokens` 已有 `countRequest:false` 保证不重复计 request。
+  - **BUG-2 登录页 fmtTok ReferenceError**：`renderPublicSummary`（约 4939 行）调用 `fmtTok(roundedNeurons)`，但 `fmtTok` 只在 admin 页脚本（原 6154 行）定义，未登录访问首页并登录后加载用量摘要即抛 `ReferenceError: fmtTok is not defined`，导致登录页数字滚动/用量描述渲染中断。修复：把 `fmtTok` 上移到 `SHARED_JS`（约 4140 行），并删除 admin 页脚本里的重复定义，统一由共享脚本提供。
+  - **BUG-3 流式请求「今日请求」翻倍**：流式 handler 入口先 `accumulateFromUsage(null)` 写一条 `evt_` 事件键（+1 request），流末补 token 时 `accumulateTokens` 又写第二条事件键，`buildLocalUsageFallback` 按 `evt_*` 键聚合时同一请求被计 2 次 request。修复：`accumulateTokens` 加 `writeEvent` 参数（默认 true），流末补 token 的三处调用传 `writeEvent:false`，只补 DO/日/月汇总键的 token，不写第二条事件键。
+  - 验证：`node --check src/index.js` SYNTAX_OK；grep 确认 fmtTok 仅 1 处定义（SHARED_JS）、三处流末补偿均 `countRequest:false + writeEvent:false`、三处调用点均 `tokenAlreadyCounted=false`。**未部署验证**。改动文件：src/index.js + AGENTS.md。下一步建议：push 触发 Git 集成自动部署后验证流式请求的「今日用量/今日请求」计数（发起 1 次流式请求，看板今日请求应 +1 而非 +2，token 应计入）。
+
 - **2026-09-10（看板本地兜底 + 密钥有效期/次数 + 公开查询 + 流式计数+KV竞态，7 commits 已线上验证通过）**：用户报告"模式 A 仅部署时看板全 0"+"今日请求恒为 1 不增长"。**根因链**：① 看板数据源只走 GraphQL Analytics，模式 A 单账号无 cfg_accounts → 空；② `accumulateFromUsage` 流式 usage 缺失时直接 return → 不计 request；③ `accumulateTokens` read-modify-write 并发覆盖丢更新。**修复清单**：
   - **commit 2579177 看板本地 token 兜底**：新增 `buildLocalUsageFallback`，三路数据源 `cfg_accounts > ANALYTICS_API_TOKEN(自账号) > 本地 token 兜底`；响应加 `unit` 字段（'Neurons'/'Tokens'），前端按 unit 切换标注；`wrangler.toml` 加 `ANALYTICS_ACCOUNT_ID`/`ANALYTICS_API_TOKEN` 配置说明（最小权限：Account > Workers Analytics > Read）。
   - **commit cc5b169 密钥有效期/次数 + 公开查询 + 7日走势次数曲线**：`/api/keys` POST 接收 `expiresDays`/`expiresMonths`/`maxCalls`（任一空=不限），key 对象加 `expiresAt`/`maxCalls`/`usedCalls`；`checkProxyAuth` 返回 `{ok, reason, keyId}` 校验过期/次数，超限 401；`incrementKeyUsage` 在 `ctx.waitUntil` 异步累加；新增 `GET /api/key/info?key=...` 公开端点（无需登录）；前端 add-key 模态框加有效期(天/月)+最大次数输入，keys 表格加有效期/剩余次数列，主页加"API 密钥查询"卡片；7 日走势图加绿色"请求次数"双 Y 轴曲线。
