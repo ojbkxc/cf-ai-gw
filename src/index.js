@@ -109,24 +109,15 @@ function getTokenMonthlyKey() {
 	return `tokens_monthly_${d.getFullYear()}_${String(d.getMonth() + 1).padStart(2, '0')}`;
 }
 
-// 累加 token：每请求写独立事件键 evt_<date>_<uuid>，彻底无 read-modify-write 竞态。
-// buildLocalUsageFallback 用 KV.list 聚合。同时维护 tokens_daily_/tokens_monthly_ 汇总键
-// 作为 chart 快速路径（容忍少量并发覆盖丢失，事件键为准）。
-async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0, cacheRead = 0, cacheWrite = 0, durationSec = 0, model = null, countRequest = true, writeEvent = true }) {
+// 累加 token：写入 DO（今日强一致）+ tokens_daily_/tokens_monthly_ 汇总键（best-effort，
+// 并发覆盖可能少量丢失）。原 evt_<date>_<uuid> 事件键已删除——aggregateEventsByDate
+// 移除后全文件无人读取 evt_ 键，纯死写入（每请求白付一次 KV 写）。
+async function accumulateTokens(env, ctx, { input = 0, output = 0, reasoning = 0, cacheRead = 0, cacheWrite = 0, durationSec = 0, model = null, countRequest = true }) {
 	if (!ctx) return;
 	ctx.waitUntil((async () => {
 		try {
 			const todayStr = getTodayStr();
-			// 1) 独立事件键（无竞态，作为请求数与 token 数的真实数据源）。
-			//    流式请求在 handler 入口已先写一条事件键记 request；流末补 token 时 writeEvent=false，
-			//    避免同一请求产生第二条事件键导致"今日请求"翻倍。
-			if (writeEvent) {
-				const evtKey = `evt_${todayStr}_${crypto.randomUUID()}`;
-				const evt = { i: input, o: output, r: reasoning, m: model || null, ts: Date.now() };
-				await env.KV.put(evtKey, JSON.stringify(evt), { expirationTtl: TOKEN_KV_TTL_SEC });
-			}
-
-			// 1.5) 实时 DO 计数（看板"今日请求/今日用量"强一致读）；失败静默，不影响事件键/汇总键
+			// 1) 实时 DO 计数（看板"今日请求/今日用量"强一致读）；失败静默，不影响汇总键
 			await doBumpUsage(env, { requests: countRequest ? 1 : 0, input, output });
 
 			// 2) 日汇总键（best-effort，并发可能覆盖丢失，仅用于前端避免 list N 次的快速展示；
@@ -385,8 +376,8 @@ async function doCheckAndIncrement(env, keyId, max, seed) {
 }
 
 // ===== 今日用量实时计数：Durable Object 强一致计数器 =====
-// 按 UTC 日期命名（usage:<date>），与 evt_ 键口径一致。每次请求在 accumulateTokens 中
-// 原子累加 requests/input/output，看板"今日请求/今日用量"直接读此 DO，瞬时强一致，无 KV.list 延迟。
+// 按 UTC 日期命名（usage:<date>），与 tokens_daily_ 键的 UTC 口径一致。每次请求在
+// accumulateTokens 中原子累加 requests/input/output，看板"今日请求/今日用量"直接读此 DO，瞬时强一致。
 export class UsageCounter {
 	constructor(state, env) {
 		this.state = state;
@@ -1309,7 +1300,9 @@ async function resolveModelName(model, env) {
 	return { cfModel: DEFAULT_FALLBACK_MODEL, isFallback: true, tokens };
 }
 
-// 取实际映射模型的"短名"（最后一个 / 后的部分），用于用量分组的展示名
+// 取实际映射模型的"短名"（最后一个 / 后的部分）。
+// 注意：用量统计的模型归因已统一为「用户请求模型名」口径（与面板按模型并发的配置键一致），
+// 经别名/回退调用时 request 与 token 不会拆裂到两个模型；本函数仅用于展示名兜底。
 function shortModelName(cfModel) {
 	if (!cfModel) return 'unknown';
 	const idx = cfModel.lastIndexOf('/');
@@ -1548,7 +1541,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 
 	if (stream) {
 		// 流式：先记一次 request（流式 done 分支只补 token，避免 ctx 失效导致 request 漏记）
-		accumulateFromUsage(env, ctx, null, requestStartTime, shortModelName(cfModel));
+		accumulateFromUsage(env, ctx, null, requestStartTime, model);
 		// For Binding streaming, we get a ReadableStream directly. Wrap it in passthroughStream for SSE processing.
 		return streamResponse(
 			passthroughStream(result.stream, model, pathname === '/v1/completions', env, ctx, requestStartTime, false, result.releaseSlot),
@@ -1557,7 +1550,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 	}
 	const cfJson = result.data;
 	if (cfJson.model !== undefined) cfJson.model = model;
-	accumulateFromUsage(env, ctx, cfJson.usage, requestStartTime, shortModelName(cfModel));
+	accumulateFromUsage(env, ctx, cfJson.usage, requestStartTime, model);
 	if (pathname === '/v1/completions') {
 		const textChoices = (cfJson.choices || []).map(c => ({
 			text: c.message?.content || '',
@@ -1891,14 +1884,14 @@ async function handleMessages(request, env, ctx) {
 	}
 
 	if (stream) {
-		accumulateFromUsage(env, ctx, null, requestStartTime, shortModelName(cfModel));
+		accumulateFromUsage(env, ctx, null, requestStartTime, model);
 		return streamResponse(
 			anthropicStreamTransform(result.stream, model, anthropicBody.messages, env, ctx, requestStartTime, false, result.releaseSlot),
 			fallbackWarning
 		);
 	}
 	const openaiResponse = result.data;
-	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime, shortModelName(cfModel));
+	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime, model);
 	return jsonResponse(convertOpenAIToAnthropic(openaiResponse, model, anthropicBody.stop_sequences), fallbackWarning);
 }
 
@@ -2234,7 +2227,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 		finalEventSent = true;
 
 		// 流式 request 已在 handler 入口计过；这里仅在拿到 token 数时补一次 token 累加
-		// （不重复计 request、不重复写事件键 → countRequest:false + writeEvent:false）
+		// （不重复计 request → countRequest:false）
 		if (env && ctx && !tokenAlreadyCounted && (inputTokens > 0 || outputTokens > 0)) {
 			accumulateTokens(env, ctx, {
 				input: inputTokens,
@@ -2245,7 +2238,6 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 				durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
 				model: modelName,
 				countRequest: false,
-				writeEvent: false,
 			});
 		}
 	}
@@ -2503,14 +2495,14 @@ async function handleResponses(request, env, ctx) {
 	}
 
 	if (stream) {
-		accumulateFromUsage(env, ctx, null, requestStartTime, shortModelName(cfModel));
+		accumulateFromUsage(env, ctx, null, requestStartTime, model);
 		return streamResponse(
 			responsesStreamTransform(result.stream, model, env, ctx, requestStartTime, false, result.releaseSlot),
 			fallbackWarning
 		);
 	}
 	const openaiResponse = result.data;
-	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime, shortModelName(cfModel));
+	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime, model);
 	return jsonResponse(convertOpenAIToResponses(openaiResponse, model, {
 		instructions: responsesBody.instructions,
 		parallel_tool_calls: responsesBody.parallel_tool_calls,
@@ -2967,7 +2959,7 @@ function responsesStreamTransform(upstreamBody, originalModel, env, ctx, request
 		finalEventSent = true;
 
 		// 流式 request 已在 handler 入口计过；这里仅在拿到 token 数时补一次 token 累加
-		// （不重复计 request、不重复写事件键 → countRequest:false + writeEvent:false）
+		// （不重复计 request → countRequest:false）
 		if (env && ctx && !tokenAlreadyCounted && (inputTokens > 0 || outputTokens > 0)) {
 			accumulateTokens(env, ctx, {
 				input: inputTokens,
@@ -2978,7 +2970,6 @@ function responsesStreamTransform(upstreamBody, originalModel, env, ctx, request
 				durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
 				model: originalModel,
 				countRequest: false,
-				writeEvent: false,
 			});
 		}
 	}
@@ -3422,7 +3413,6 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 								durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
 								model: modelName,
 								countRequest: false,
-								writeEvent: false,
 							});
 						}
 						if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
@@ -3634,7 +3624,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 用量汇总（模式A：实时聚合本地 KV 的 evt_* 事件键）
+	// 用量汇总（模式A：DO 今日 + tokens_daily_/tokens_monthly_ 汇总键）
 	if (url.pathname === '/api/usage/summary' && method === 'GET') {
 		const isAuthorized = await checkAdminAuth(request, env);
 		if (!isAuthorized) {
@@ -3644,7 +3634,7 @@ async function handleDashboardApi(request, env, ctx) {
 		{
 			const limits = await getUsageLimits(env);
 
-			// 模式A：用量直接来自本地 KV 聚合（evt_* 事件键），实时读取，无需缓存、也无需查询 CF Analytics GraphQL
+			// 模式A：用量来自 DO 今日 + tokens_daily_/tokens_monthly_ 汇总键，实时读取，无需查询 CF Analytics GraphQL
 			const fallback = await buildLocalUsageFallback(env);
 			const a = fallback.accounts[0];
 			const formattedModelsToday = (a.modelsToday || []).map(m => ({ model: m.model, requests: m.requests, tokens: m.tokens }));
@@ -3700,11 +3690,11 @@ async function handleDashboardApi(request, env, ctx) {
 		}]), { headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 账号用量（模式A：实时聚合本地 KV 的 evt_* 事件键）
+	// 账号用量（模式A：DO 今日 + tokens_daily_/tokens_monthly_ 汇总键）
 	if (url.pathname === '/api/accounts/usage' && method === 'GET') {
 		const limits = await getUsageLimits(env);
 
-		// 模式A：用量直接来自本地 KV 聚合（evt_* 事件键），实时读取，无需缓存、也无需查询 CF Analytics GraphQL
+		// 模式A：用量来自 DO 今日 + tokens_daily_/tokens_monthly_ 汇总键，实时读取，无需查询 CF Analytics GraphQL
 		const fallback = await buildLocalUsageFallback(env);
 		const dailyUsage = fallback.accounts[0].usageToday;
 		const dailyRequests = fallback.accounts[0].usageTodayRequests;
