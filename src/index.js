@@ -843,15 +843,15 @@ async function buildLocalUsageFallback(env) {
 		? Math.max(doToday.requests || 0, todayEntry.requests || 0)
 		: (todayEntry.requests || 0);
 
-	// 今日模型占比（按请求次数计）
+	// 今日模型占比（按请求次数排序，同时统计 token 消耗）
 	const modelsToday = [];
 	if (todayEntry.models) {
 		for (const [model, m] of Object.entries(todayEntry.models)) {
-			modelsToday.push({ model, requests: m.requests || 0 });
+			modelsToday.push({ model, requests: m.requests || 0, tokens: (m.input || 0) + (m.output || 0) });
 		}
 	}
 	if (modelsToday.length === 0 && usageTodayRequests > 0) {
-		modelsToday.push({ model: '_unknown', requests: usageTodayRequests });
+		modelsToday.push({ model: '_unknown', requests: usageTodayRequests, tokens: usageToday });
 	}
 	modelsToday.sort((a, b) => b.requests - a.requests);
 
@@ -3634,7 +3634,7 @@ async function handleDashboardApi(request, env, ctx) {
 			// 模式A：用量直接来自本地 KV 聚合（evt_* 事件键），实时读取，无需缓存、也无需查询 CF Analytics GraphQL
 			const fallback = await buildLocalUsageFallback(env);
 			const a = fallback.accounts[0];
-			const formattedModelsToday = (a.modelsToday || []).map(m => ({ model: m.model, requests: m.requests }));
+			const formattedModelsToday = (a.modelsToday || []).map(m => ({ model: m.model, requests: m.requests, tokens: m.tokens }));
 			const summary = {
 				totalNeuronsToday: a.usageToday,
 				totalRequestsToday: a.usageTodayRequests,
@@ -4087,7 +4087,7 @@ const SHARED_JS = `
 
 		// 共享的图表 Legend 渲染函数
 		const CHART_COLORS = ['#6366f1', '#a855f7', '#ec4899', '#10b981', '#f59e0b', '#3b82f6'];
-		function renderChartLegend(legendContainer, labels, data, fullLabels) {
+		function renderChartLegend(legendContainer, labels, data, fullLabels, tokens) {
 			if (!legendContainer) return;
 			legendContainer.innerHTML = '';
 			const isLight = document.documentElement.getAttribute('data-theme') === 'light';
@@ -4099,6 +4099,7 @@ const SHARED_JS = `
 				const color = CHART_COLORS[index % CHART_COLORS.length];
 				const pct = total > 0 ? ((val / total) * 100).toFixed(1) : '0.0';
 				const title = fullLabels ? fullLabels[index] : label;
+				const tok = (tokens && tokens[index]) || 0;
 
 				const item = document.createElement('div');
 				item.style.display = 'flex';
@@ -4112,7 +4113,7 @@ const SHARED_JS = `
 
 				item.innerHTML = '<span style="width: 8px; height: 8px; border-radius: 50%; background-color: ' + color + '; flex-shrink: 0; margin-right: 2px;"></span>' +
 					'<span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; font-weight: 500;" title="' + escapeHtml(title) + '">' + escapeHtml(label) + '</span>' +
-					'<span style="color: var(--text-muted); font-family: monospace; font-size: 11px; flex-shrink: 0; margin-left: 4px;">' + pct + '%</span>';
+					'<span style="color: var(--text-muted); font-family: monospace; font-size: 11px; flex-shrink: 0; margin-left: 4px;">' + val + '次 · ' + fmtTok(tok) + ' · ' + pct + '%</span>';
 
 				legendContainer.appendChild(item);
 				setTimeout(() => {
@@ -4984,8 +4985,9 @@ async function handleLandingPage(request, env, ctx) {
 				// 按请求次数从大到小排序
 					const sortedModelsToday = [...data.modelsToday].sort((a, b) => b.requests - a.requests);
 
-					const labels = sortedModelsToday.map(m => m.model.split('/').pop());
+					const labels = sortedModelsToday.map(m => m.model);
 					const chartData = sortedModelsToday.map(m => m.requests);
+					const chartTokens = sortedModelsToday.map(m => m.tokens);
 				
 				const isLight = document.documentElement.getAttribute('data-theme') === 'light';
 				const borderColor = isLight ? '#ffffff' : '#1e293b';
@@ -4996,13 +4998,13 @@ async function handleLandingPage(request, env, ctx) {
 
 				publicModelsChartInstance = createDoughnutChart('publicModelsChart', labels, chartData, borderColor);
 
-				// 动态且逐个淡入渲染模型说明 ID
-				renderChartLegend(legendContainer, labels, chartData);
-			} else {
-				if (wrapper) wrapper.style.display = 'none';
-				if (placeholder) {
-					placeholder.style.display = 'flex';
-					placeholder.innerHTML = '<svg style="width: 32px; height: 32px; opacity: 0.5;" fill="none" stroke="currentColor" viewBox="0 0 24 24">' +
+				// 动态且逐个淡入渲染模型说明 ID（图例同时展示请求次数与 token 消耗）
+					renderChartLegend(legendContainer, labels, chartData, null, chartTokens);
+				} else {
+					if (wrapper) wrapper.style.display = 'none';
+					if (placeholder) {
+						placeholder.style.display = 'flex';
+						placeholder.innerHTML = '<svg style="width: 32px; height: 32px; opacity: 0.5;" fill="none" stroke="currentColor" viewBox="0 0 24 24">' +
 						'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z"></path>' +
 						'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"></path>' +
 						'</svg><span>今日暂无消耗数据</span>';
@@ -6205,6 +6207,7 @@ async function handleAdminPage(request, env, ctx) {
 			let historyData = {};
 			let historyRequestsData = {};
 			let modelsToday = {};
+			let modelsTokens = {};
 
 			const usageList = document.getElementById('accounts-usage-list');
 
@@ -6303,6 +6306,7 @@ async function handleAdminPage(request, env, ctx) {
 				if (account.modelsToday) {
 					account.modelsToday.forEach(m => {
 						modelsToday[m.model] = (modelsToday[m.model] || 0) + (m.requests || 0);
+						modelsTokens[m.model] = (modelsTokens[m.model] || 0) + (m.tokens || 0);
 					});
 				}
 			});
@@ -6352,7 +6356,8 @@ async function handleAdminPage(request, env, ctx) {
 
 			const models = Object.keys(modelsToday);
 			const modelsData = models.map(m => modelsToday[m]);
-			renderModelsChart(models, modelsData);
+			const modelsTok = models.map(m => modelsTokens[m] || 0);
+			renderModelsChart(models, modelsData, modelsTok);
 		}
 
 		function updateLimitCards(limits) {
@@ -6690,7 +6695,7 @@ async function handleAdminPage(request, env, ctx) {
 			});
 		}
 
-		function renderModelsChart(labels, data) {
+		function renderModelsChart(labels, data, tokens) {
 			if (modelsChart) modelsChart.destroy();
 			
 			const legendContainer = document.getElementById('admin-chart-legend');
@@ -6711,15 +6716,17 @@ async function handleAdminPage(request, env, ctx) {
 				if (placeholder) placeholder.style.display = 'none';
 			}
 
-			// Sort the model data descending by neurons
+			// Sort the model data descending by requests
 			const combined = labels.map((label, idx) => ({
 				fullLabel: label,
 				cleanLabel: label.split('/').pop(),
-				value: data[idx]
+				value: data[idx],
+				tok: (tokens && tokens[idx]) || 0
 			})).sort((a, b) => b.value - a.value);
 
 			const sortedLabels = combined.map(x => x.cleanLabel);
 			const sortedData = combined.map(x => x.value);
+			const sortedTok = combined.map(x => x.tok);
 
 			const isLight = document.documentElement.getAttribute('data-theme') === 'light';
 			const borderColor = isLight ? '#ffffff' : '#1e293b';
@@ -6727,8 +6734,8 @@ async function handleAdminPage(request, env, ctx) {
 			if (modelsChart) modelsChart.destroy();
 			modelsChart = createDoughnutChart('modelsChart', sortedLabels, sortedData, borderColor);
 
-			// Render Custom HTML Legend for Admin Page
-			renderChartLegend(legendContainer, sortedLabels, sortedData, combined.map(x => x.fullLabel));
+			// Render Custom HTML Legend for Admin Page（同时展示请求次数与 token 消耗）
+			renderChartLegend(legendContainer, sortedLabels, sortedData, combined.map(x => x.fullLabel), sortedTok);
 		}
 
 		async function copyEndpointUrl(url) {
