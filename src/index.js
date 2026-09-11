@@ -819,9 +819,10 @@ async function buildLocalUsageFallback(env) {
 							agg.output += evt.o || 0;
 							agg.requests += 1;
 							if (evt.m) {
-								agg.models[evt.m] = agg.models[evt.m] || { input: 0, output: 0 };
+								agg.models[evt.m] = agg.models[evt.m] || { input: 0, output: 0, requests: 0 };
 								agg.models[evt.m].input += evt.i || 0;
 								agg.models[evt.m].output += evt.o || 0;
+								agg.models[evt.m].requests += 1;
 							}
 						} catch (_) {}
 					}
@@ -842,17 +843,17 @@ async function buildLocalUsageFallback(env) {
 		? Math.max(doToday.requests || 0, todayEntry.requests || 0)
 		: (todayEntry.requests || 0);
 
-	// 今日模型占比
+	// 今日模型占比（按请求次数计）
 	const modelsToday = [];
 	if (todayEntry.models) {
 		for (const [model, m] of Object.entries(todayEntry.models)) {
-			modelsToday.push({ model, neurons: (m.input || 0) + (m.output || 0), requests: 0 });
+			modelsToday.push({ model, requests: m.requests || 0 });
 		}
 	}
 	if (modelsToday.length === 0 && usageTodayRequests > 0) {
-		modelsToday.push({ model: '_unknown', neurons: usageToday, requests: usageTodayRequests });
+		modelsToday.push({ model: '_unknown', requests: usageTodayRequests });
 	}
-	modelsToday.sort((a, b) => b.neurons - a.neurons);
+	modelsToday.sort((a, b) => b.requests - a.requests);
 
 	// 7 日走势
 	const history = dailyAgg
@@ -1306,6 +1307,13 @@ async function resolveModelName(model, env) {
 	return { cfModel: DEFAULT_FALLBACK_MODEL, isFallback: true, tokens };
 }
 
+// 取实际映射模型的"短名"（最后一个 / 后的部分），用于用量分组的展示名
+function shortModelName(cfModel) {
+	if (!cfModel) return 'unknown';
+	const idx = cfModel.lastIndexOf('/');
+	return idx >= 0 ? cfModel.slice(idx + 1) : cfModel;
+}
+
 // ===== handleV1Proxy =====
 async function handleV1Proxy(request, env, ctx) {
 	const url = new URL(request.url);
@@ -1538,7 +1546,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 
 	if (stream) {
 		// 流式：先记一次 request（流式 done 分支只补 token，避免 ctx 失效导致 request 漏记）
-		accumulateFromUsage(env, ctx, null, requestStartTime, model);
+		accumulateFromUsage(env, ctx, null, requestStartTime, shortModelName(cfModel));
 		// For Binding streaming, we get a ReadableStream directly. Wrap it in passthroughStream for SSE processing.
 		return streamResponse(
 			passthroughStream(result.stream, model, pathname === '/v1/completions', env, ctx, requestStartTime, false),
@@ -1547,7 +1555,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 	}
 	const cfJson = result.data;
 	if (cfJson.model !== undefined) cfJson.model = model;
-	accumulateFromUsage(env, ctx, cfJson.usage, requestStartTime, model);
+	accumulateFromUsage(env, ctx, cfJson.usage, requestStartTime, shortModelName(cfModel));
 	if (pathname === '/v1/completions') {
 		const textChoices = (cfJson.choices || []).map(c => ({
 			text: c.message?.content || '',
@@ -1881,14 +1889,14 @@ async function handleMessages(request, env, ctx) {
 	}
 
 	if (stream) {
-		accumulateFromUsage(env, ctx, null, requestStartTime, model);
+		accumulateFromUsage(env, ctx, null, requestStartTime, shortModelName(cfModel));
 		return streamResponse(
 			anthropicStreamTransform(result.stream, model, anthropicBody.messages, env, ctx, requestStartTime, false),
 			fallbackWarning
 		);
 	}
 	const openaiResponse = result.data;
-	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime, model);
+	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime, shortModelName(cfModel));
 	return jsonResponse(convertOpenAIToAnthropic(openaiResponse, model, anthropicBody.stop_sequences), fallbackWarning);
 }
 
@@ -2490,14 +2498,14 @@ async function handleResponses(request, env, ctx) {
 	}
 
 	if (stream) {
-		accumulateFromUsage(env, ctx, null, requestStartTime, model);
+		accumulateFromUsage(env, ctx, null, requestStartTime, shortModelName(cfModel));
 		return streamResponse(
 			responsesStreamTransform(result.stream, model, env, ctx, requestStartTime, false),
 			fallbackWarning
 		);
 	}
 	const openaiResponse = result.data;
-	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime, model);
+	accumulateFromUsage(env, ctx, openaiResponse.usage, requestStartTime, shortModelName(cfModel));
 	return jsonResponse(convertOpenAIToResponses(openaiResponse, model, {
 		instructions: responsesBody.instructions,
 		parallel_tool_calls: responsesBody.parallel_tool_calls,
@@ -3626,7 +3634,7 @@ async function handleDashboardApi(request, env, ctx) {
 			// 模式A：用量直接来自本地 KV 聚合（evt_* 事件键），实时读取，无需缓存、也无需查询 CF Analytics GraphQL
 			const fallback = await buildLocalUsageFallback(env);
 			const a = fallback.accounts[0];
-			const formattedModelsToday = (a.modelsToday || []).map(m => ({ model: m.model, neurons: m.neurons }));
+			const formattedModelsToday = (a.modelsToday || []).map(m => ({ model: m.model, requests: m.requests }));
 			const summary = {
 				totalNeuronsToday: a.usageToday,
 				totalRequestsToday: a.usageTodayRequests,
@@ -4973,11 +4981,11 @@ async function handleLandingPage(request, env, ctx) {
 				if (wrapper) wrapper.style.display = 'flex';
 				if (placeholder) placeholder.style.display = 'none';
 
-				// 按 Neurons 消耗数从大到小排序
-				const sortedModelsToday = [...data.modelsToday].sort((a, b) => b.neurons - a.neurons);
+				// 按请求次数从大到小排序
+					const sortedModelsToday = [...data.modelsToday].sort((a, b) => b.requests - a.requests);
 
-				const labels = sortedModelsToday.map(m => m.model.split('/').pop());
-				const chartData = sortedModelsToday.map(m => m.neurons);
+					const labels = sortedModelsToday.map(m => m.model.split('/').pop());
+					const chartData = sortedModelsToday.map(m => m.requests);
 				
 				const isLight = document.documentElement.getAttribute('data-theme') === 'light';
 				const borderColor = isLight ? '#ffffff' : '#1e293b';
@@ -6294,7 +6302,7 @@ async function handleAdminPage(request, env, ctx) {
 
 				if (account.modelsToday) {
 					account.modelsToday.forEach(m => {
-						modelsToday[m.model] = (modelsToday[m.model] || 0) + m.neurons;
+						modelsToday[m.model] = (modelsToday[m.model] || 0) + (m.requests || 0);
 					});
 				}
 			});
@@ -6343,8 +6351,8 @@ async function handleAdminPage(request, env, ctx) {
 			renderHistoryChart(dates, neuronsData, requestsData);
 
 			const models = Object.keys(modelsToday);
-			const modelsNeurons = models.map(m => modelsToday[m]);
-			renderModelsChart(models, modelsNeurons);
+			const modelsData = models.map(m => modelsToday[m]);
+			renderModelsChart(models, modelsData);
 		}
 
 		function updateLimitCards(limits) {
