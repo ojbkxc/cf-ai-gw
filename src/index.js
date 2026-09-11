@@ -6193,6 +6193,7 @@ async function handleAdminPage(request, env, ctx) {
 						<div id="key-expires-launcher" class="picker-launcher" onclick="onKeyExpiresLauncherClick(event)" style="width: 100%;">
 							<input type="datetime-local" id="key-expires-at" disabled onchange="onKeyDateChange()" style="width: 100%;">
 						</div>
+						<button type="button" class="btn btn-secondary" id="key-expires-confirm" onclick="confirmKeyDate()" style="width: 100%; margin-top: 6px; padding: 8px 16px; font-size: 13px;">确定时间</button>
 						<div id="key-expires-hint" style="font-size: 11px; color: var(--text-muted); margin-top: 4px; display: none;"></div>
 					</div>
 					<div class="form-group" style="margin-bottom: 0;">
@@ -6900,20 +6901,22 @@ async function handleAdminPage(request, env, ctx) {
 		// ===== 密钥有效期控件：永久 checkbox 最高优先级，天数 ↔ 日期双向联动 =====
 		// 规则：勾选「永久有效」→ 天数输入框 + 日期控件全部置灰，不论其他
 		//       取消勾选 → 两者可编辑；改天数 → 换算日期（从当前时刻起 + N 天，两位小数）；
-		//       日期控件弹框内选完（onchange 触发）→ 立即反算刷新天数框
+		//       日期控件选完（onchange）→ 即时提示已选时间，点「确定时间」按钮才反算天数
 		function onKeyForeverChange() {
 			KEY_EXPIRES_DIRTY = true;
 			const forever = document.getElementById('key-expires-forever').checked;
 			const daysEl = document.getElementById('key-expires-days');
 			const dateEl = document.getElementById('key-expires-at');
+			const confirmBtn = document.getElementById('key-expires-confirm');
 			daysEl.disabled = forever;
 			dateEl.disabled = forever;
+			confirmBtn.disabled = forever;
 			if (forever) {
 				daysEl.value = '';
 				dateEl.value = '';
 				setKeyExpiresHint('已选永久有效，不限使用时间');
 			} else if (!dateEl.value) {
-				setKeyExpiresHint('请填写天数或选择到期日期');
+				setKeyExpiresHint('请填写天数，或选到期日期后点「确定时间」');
 			}
 		}
 
@@ -6951,21 +6954,39 @@ async function handleAdminPage(request, env, ctx) {
 			}
 		}
 
-		// 日期控件 onchange：用户在日期选择弹框里点确认/选完触发，
-		// 此刻刷新天数框（反算 (到期-现在)/天，两位小数）——外置确定按钮已移除
+		// 日期控件 onchange：选完/键盘输入触发 → 保留 KEY_EXPIRES_DIRTY 标志但先不刷新天数。
+		// 浏览器 datetime 弹框部分环境无自带确认按钮，统一由「确定时间」按钮收口：
+		// 点它才算最终选定，此刻反算 (到期-现在)/天（两位小数）刷新天数框。
 		function onKeyDateChange() {
 			if (document.getElementById('key-expires-forever').checked) return;
 			KEY_EXPIRES_DIRTY = true;
+			// 延迟到 confirmKeyDate() 再反算天数；这里只做即时合法性提示
 			const dateEl = document.getElementById('key-expires-at');
-			if (!dateEl.value) { document.getElementById('key-expires-days').value = ''; setKeyExpiresHint('请选择到期日期'); return; }
+			if (!dateEl.value) { setKeyExpiresHint('请选择到期日期，然后点「确定时间」'); return; }
 			const targetMs = new Date(dateEl.value).getTime();
 			if (isNaN(targetMs)) return;
 			const days = (targetMs - Date.now()) / 86400000;
-			const daysEl = document.getElementById('key-expires-days');
-			daysEl.value = days > 0 ? (Math.round(days * 100) / 100) : '';
 			setKeyExpiresHint(days > 0
-				? '生效后至 ' + new Date(targetMs).toLocaleString() + '（' + (Math.round(days * 100) / 100) + ' 天）'
+				? '已选 ' + new Date(targetMs).toLocaleString() + '，点「确定时间」生效'
 				: '所选时间已过时，请选未来时间');
+		}
+
+		// 「确定时间」按钮：锁定日期选择，反算天数框并给确认反馈
+		function confirmKeyDate() {
+			const forever = document.getElementById('key-expires-forever');
+			if (forever.checked) return;
+			const dateEl = document.getElementById('key-expires-at');
+			if (!dateEl.value) { setKeyExpiresHint('请先选择到期日期'); return; }
+			const targetMs = new Date(dateEl.value).getTime();
+			if (isNaN(targetMs) || targetMs <= Date.now()) {
+				setKeyExpiresHint('所选时间已过时，请选未来时间');
+				return;
+			}
+			KEY_EXPIRES_DIRTY = true;
+			const days = (targetMs - Date.now()) / 86400000;
+			const daysEl = document.getElementById('key-expires-days');
+			daysEl.value = Math.round(days * 100) / 100;
+			setKeyExpiresHint('✓ 已确定：生效后至 ' + new Date(targetMs).toLocaleString() + '（' + (Math.round(days * 100) / 100) + ' 天）');
 		}
 
 		// Date → datetime-local 控件值（本地时区，精确到分钟）
@@ -6988,6 +7009,7 @@ async function handleAdminPage(request, env, ctx) {
 			document.getElementById('key-expires-at').value = '';
 			document.getElementById('key-expires-days').disabled = true;
 			document.getElementById('key-expires-at').disabled = true;
+			document.getElementById('key-expires-confirm').disabled = true;
 			document.getElementById('key-max-calls').value = '';
 			setKeyExpiresHint('已选永久有效，不限使用时间');
 			document.getElementById('key-modal-title').innerText = '生成新 API 密钥';
@@ -7015,6 +7037,7 @@ async function handleAdminPage(request, env, ctx) {
 					document.getElementById('key-expires-forever').checked = false;
 					document.getElementById('key-expires-days').disabled = false;
 					document.getElementById('key-expires-at').disabled = false;
+					document.getElementById('key-expires-confirm').disabled = false;
 					document.getElementById('key-expires-at').value = toDatetimeLocalInput(k.expiresAt);
 					document.getElementById('key-expires-days').value = '';
 					setKeyExpiresHint('当前有效期至 ' + new Date(k.expiresAt).toLocaleString() + (k.remainingDays != null && k.remainingDays > 0 ? '（剩 ' + k.remainingDays + ' 天）' : '') + '；不动则保持不变');
@@ -7024,6 +7047,7 @@ async function handleAdminPage(request, env, ctx) {
 					document.getElementById('key-expires-at').value = '';
 					document.getElementById('key-expires-days').disabled = true;
 					document.getElementById('key-expires-at').disabled = true;
+					document.getElementById('key-expires-confirm').disabled = true;
 					setKeyExpiresHint('当前永久有效；已选永久有效，不限使用时间');
 				}
 				document.getElementById('key-max-calls').value = (k.remainingCalls != null) ? k.remainingCalls : '';
