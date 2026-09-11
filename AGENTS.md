@@ -126,6 +126,17 @@ grep "if (releaseSlot) releaseSlot();" → ≥ 9 处(3 transform × 3 路径)
 
 ## 6. 变更日志(最新在上)
 
+- **2026-09-11(全量检测 5 项 bug 修复 + 日期控件确认交互修正)**:**bug 修复**(三路并行
+  审查发现,commit a6835a2):① anthropicStreamTransform 的 sendFinalEvent 用了未定义
+  变量 `model`(实为参数名 `modelName`),流式 /v1/messages 拿到 usage 即 ReferenceError
+  → 流式 token 永不入账且收尾被打断;② per-model 并发配置死引用 `cfPayload._userModelName`
+  全文件无赋值处,面板「按模型并发」永不生效——改为 callBindingChat 显式传
+  userModelName(用户请求模型名口径);③ createKVGetter 缓存 rejected promise 60s,一次
+  瞬时 KV 故障 → 全部 /v1 请求 500 一分钟——失败不缓存;④ 熔断器误计 4xx 客户端错误
+  (cbOnCapacityFail 改为仅 isCapacityError 时调用,8 个坏请求不再全局开闸);⑤
+  acquireModelSlot max<=0 与 globalMax<=0 同语义=不限(配 0 不再全站 429)。
+  **UI 交互修正**:日期控件外置「确定」按钮移除(浏览器日期弹框自带确认),选完 onchange
+  即刷新天数框。未部署验证。改动文件:src/index.js。
 - **2026-09-11(密钥有效期控件交互重构:天数↔日期联动 + 确定按钮)**:按用户 5 点规则重做
   模态框:① 「永久有效」checkbox 最高优先级,勾选则天数框/日期控件/确定按钮全部置灰清空;
   ② 新增天数输入框(支持两位小数,如 0.5=半天),与 datetime-local 双向联动
