@@ -28,7 +28,9 @@ function acquireModelSlot(cfModel, max, globalMax) {
 	return true;
 }
 
-// 释放槽位（全局+模型）
+// 释放槽位（全局+模型）——禁止直接调用！必须经过 makeSlotReleaser 创建的幂等句柄。
+// 直接调用在「流式双层结构」（wrapStreamWithRelease + 内层 transform）下会双重释放，
+// 使 modelInflight 计数减超、并发闸失效（R0.12）。
 function releaseModelSlot(cfModel) {
 	const next = (modelInflight.get(cfModel) || 1) - 1;
 	if (next <= 0) modelInflight.delete(cfModel);
@@ -36,26 +38,38 @@ function releaseModelSlot(cfModel) {
 	if (globalInflight > 0) globalInflight -= 1;
 }
 
-// 包装 stream：在流完全读取或取消时自动释放槽位
-function wrapStreamWithRelease(stream, cfModel) {
+// 创建一次性释放句柄：无论多少处调用 release()，实际只释放一次。
+// 流式路径上 wrapStreamWithRelease 与内层 transform 都持有释放义务，
+// 谁先走到终点谁释放，另一方调用是安全的 no-op——从物理上杜绝双重释放。
+function makeSlotReleaser(cfModel) {
+	let released = false;
+	return () => {
+		if (released) return;
+		released = true;
+		releaseModelSlot(cfModel);
+	};
+}
+
+// 包装 stream：在流完全读取或取消时自动释放槽位（release 为幂等句柄，与内层 transform 共享）
+function wrapStreamWithRelease(stream, cfModel, release) {
 	const reader = stream.getReader();
 	return new ReadableStream({
 		async pull(controller) {
 			try {
 				const { done, value } = await reader.read();
 				if (done) {
-					releaseModelSlot(cfModel);
+					release();
 					controller.close();
 				} else {
 					controller.enqueue(value);
 				}
 			} catch (e) {
-				releaseModelSlot(cfModel);
+				release();
 				controller.error(e);
 			}
 		},
 		async cancel(reason) {
-			releaseModelSlot(cfModel);
+			release();
 			await reader.cancel(reason);
 		}
 	});
@@ -1214,14 +1228,9 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 	if (!acquireModelSlot(cfModel, modelMax, globalMax)) {
 		return { success: false, status: 429, error: concurrencyLimitError(cfModel, modelMax) };
 	}
-	// 幂等释放：带标志位，避免 finally 与 catch 各自释放造成双释放，导致并发计数减超
-	let slotReleased = false;
-	const releaseSlot = () => {
-		if (!slotReleased) {
-			slotReleased = true;
-			releaseModelSlot(cfModel);
-		}
-	};
+	// 幂等释放句柄：流式时与 wrapStreamWithRelease 共享（谁先到终点谁释放，另一方 no-op），
+	// 非流式由 finally 释放；杜绝双释放导致并发计数减超
+	const releaseSlot = makeSlotReleaser(cfModel);
 
 	try {
 		if (stream) {
@@ -1243,10 +1252,10 @@ async function callBindingChat(cfModel, cfPayload, env, stream) {
 				releaseSlot();
 				return { success: false, status: 502, error: new Error('AI Binding returned empty response body') };
 			}
-			// 流式成功：槽位改由 wrapper 在流读完/取消/出错时释放，此处不标记已释放
+			// 流式成功：槽位由 wrapper 与内层 transform 共享同一幂等句柄，先到终点者释放
 			cbOnSuccess(env);
 			noteModelOk(cfModel);
-			return { success: true, status: resp.status, stream: wrapStreamWithRelease(resp.body, cfModel) };
+			return { success: true, status: resp.status, stream: wrapStreamWithRelease(resp.body, cfModel, releaseSlot), releaseSlot };
 		}
 		// 非流式：try/finally 确保释放
 		try {
@@ -1530,7 +1539,7 @@ async function handleCompletions(request, env, ctx, pathname) {
 		accumulateFromUsage(env, ctx, null, requestStartTime, shortModelName(cfModel));
 		// For Binding streaming, we get a ReadableStream directly. Wrap it in passthroughStream for SSE processing.
 		return streamResponse(
-			passthroughStream(result.stream, model, pathname === '/v1/completions', env, ctx, requestStartTime, false, cfModel),
+			passthroughStream(result.stream, model, pathname === '/v1/completions', env, ctx, requestStartTime, false, result.releaseSlot),
 			fallbackWarning
 		);
 	}
@@ -1872,7 +1881,7 @@ async function handleMessages(request, env, ctx) {
 	if (stream) {
 		accumulateFromUsage(env, ctx, null, requestStartTime, shortModelName(cfModel));
 		return streamResponse(
-			anthropicStreamTransform(result.stream, model, anthropicBody.messages, env, ctx, requestStartTime, false, cfModel),
+			anthropicStreamTransform(result.stream, model, anthropicBody.messages, env, ctx, requestStartTime, false, result.releaseSlot),
 			fallbackWarning
 		);
 	}
@@ -1882,7 +1891,7 @@ async function handleMessages(request, env, ctx) {
 }
 
 // ===== Anthropic SSE 流式转换：OpenAI SSE → Anthropic SSE =====
-function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env, ctx, requestStartTime, tokenAlreadyCounted, cfModel = null) {
+function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env, ctx, requestStartTime, tokenAlreadyCounted, releaseSlot = null) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
@@ -1936,7 +1945,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 							sendFinalEvent(controller);
 						}
 						if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-						if (cfModel) releaseModelSlot(cfModel);
+						if (releaseSlot) releaseSlot();
 						try { controller.close(); } catch (_) { }
 						break;
 					}
@@ -1961,13 +1970,13 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 					}
 				} catch (e2) { console.error('anthropicStreamTransform secondary error:', e2?.message || e2); }
 				if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-				if (cfModel) releaseModelSlot(cfModel);
+				if (releaseSlot) releaseSlot();
 				try { controller.close(); } catch (_) { }
 			}
 		},
 		cancel() {
 			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-			if (cfModel) releaseModelSlot(cfModel);
+			if (releaseSlot) releaseSlot();
 			return reader.cancel();
 		},
 	});
@@ -2484,7 +2493,7 @@ async function handleResponses(request, env, ctx) {
 	if (stream) {
 		accumulateFromUsage(env, ctx, null, requestStartTime, shortModelName(cfModel));
 		return streamResponse(
-			responsesStreamTransform(result.stream, model, env, ctx, requestStartTime, false, cfModel),
+			responsesStreamTransform(result.stream, model, env, ctx, requestStartTime, false, result.releaseSlot),
 			fallbackWarning
 		);
 	}
@@ -2503,7 +2512,7 @@ async function handleResponses(request, env, ctx) {
 // ===== Responses SSE 流式转换：OpenAI Chat SSE → Responses SSE =====
 // 事件序列：response.created → output_item/content_part/output_text/reasoning_summary/function_call_arguments
 // 系列增量 → flush 所有未闭合 item → response.completed（含完整 output 数组 + usage）
-function responsesStreamTransform(upstreamBody, originalModel, env, ctx, requestStartTime, tokenAlreadyCounted, cfModel = null) {
+function responsesStreamTransform(upstreamBody, originalModel, env, ctx, requestStartTime, tokenAlreadyCounted, releaseSlot = null) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
@@ -2573,7 +2582,7 @@ function responsesStreamTransform(upstreamBody, originalModel, env, ctx, request
 							sendFinalEvent(controller);
 						}
 						if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-						if (cfModel) releaseModelSlot(cfModel);
+						if (releaseSlot) releaseSlot();
 						try { controller.close(); } catch (_) { }
 						break;
 					}
@@ -2598,13 +2607,13 @@ function responsesStreamTransform(upstreamBody, originalModel, env, ctx, request
 					}
 				} catch (e2) { console.error('responsesStreamTransform secondary error:', e2?.message || e2); }
 				if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-				if (cfModel) releaseModelSlot(cfModel);
+				if (releaseSlot) releaseSlot();
 				try { controller.close(); } catch (_) { }
 			}
 		},
 		cancel() {
 			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-			if (cfModel) releaseModelSlot(cfModel);
+			if (releaseSlot) releaseSlot();
 			return reader.cancel();
 		},
 	});
@@ -3000,6 +3009,7 @@ async function handleEmbeddings(request, env, ctx) {
 		const fe = { status: 429, type: 'rate_limit_error', message: `并发已达上限 (模型${max}/全局${globalMax})，请稍后重试` };
 		return jsonError(fe.message, fe.status, fe.type);
 	}
+	const releaseSlot = makeSlotReleaser(cfModel);
 
 	try {
 		const result = await env.AI.run(cfModel, { text: textArray }, aiRunOptions(env, { signal: AbortSignal.timeout(120000) }));
@@ -3036,7 +3046,7 @@ async function handleEmbeddings(request, env, ctx) {
 		const fe = friendlyError(e);
 		return jsonError(fe.message, fe.status || 502, fe.type);
 	} finally {
-		releaseModelSlot(cfModel);
+		releaseSlot();
 	}
 }
 
@@ -3073,6 +3083,7 @@ async function handleImageGenerations(request, env, ctx) {
 	if (!acquireModelSlot(cfModel, max, globalMax)) {
 		return jsonError(`并发已达上限 (模型${max}/全局${globalMax})，请稍后重试`, 429, 'rate_limit_error');
 	}
+	const releaseSlot = makeSlotReleaser(cfModel);
 
 	try {
 		// flux 系列 schema 仅接受 prompt（多传 width/height/num_steps 会 400 Additional properties not allowed）
@@ -3121,7 +3132,7 @@ async function handleImageGenerations(request, env, ctx) {
 		const fe = friendlyError(e);
 		return jsonError(fe.message, fe.status || 502, fe.type);
 	} finally {
-		releaseModelSlot(cfModel);
+		releaseSlot();
 	}
 }
 
@@ -3190,6 +3201,7 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 		if (!acquireModelSlot(actualCfModel, max, globalMax)) {
 			return jsonError(`并发已达上限 (模型${max}/全局${globalMax})，请稍后重试`, 429, 'rate_limit_error');
 		}
+		const releaseSlot = makeSlotReleaser(actualCfModel);
 
 		try {
 			// AI Binding 的 Whisper 要求 { audio: [...字节数组展开] }：传 Uint8Array 会报「未识别的上游错误」
@@ -3212,7 +3224,7 @@ async function handleAudioTranscribe(request, env, ctx, isTranslation) {
 			const fe = friendlyError(e);
 			return jsonError(fe.message, fe.status || 400, fe.type);
 		} finally {
-			releaseModelSlot(actualCfModel);
+			releaseSlot();
 		}
 	} catch (e) {
 		const fe = friendlyError(e);
@@ -3329,7 +3341,7 @@ async function handleCountTokens(request, env) {
 }
 
 // ===== passthroughStream - 透传 SSE 流 =====
-function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requestStartTime, tokenAlreadyCounted, cfModel = null) {
+function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requestStartTime, tokenAlreadyCounted, releaseSlot = null) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
@@ -3402,7 +3414,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 							});
 						}
 						if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-						if (cfModel) releaseModelSlot(cfModel);
+						if (releaseSlot) releaseSlot();
 						try { controller.close(); } catch (_) { }
 						break;
 					}
@@ -3425,13 +3437,13 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 					controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 				} catch (e2) { console.error('passthroughStream secondary error:', e2?.message || e2); }
 				if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-				if (cfModel) releaseModelSlot(cfModel);
+				if (releaseSlot) releaseSlot();
 				try { controller.close(); } catch (_) { }
 			}
 		},
 		cancel() {
 			if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-			if (cfModel) releaseModelSlot(cfModel);
+			if (releaseSlot) releaseSlot();
 			return reader.cancel();
 		},
 	});
@@ -3748,20 +3760,26 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 
 		if (method === 'POST') {
-			const { name, key, expiresDays, expiresMonths, maxCalls } = await safeJsonBody(request) || {};
+			const { name, key, expiresAt, expiresDays, expiresMonths, maxCalls } = await safeJsonBody(request) || {};
 			if (!name) {
 				return new Response(JSON.stringify({ error: 'Name is required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 			}
 
-			// 计算过期时间（任一空=不限；同时填则叠加）
-			let expiresAt = null;
-			const days = parseInt(expiresDays, 10);
-			const months = parseInt(expiresMonths, 10);
-			if ((days > 0 || months > 0)) {
-				const d = new Date();
-				if (months > 0) d.setMonth(d.getMonth() + months);
-				if (days > 0) d.setDate(d.getDate() + days);
-				expiresAt = d.toISOString();
+			// 计算过期时间：expiresAt（ISO 字符串，null=永久）优先；兼容旧 expiresDays/expiresMonths
+			let expiresAtVal = null;
+			if (expiresAt) {
+				const t = Date.parse(expiresAt);
+				if (!isNaN(t)) expiresAtVal = new Date(t).toISOString();
+			}
+			if (!expiresAtVal) {
+				const days = parseInt(expiresDays, 10);
+				const months = parseInt(expiresMonths, 10);
+				if ((days > 0 || months > 0)) {
+					const d = new Date();
+					if (months > 0) d.setMonth(d.getMonth() + months);
+					if (days > 0) d.setDate(d.getDate() + days);
+					expiresAtVal = d.toISOString();
+				}
 			}
 			// 最大调用次数（空或<=0=不限）
 			const maxCallsNum = parseInt(maxCalls, 10);
@@ -3774,7 +3792,7 @@ async function handleDashboardApi(request, env, ctx) {
 				name,
 				key: generatedKey,
 				createdAt: new Date().toISOString(),
-				expiresAt,
+				expiresAt: expiresAtVal,
 				maxCalls: maxCallsVal,
 				usedCalls: 0
 			});
@@ -3785,7 +3803,7 @@ async function handleDashboardApi(request, env, ctx) {
 
 	if (url.pathname.startsWith('/api/keys/') && method === 'PUT') {
 		const id = decodeURIComponent(url.pathname.slice('/api/keys/'.length));
-		const { name, expiresDays, expiresMonths, remainingCalls } = await safeJsonBody(request) || {};
+		const { name, expiresAt, expiresDays, expiresMonths, remainingCalls } = await safeJsonBody(request) || {};
 		const keys = await getApiKeys(env);
 		const k = keys.find(x => x.id === id);
 		if (!k) {
@@ -3793,8 +3811,15 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 		// 描述名称
 		if (typeof name === 'string') k.name = name;
-		// 有效期：填数字>0 则从当前时间起计算；填 0 或负数则置为不限
-		if (expiresDays !== undefined || expiresMonths !== undefined) {
+		// 有效期：expiresAt 显式传值（ISO 字符串或 null=永久）；兼容旧 expiresDays/expiresMonths；都不传=保持不变
+		if (expiresAt !== undefined) {
+			if (expiresAt === null || expiresAt === '') {
+				k.expiresAt = null;
+			} else {
+				const t = Date.parse(expiresAt);
+				if (!isNaN(t)) k.expiresAt = new Date(t).toISOString();
+			}
+		} else if (expiresDays !== undefined || expiresMonths !== undefined) {
 			const days = parseInt(expiresDays, 10);
 			const months = parseInt(expiresMonths, 10);
 			if (days > 0 || months > 0) {
@@ -6124,14 +6149,12 @@ async function handleAdminPage(request, env, ctx) {
 				</div>
 				<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
 				<div class="form-group" style="margin-bottom: 0;">
-						<label for="key-expires-num">有效期 (空=不限)</label>
-						<div style="display: flex; gap: 8px;">
-							<input type="number" id="key-expires-num" min="1" placeholder="不限" style="flex: 1;">
-							<select id="key-expires-unit" style="width: 80px;">
-								<option value="days">天</option>
-								<option value="months">月</option>
-							</select>
+						<label for="key-expires-at">有效期</label>
+						<div style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
+							<input type="checkbox" id="key-expires-forever" checked onchange="onKeyForeverChange()">
+							<span style="font-size: 13px;">永久有效</span>
 						</div>
+						<input type="datetime-local" id="key-expires-at" disabled style="width: 100%;">
 						<div id="key-expires-hint" style="font-size: 11px; color: var(--text-muted); margin-top: 4px; display: none;"></div>
 					</div>
 					<div class="form-group" style="margin-bottom: 0;">
@@ -6832,12 +6855,28 @@ async function handleAdminPage(request, env, ctx) {
 		// 当前正在编辑的密钥 id（null=新增模式）
 		let KEY_EDITING_ID = null;
 
+		function onKeyForeverChange() {
+			const forever = document.getElementById('key-expires-forever').checked;
+			document.getElementById('key-expires-at').disabled = forever;
+			if (forever) document.getElementById('key-expires-at').value = '';
+		}
+
+		// Date → datetime-local 控件值（本地时区，精确到分钟）
+		function toDatetimeLocalInput(isoStr) {
+			if (!isoStr) return '';
+			const d = new Date(isoStr);
+			if (isNaN(d.getTime())) return '';
+			const p = (n) => String(n).padStart(2, '0');
+			return \`\${d.getFullYear()}-\${p(d.getMonth() + 1)}-\${p(d.getDate())}T\${p(d.getHours())}:\${p(d.getMinutes())}\`;
+		}
+
 		function openAddKeyModal() {
 			KEY_EDITING_ID = null;
 			document.getElementById('key-name').value = '';
 			document.getElementById('key-val').value = '';
-			document.getElementById('key-expires-num').value = '';
-			document.getElementById('key-expires-unit').value = 'days';
+			document.getElementById('key-expires-forever').checked = true;
+			document.getElementById('key-expires-at').value = '';
+			document.getElementById('key-expires-at').disabled = true;
 			document.getElementById('key-max-calls').value = '';
 			document.getElementById('key-expires-hint').style.display = 'none';
 			document.getElementById('key-modal-title').innerText = '生成新 API 密钥';
@@ -6858,15 +6897,22 @@ async function handleAdminPage(request, env, ctx) {
 				if (!k) { showToast('未找到该密钥！', 'error'); return; }
 				KEY_EDITING_ID = id;
 				document.getElementById('key-name').value = k.name || '';
-				// 有效期不预填：空=保留原到期日不变；填数字才从当前时刻重算（避免每次编辑静默改写/延长有效期）
-				document.getElementById('key-expires-num').value = '';
-				document.getElementById('key-expires-unit').value = 'days';
+				// 有效期：勾选「永久」=显式置为不限；改日期=新到期日；两者都不动=保持不变
+				if (k.expiresAt) {
+					document.getElementById('key-expires-forever').checked = false;
+					document.getElementById('key-expires-at').disabled = false;
+					document.getElementById('key-expires-at').value = toDatetimeLocalInput(k.expiresAt);
+				} else {
+					document.getElementById('key-expires-forever').checked = true;
+					document.getElementById('key-expires-at').disabled = true;
+					document.getElementById('key-expires-at').value = '';
+				}
 				const hintEl = document.getElementById('key-expires-hint');
 				if (k.expiresAt) {
-					hintEl.innerText = '当前有效期至 ' + new Date(k.expiresAt).toLocaleString() + (k.remainingDays != null && k.remainingDays > 0 ? '（剩 ' + k.remainingDays + ' 天）' : '') + '；修改将从此刻重算';
+					hintEl.innerText = '当前有效期至 ' + new Date(k.expiresAt).toLocaleString() + (k.remainingDays != null && k.remainingDays > 0 ? '（剩 ' + k.remainingDays + ' 天）' : '') + '；不动则保持不变';
 					hintEl.style.display = 'block';
 				} else {
-					hintEl.innerText = '当前不限期；填写数字将设置有效期';
+					hintEl.innerText = '当前永久有效；取消勾选并选日期可设置到期时间';
 					hintEl.style.display = 'block';
 				}
 				document.getElementById('key-max-calls').value = (k.remainingCalls != null) ? k.remainingCalls : '';
@@ -6889,19 +6935,21 @@ async function handleAdminPage(request, env, ctx) {
 		async function saveKey() {
 			const name = document.getElementById('key-name').value;
 			const key = document.getElementById('key-val').value;
-			const expiresNum = document.getElementById('key-expires-num').value;
-			const expiresUnit = document.getElementById('key-expires-unit').value;
+			const forever = document.getElementById('key-expires-forever').checked;
+			const expiresLocal = document.getElementById('key-expires-at').value;
 			const maxCalls = document.getElementById('key-max-calls').value;
 			if (!name) {
 				showToast('请输入描述名称！', 'warning');
 				return;
 			}
+			// datetime-local → ISO；勾选永久或日期为空/无效则视为不限
+			const expiresIso = (!forever && expiresLocal) ? new Date(expiresLocal).toISOString() : null;
+			if (!forever && !expiresIso) {
+				showToast('请选择到期日期，或勾选「永久有效」！', 'warning');
+				return;
+			}
 			if (KEY_EDITING_ID) {
-				const body = { name };
-				if (expiresNum && parseInt(expiresNum, 10) > 0) {
-					if (expiresUnit === 'months') body.expiresMonths = parseInt(expiresNum, 10);
-					else body.expiresDays = parseInt(expiresNum, 10);
-				}
+				const body = { name, expiresAt: expiresIso };
 				if (maxCalls && parseInt(maxCalls, 10) > 0) body.remainingCalls = parseInt(maxCalls, 10);
 				const res = await apiFetch('/api/keys/' + encodeURIComponent(KEY_EDITING_ID), {
 					method: 'PUT',
@@ -6917,11 +6965,7 @@ async function handleAdminPage(request, env, ctx) {
 				}
 				return;
 			}
-			const body = { name, key };
-			if (expiresNum && parseInt(expiresNum, 10) > 0) {
-				if (expiresUnit === 'months') body.expiresMonths = parseInt(expiresNum, 10);
-				else body.expiresDays = parseInt(expiresNum, 10);
-			}
+			const body = { name, key, expiresAt: expiresIso };
 			if (maxCalls && parseInt(maxCalls, 10) > 0) body.maxCalls = parseInt(maxCalls, 10);
 			const res = await apiFetch('/api/keys', {
 				method: 'POST',
