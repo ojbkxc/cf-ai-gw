@@ -126,6 +126,15 @@ grep "if (releaseSlot) releaseSlot();" → ≥ 9 处(3 transform × 3 路径)
 
 ## 6. 变更日志(最新在上)
 
+- **2026-09-11(彻底移除 AI Gateway 挂载)**:用户裁决选 C(完全移除),commit 27cea0f。
+  删除 `aiRunOptions()`(gateway.id=ojbkxc + cacheTtl 3600),5 个 env.AI.run 调用点
+  (chat 流式/非流式、embeddings、images、whisper)改为直传 `{signal/returnRawResponse}`。
+  理由:① 缓存是完整请求体匹配,多轮对话永不命中,命中率低;② 硬编码默认挂 ojbkxc
+  网关,平台侧删网关即全站推理 500 的隐性耦合;③ 网关平台侧日志非刚需。
+  同步删 wrangler.account2.toml 的 `AI_GATEWAY_ID = "off"`(默认不挂了,该开关无意义)。
+  **注意**:主部署 wrangler.toml 从未配过此 var,线上行为变化=不再挂网关/无缓存,
+  若上游异常优先怀疑此项回滚。node --check OK。未部署验证。
+  改动文件:src/index.js + wrangler.account2.toml。
 - **2026-09-11(Tokens 计算全链路检测 + 两项修正)**:应用户要求全量检测 token 计算
   方式,commit 317de20。**结论**:防重复计费(流式入口 request+流末 token 双段、
   countRequest/writeEvent 语义)、total=input+output 口径、UTC 日期一致性、估算类
