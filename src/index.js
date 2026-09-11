@@ -806,7 +806,7 @@ async function buildLocalUsageFallback(env) {
 	const historyByDate = {};
 	await Promise.all(historyDates.map(async (date) => {
 		try {
-			const raw = await env.KV.get(	okens_daily_\);
+			const raw = await env.KV.get(`tokens_daily_${date}`);
 			historyByDate[date] = raw ? JSON.parse(raw) : { input: 0, output: 0, requests: 0, models: {} };
 		} catch (_) { historyByDate[date] = { input: 0, output: 0, requests: 0, models: {} }; }
 	}));
@@ -848,7 +848,7 @@ async function buildLocalUsageFallback(env) {
 	const now = new Date();
 	let monthInput = 0, monthOutput = 0, monthRequests = 0;
 	try {
-		const monthKey = 	okens_monthly__\;
+		const monthKey = getTokenMonthlyKey();
 		const raw = await env.KV.get(monthKey);
 		if (raw) {
 			const m = JSON.parse(raw);
@@ -4126,6 +4126,13 @@ const SHARED_JS = `
 			if (n < 1000000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
 			if (n < 1000000000) return (n / 1000000).toFixed(2).replace(/\.?0+$/, '') + 'M';
 			return (n / 1000000000).toFixed(2).replace(/\.?0+$/, '') + 'B';
+		}
+
+		// 请求次数用「万」为单位展示（12345 -> 1.23w）；两位小数全 0 时去掉小数点（4.00w -> 4w）
+		function fmtWan(n) {
+			if (!n || n < 10000) return String(n || 0);
+			const v = (n / 10000).toFixed(2);
+			return v.endsWith('.00') ? v.slice(0, -3) + 'w' : v + 'w';
 		}`;
 
 const SHARED_BG_CSS = `
@@ -4765,6 +4772,9 @@ async function handleLandingPage(request, env, ctx) {
 					<div style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">
 						<span id="public-limit-desc">今日累计用量 0</span>
 					</div>
+					<div style="font-size: 12px; color: var(--text-muted); margin-top: 6px;">
+						<span id="public-requests-desc">今日请求 0 次</span>
+					</div>
 				</div>
 			</div>
 
@@ -4941,6 +4951,7 @@ async function handleLandingPage(request, env, ctx) {
 			if (unitLabel) unitLabel.innerText = unit;
 			document.getElementById('public-limit-desc').innerText = '今日累计用量: ' + fmtTok(roundedNeurons) + ' ' + unit;
 			document.getElementById('public-percent-desc') && (document.getElementById('public-percent-desc').style.display = 'none');
+			document.getElementById('public-requests-desc').innerText = '今日请求: ' + fmtWan(data.totalRequestsToday || 0) + ' 次';
 
 			const wrapper = document.getElementById('public-chart-wrapper');
 			const placeholder = document.getElementById('public-chart-placeholder');
@@ -6142,14 +6153,6 @@ async function handleAdminPage(request, env, ctx) {
 
 	<script>
 		${SHARED_JS}
-
-		// 请求次数用「万」为单位展示（如 12345 -> 1.23w）
-		// 规则：保留两位小数；两位小数全为 0 时去掉小数点显示整数（4.00w -> 4w），否则完整显示两位（4.01w / 4.12w）
-		function fmtWan(n) {
-			if (n < 10000) return String(n);
-			const v = (n / 10000).toFixed(2);
-			return v.endsWith('.00') ? v.slice(0, -3) + 'w' : v + 'w';
-		}
 
 		let currentTab = 'overview';
 		let historyChart = null;
