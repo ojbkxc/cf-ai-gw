@@ -126,6 +126,14 @@ grep "if (releaseSlot) releaseSlot();" → ≥ 9 处(3 transform × 3 路径)
 
 ## 6. 变更日志(最新在上)
 
+- **2026-09-11(密钥有效期日期控件:整框弹选择器 + 主题适配)**:用户反馈 datetime-local
+  弹框自带确认没做好 + 希望点击整个日期显示框都能弹出选择控件。修复:① 外层
+  `picker-launcher` div onclick → `showPicker()`(用户手势内调用;旧浏览器降级
+  focus;disabled 直接 return;点控件本身不拦截交给浏览器);② CSS 补
+  `input[type=datetime-local]{color-scheme:dark}`(暗色主题日历图标反色,light 主题
+  对应 light)与禁用态 `opacity .5 + grayscale`(此前禁用无视觉反馈);③ 控件
+  cursor: pointer。node --check OK。commit 3a28f7f,未部署验证。改动文件:src/index.js。
+  下一步:部署生效后验证创建/编辑弹框交互。
 - **2026-09-11(7 日走势 Tokens 修复:两处流式 usage 死引用)**:用户报告「过去 7 日消耗走势
   Tokens 出问题」,排查结论:① 数据链(KV 键口径/排序/前端映射)正常;② 上午 2c54add 曾
   破坏 `tokens_daily_` 键拼接语法(f8ee9e7 已修),09:20-09:51 窗口数据缺失属历史事故,
