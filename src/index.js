@@ -6995,7 +6995,7 @@ async function handleAdminPage(request, env, ctx) {
 				daysEl.value = '';
 				setKeyExpiresHint('已选永久有效，不限使用时间');
 			} else {
-				setKeyExpiresHint('请输入有效期天数（支持两位小数，如 0.5 = 半天）');
+				setKeyExpiresHint('请输入有效期天数，支持两位小数，如 0.5 = 半天');
 			}
 		}
 
@@ -7011,7 +7011,7 @@ async function handleAdminPage(request, env, ctx) {
 			KEY_EXPIRES_DIRTY = true;
 			const daysEl = document.getElementById('key-expires-days');
 			const days = parseFloat(daysEl.value);
-			if (isNaN(days) || days <= 0) { setKeyExpiresHint('天数需为正数（支持两位小数，如 0.5 = 半天）'); return; }
+			if (isNaN(days) || days <= 0) { setKeyExpiresHint('支持两位小数，如 0.5 = 半天'); return; }
 			const target = new Date(Date.now() + days * 86400000);
 			const rounded = Math.round(days * 100) / 100;
 			setKeyExpiresHint('生效后至 ' + target.toLocaleString() + '（' + rounded + ' 天）');
