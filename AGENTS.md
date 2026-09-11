@@ -126,6 +126,17 @@ grep "if (releaseSlot) releaseSlot();" → ≥ 9 处(3 transform × 3 路径)
 
 ## 6. 变更日志(最新在上)
 
+- **2026-09-11(密钥有效期控件交互重构:天数↔日期联动 + 确定按钮)**:按用户 5 点规则重做
+  模态框:① 「永久有效」checkbox 最高优先级,勾选则天数框/日期控件/确定按钮全部置灰清空;
+  ② 新增天数输入框(支持两位小数,如 0.5=半天),与 datetime-local 双向联动
+  (onKeyDaysChange:天数→日期=现在+N 天;onKeyDateChange:日期→天数=(到期-现在)/天,
+  保留两位);③ 日期控件旁加「确定」按钮(confirmKeyDate,校验必须晚于当前时间);
+  ④ 创建时有效期必填:永久或有效日期二选一,否则 toast 拦截;⑤ 编辑时 KEY_EXPIRES_DIRTY
+  跟踪用户是否动过时间控件——未动过则 PUT 不带 expiresAt 字段,后端保持原值;动过则按
+  当前状态提交。hint 提示行全程引导(勾选状态/换算结果/确定锁定)。验证:node --check OK;
+  事件绑定 4 处齐全(oninput/onchange)。**注:api 密钥明文展示在 UI 上是用户明确允许的
+  设计(复制功能需要),勿作为安全缺陷报告。**未部署验证。改动文件:src/index.js。
+  下一步:部署生效后实测创建/编辑/联动/永久置灰交互。
 - **2026-09-11(双重释放修复 + 密钥有效期控件统一 + 首页信息精简 + AGENTS.md 精简重写)**:
   ① 上轮给三 transform 加的 `releaseModelSlot` 直调与 `wrapStreamWithRelease` 外层释放
   双重冲突(用户质疑促成复查),重构为 `makeSlotReleaser` 幂等句柄贯穿全链路(transform
