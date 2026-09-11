@@ -169,7 +169,7 @@ function accumulateFromUsage(env, ctx, usage, requestStartTime, model = null) {
 	accumulateTokens(env, ctx, {
 		input: u.prompt_tokens || 0,
 		output: u.completion_tokens || 0,
-		reasoning: u.reasoning_tokens || 0,
+		reasoning: u.reasoning_tokens ?? u.completion_tokens_details?.reasoning_tokens ?? 0,
 		cacheRead: pd.cached_tokens ?? u.cache_read_tokens ?? 0,
 		cacheWrite: u.cache_write_tokens || 0,
 		durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
@@ -2017,7 +2017,7 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages, env
 					if (chunk.usage) {
 						inputTokens = chunk.usage.prompt_tokens || 0;
 						outputTokens = chunk.usage.completion_tokens || 0;
-						reasoningTokens = chunk.usage.reasoning_tokens || 0;
+						reasoningTokens = chunk.usage.reasoning_tokens ?? chunk.usage.completion_tokens_details?.reasoning_tokens ?? 0;
 						cacheReadTokens = (chunk.usage.prompt_tokens_details?.cached_tokens || chunk.usage.cache_read_tokens || 0);
 						cacheWriteTokens = chunk.usage.cache_write_tokens || 0;
 					}
@@ -3399,7 +3399,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 							accumulateTokens(env, ctx, {
 								input: streamUsage.prompt_tokens || 0,
 								output: streamUsage.completion_tokens || 0,
-								reasoning: streamUsage.reasoning_tokens || 0,
+								reasoning: streamUsage.reasoning_tokens ?? streamUsage.completion_tokens_details?.reasoning_tokens ?? 0,
 								cacheRead: (streamUsage.prompt_tokens_details?.cached_tokens ?? streamUsage.cache_read_tokens ?? 0),
 								cacheWrite: streamUsage.cache_write_tokens || 0,
 								durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
@@ -4182,6 +4182,14 @@ const SHARED_JS = `
 			return (n / 1000000000).toFixed(2).replace(/\.?0+$/, '') + 'B';
 		}
 
+		// 中文量级读数（首页"今日用量"辅助标注）：万 / 亿
+		// 采用中文最自然的万/亿两级（百万=100万、十亿=10亿，均可被万/亿覆盖），避免"1.23百万"这类别扭读法
+		function fmtCn(n) {
+			if (n >= 100000000) return (n / 100000000).toFixed(2).replace(/\.?0+$/, '') + ' 亿';
+			if (n >= 10000) return (n / 10000).toFixed(2).replace(/\.?0+$/, '') + ' 万';
+			return Number(n || 0).toLocaleString();
+		}
+
 		// 请求次数用「万」为单位展示（12345 -> 1.23w）；两位小数全 0 时去掉小数点（4.00w -> 4w）
 		function fmtWan(n) {
 			if (!n || n < 10000) return String(n || 0);
@@ -4880,6 +4888,7 @@ async function handleLandingPage(request, env, ctx) {
 						<div class="stat-value" id="public-tokens" style="font-size: 42px; background: var(--primary-gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 800; display: inline-block;">0</div>
 						<span id="public-unit-label" style="font-size: 14px; color: var(--text-muted); font-weight: 500; font-family: 'Outfit', sans-serif;">Tokens</span>
 					</div>
+					<div id="public-tokens-cn" style="font-size: 12px; color: var(--text-muted); margin-top: 4px; font-weight: 500;">约 0</div>
 				</div>
 
 				<div style="margin-top: 16px;">
@@ -5089,8 +5098,10 @@ async function handleLandingPage(request, env, ctx) {
 			const roundedTokens = Math.ceil(data.totalTokensToday);
 			const unit = data.unit || 'Tokens';
 
-			// 触发数字滚动的动效
+			// 触发数字滚动的动效（精确值千分位）；下方中文量级读数单独更新
 			animateNumber('public-tokens', roundedTokens, 1000);
+			const cnLabel = document.getElementById('public-tokens-cn');
+			if (cnLabel) cnLabel.innerText = '约 ' + fmtCn(roundedTokens);
 
 			const unitLabel = document.getElementById('public-unit-label');
 			if (unitLabel) unitLabel.innerText = unit;

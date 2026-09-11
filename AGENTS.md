@@ -126,6 +126,17 @@ grep "if (releaseSlot) releaseSlot();" → ≥ 9 处(3 transform × 3 路径)
 
 ## 6. 变更日志(最新在上)
 
+- **2026-09-11(首页今日用量中文量级读数 + reasoning 字段名对齐)**:① 首页「今日用量
+  汇总」大数字下方新增一行小字中文量级读数(约 X 万 / 约 X 亿),新增 fmtCn(n) 函数:
+  ≥1亿→n/10^8 两位小数「亿」,≥1万→n/10^4 两位小数「万」,<1万→千分位精确值;采用万/亿
+  两级(中文最自然,百万=100万/十亿=10亿均可覆盖),不用「百万/十亿」固定词避免「1.23百万」
+  别扭读法。方案比选:括号并排 vs 下面加一排——选后者,不挤 42px 主数字、主次层级分明、
+  滚动动效不需改。② reasoning token 字段名对齐:accumulateFromUsage(非流式)、anthropic
+  流式、passthrough 流式三处,由仅读顶层 u.reasoning_tokens 改为
+  `?? u.completion_tokens_details?.reasoning_tokens ?? 0` 双结构兼容——CF 若按 OpenAI 标准
+  返回嵌套 reasoning_tokens,明细卡「推理 N」不再恒 0。③ fmtTok/首页数字显示保持原样
+  (K/M/B 与千分位精确值),仅新增辅助读数,不波及其他共用处。node --check OK。未部署验证。
+  改动文件:src/index.js。
 - **2026-09-11(彻底移除 AI Gateway 挂载)**:用户裁决选 C(完全移除),commit 27cea0f。
   删除 `aiRunOptions()`(gateway.id=ojbkxc + cacheTtl 3600),5 个 env.AI.run 调用点
   (chat 流式/非流式、embeddings、images、whisper)改为直传 `{signal/returnRawResponse}`。
