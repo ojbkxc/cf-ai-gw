@@ -126,6 +126,18 @@ grep "if (releaseSlot) releaseSlot();" → ≥ 9 处(3 transform × 3 路径)
 
 ## 6. 变更日志(最新在上)
 
+- **2026-09-11(7 日走势 Tokens 修复:两处流式 usage 死引用)**:用户报告「过去 7 日消耗走势
+  Tokens 出问题」,排查结论:① 数据链(KV 键口径/排序/前端映射)正常;② 上午 2c54add 曾
+  破坏 `tokens_daily_` 键拼接语法(f8ee9e7 已修),09:20-09:51 窗口数据缺失属历史事故,
+  无法回补;③ **真正根因**:passthroughStream(3423)与 responsesStreamTransform(2979)
+  的 accumulateTokens 调用引用未定义变量 `model`(参数名分别为 modelName/originalModel)
+  ——与 a6835a2 修的 anthropicStreamTransform 死引用完全同源,是全量检测漏网之鱼。
+  流式 OpenAI chat / Responses 请求一拿到 usage,done 分支抛 ReferenceError 被 catch
+  吞掉 → 流中断 + token 永不入账 → `tokens_daily_` 汇总偏低 → 走势图异常。修复:
+  `model: modelName,` / `model: originalModel,`。grep 复查 3 个 transform 全部
+  accumulateTokens 调用点(2021/2135/2246/2431/2563/2664/2905/2979/3423/3485)无残留
+  裸 model 引用;node --check OK。commit 63e44c4,未部署验证(等 ~5 分钟)。
+  改动文件:src/index.js。下一步:部署生效后看 7 日走势恢复入账。
 - **2026-09-11(全量检测 5 项 bug 修复 + 日期控件确认交互修正)**:**bug 修复**(三路并行
   审查发现,commit a6835a2):① anthropicStreamTransform 的 sendFinalEvent 用了未定义
   变量 `model`(实为参数名 `modelName`),流式 /v1/messages 拿到 usage 即 ReferenceError
