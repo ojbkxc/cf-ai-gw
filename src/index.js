@@ -2976,7 +2976,7 @@ function responsesStreamTransform(upstreamBody, originalModel, env, ctx, request
 				cacheRead: cacheReadTokens,
 				cacheWrite: 0,
 				durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
-				model,
+				model: originalModel,
 				countRequest: false,
 				writeEvent: false,
 			});
@@ -3420,7 +3420,7 @@ function passthroughStream(upstreamBody, modelName, isCompletion, env, ctx, requ
 								cacheRead: (streamUsage.prompt_tokens_details?.cached_tokens ?? streamUsage.cache_read_tokens ?? 0),
 								cacheWrite: streamUsage.cache_write_tokens || 0,
 								durationSec: requestStartTime ? (Date.now() - requestStartTime) / 1000 : 0,
-								model,
+								model: modelName,
 								countRequest: false,
 								writeEvent: false,
 							});
