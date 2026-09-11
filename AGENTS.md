@@ -126,6 +126,21 @@ grep "if (releaseSlot) releaseSlot();" → ≥ 9 处(3 transform × 3 路径)
 
 ## 6. 变更日志(最新在上)
 
+- **2026-09-11(Tokens 计算全链路检测 + 两项修正)**:应用户要求全量检测 token 计算
+  方式,commit 317de20。**结论**:防重复计费(流式入口 request+流末 token 双段、
+  countRequest/writeEvent 语义)、total=input+output 口径、UTC 日期一致性、估算类
+  (embeddings/images/whisper ceil(len/3))均正确。**修正两项**:① 删除 evt_<date>_<uuid>
+  事件键写入(accumulateTokens 的 writeEvent 分支)——aggregateEventsByDate 早已移除,
+  全文件无人读取该键,纯死写入白付 KV 写;同步清理 6 处过时注释、3 处
+  writeEvent:false 调用参数、TOKEN_KV_TTL_SEC 注释口径;② 模型归因统一为「用户请求
+  模型名」——原 6 处 accumulateFromUsage 用 shortModelName(cfModel)(实际服务模型),
+  与流末补 token 的用户模型名口径不一致,经别名/回退调用时今日模型占比会拆裂成
+  "A:N请求/0 token"+"B:0请求/M token"两条;现 request 与 token 同口径,与面板按模型
+  并发的配置键一致。**遗留已知项(不修)**:今日 Token 明细卡片(getTodayTokenStats)只读
+  KV 汇总键、无 DO 兜底,并发覆盖丢写时短暂偏低;扩 DO schema 需加 reasoning/cacheRead
+  等字段,涉及 UsageCounter 类结构变更+跨版本兼容(旧 DO 实例存的是三字段对象,新代码
+  读缺字段需防御),收益仅是统计展示短暂偏差自愈,不值得。node --check OK。未部署验证。
+  改动文件:src/index.js。
 - **2026-09-11(密钥有效期控件最终简化:永久复选框+天数输入框单行)**:用户裁决
   datetime 控件 bug 太多整体废弃,commit 74b75c6(-116/+29):① 删除 datetime-local
   控件、picker-launcher、外置「确定时间」按钮及配套 JS(onKeyDateChange/
