@@ -4081,7 +4081,7 @@ const SHARED_JS = `
 
 				item.innerHTML = '<span style="width: 8px; height: 8px; border-radius: 50%; background-color: ' + color + '; flex-shrink: 0; margin-right: 2px;"></span>' +
 					'<span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; font-weight: 500;" title="' + escapeHtml(title) + '">' + escapeHtml(label) + '</span>' +
-					'<span style="color: var(--text-muted); font-family: monospace; font-size: 11px; flex-shrink: 0; margin-left: 4px;">' + val + '次 · ' + fmtTok(tok) + ' · ' + pct + '%</span>';
+					'<span style="color: var(--text-muted); font-family: monospace; font-size: 11px; flex-shrink: 0; margin-left: 4px;">' + pct + '%</span>';
 
 				legendContainer.appendChild(item);
 				setTimeout(() => {
@@ -4091,8 +4091,9 @@ const SHARED_JS = `
 			});
 		}
 
-		function createDoughnutChart(canvasId, labels, data, borderColor) {
+		function createDoughnutChart(canvasId, labels, data, borderColor, fullLabels, tokens) {
 			const ctx = document.getElementById(canvasId).getContext('2d');
+			const totalData = data.reduce((a, b) => a + b, 0);
 			return new Chart(ctx, {
 				type: 'doughnut',
 				data: {
@@ -4115,7 +4116,19 @@ const SHARED_JS = `
 						easing: 'easeOutQuart'
 					},
 					plugins: {
-						legend: { display: false }
+						legend: { display: false },
+						tooltip: {
+							callbacks: {
+								label(context) {
+									const i = context.dataIndex;
+									const val = data[i];
+									const pct = totalData > 0 ? ((val / totalData) * 100).toFixed(1) : '0.0';
+									const name = (fullLabels && fullLabels[i]) || labels[i] || '';
+									const tok = (tokens && tokens[i]) || 0;
+									return name + ': ' + val + ' 次 · ' + fmtTok(tok) + ' Tokens · ' + pct + '%';
+								}
+							}
+						}
 					}
 				}
 			});
@@ -4970,7 +4983,7 @@ async function handleLandingPage(request, env, ctx) {
 					publicModelsChartInstance.destroy();
 				}
 
-				publicModelsChartInstance = createDoughnutChart('publicModelsChart', labels, chartData, borderColor);
+				publicModelsChartInstance = createDoughnutChart('publicModelsChart', labels, chartData, borderColor, labels, chartTokens);
 
 				// 动态且逐个淡入渲染模型说明 ID（图例同时展示请求次数与 token 消耗）
 					renderChartLegend(legendContainer, labels, chartData, null, chartTokens);
@@ -6714,9 +6727,9 @@ async function handleAdminPage(request, env, ctx) {
 			const borderColor = isLight ? '#ffffff' : '#1e293b';
 			
 			if (modelsChart) modelsChart.destroy();
-			modelsChart = createDoughnutChart('modelsChart', sortedLabels, sortedData, borderColor);
+			modelsChart = createDoughnutChart('modelsChart', sortedLabels, sortedData, borderColor, combined.map(x => x.fullLabel), sortedTok);
 
-			// Render Custom HTML Legend for Admin Page（同时展示请求次数与 token 消耗）
+			// Render Custom HTML Legend for Admin Page（图例仅显示百分比，请求次数与 token 详情见悬浮提示）
 			renderChartLegend(legendContainer, sortedLabels, sortedData, combined.map(x => x.fullLabel), sortedTok);
 		}
 
